@@ -88,6 +88,10 @@ pub struct Transmit {
     pub src_ip: Option<IpAddr>,
 }
 
+/// One incoming media stream: one transfer (`Driver::last_media_stream`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MediaStream(StreamId);
+
 /// Why a connection ended, in application terms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DisconnectReason {
@@ -101,6 +105,10 @@ pub enum DisconnectReason {
     /// connection (it timed us out first, or restarted). Seen after a
     /// blackout on our side that outlasted the idle timeout.
     Reset,
+    /// The server turned the connection away at the door: it, or its
+    /// waiting room, is full (QUIC's `CONNECTION_REFUSED`). Worth trying
+    /// again later — not at once, and not all at the same moment.
+    Refused,
     /// The peer's version of the protocol is different (ALPN refused
     /// in the TLS handshake).
     AlpnMismatch,
@@ -138,6 +146,7 @@ impl std::fmt::Display for DisconnectReason {
             DisconnectReason::Reset => f.write_str(
                 "the server no longer knows this connection (it timed us out, or restarted)",
             ),
+            DisconnectReason::Refused => f.write_str("the server is full (connection refused)"),
             DisconnectReason::AlpnMismatch => f.write_str(protocol::OUTDATED_MESSAGE),
             DisconnectReason::IdentityChanged { .. } => f.write_str("server identity changed"),
             DisconnectReason::Transport(s) => f.write_str(s),
@@ -284,12 +293,18 @@ const GROUP_RESET_CODE: VarInt = VarInt::from_u32(1);
 const PROTOCOL_VIOLATION_CODE: VarInt = VarInt::from_u32(2);
 /// Close code for application-initiated closes.
 const APP_CLOSE_CODE: VarInt = VarInt::from_u32(0);
+/// Application error code for a media stream the receiver no longer
+/// wants (`Driver::stop_media`): a download cancelled.
+const CANCELLED_CODE: VarInt = VarInt::from_u32(3);
 /// How long an accepted connection may take to finish its handshake.
 /// As long as the server's Hello deadline: a handshake on a lossy link
 /// was seen to take 9 s.
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 /// TLS alert `no_application_protocol`, as a QUIC `CRYPTO_ERROR` code.
 const ALPN_MISMATCH_CODE: u64 = 0x100 + 120;
+/// QUIC's `CONNECTION_REFUSED` transport error code (RFC 9000 §20.1):
+/// what `Endpoint::refuse` answers with.
+const CONNECTION_REFUSED_CODE: u64 = 0x2;
 
 // ── Per-stream output queue ─────────────────────────────────────────────
 
@@ -501,7 +516,10 @@ struct Peer {
     inbox_signal: VecDeque<Bytes>,
     inbox_voice: VecDeque<Bytes>,
     inbox_system_audio: VecDeque<Bytes>,
-    inbox_media: VecDeque<Bytes>,
+    /// With the stream each frame came on ([`Driver::last_media_stream`]).
+    inbox_media: VecDeque<(StreamId, Bytes)>,
+    /// The stream of the Media frame `recv` handed out last.
+    last_media_stream: Option<StreamId>,
     inbox_video: VecDeque<(Track, VideoItem)>,
     video_out: HashMap<Track, GroupOut>,
     /// Groups finished but not yet acknowledged.
@@ -537,6 +555,7 @@ impl Peer {
             inbox_voice: VecDeque::new(),
             inbox_system_audio: VecDeque::new(),
             inbox_media: VecDeque::new(),
+            last_media_stream: None,
             inbox_video: VecDeque::new(),
             video_out: HashMap::new(),
             video_finishing: Vec::new(),
@@ -1626,9 +1645,38 @@ impl Driver {
             Lane::Signal => p.inbox_signal.pop_front(),
             Lane::Voice => p.inbox_voice.pop_front(),
             Lane::SystemAudio => p.inbox_system_audio.pop_front(),
-            Lane::Media => p.inbox_media.pop_front(),
+            Lane::Media => p.inbox_media.pop_front().map(|(stream, frame)| {
+                p.last_media_stream = Some(stream);
+                frame
+            }),
             Lane::Video => None,
         }
+    }
+
+    /// The stream the Media frame [`Self::recv`] returned last came on:
+    /// one transfer's (a blob, an image), for [`Self::stop_media`].
+    #[must_use]
+    pub fn last_media_stream(&self, peer: PeerId) -> Option<MediaStream> {
+        let handle = self.ids.get(&peer)?;
+        self.peers.get(handle)?.last_media_stream.map(MediaStream)
+    }
+
+    /// Stop receiving a media stream (QUIC `STOP_SENDING`): its sender
+    /// stops sending, and what is queued here from it goes. A download
+    /// cancelled used to go on arriving to its end, for nothing (review
+    /// 2026-10, P3-44). Old peers handle it as the stream reset it is.
+    pub fn stop_media(&mut self, now: Instant, peer: PeerId, stream: MediaStream) {
+        let Some(handle) = self.ids.get(&peer).copied() else {
+            return;
+        };
+        let Some(p) = self.peers.get_mut(&handle) else {
+            return;
+        };
+        let id = stream.0;
+        let _ = p.conn.recv_stream(id).stop(CANCELLED_CODE);
+        p.uni_in.remove(&id);
+        p.inbox_media.retain(|(s, _)| *s != id);
+        self.touch(handle, now);
     }
 
     /// Pop the next Video lane item with its track. Items are in order
@@ -2340,7 +2388,8 @@ fn read_uni_stream(p: &mut Peer, id: StreamId, chunks: Vec<Bytes>, mut status: R
             p.uni_in.remove(&id);
         }
     }
-    p.inbox_media.extend(media_frames);
+    p.inbox_media
+        .extend(media_frames.into_iter().map(|f| (id, f)));
     if let Some(e) = violation {
         warn!("peer {:#x}: {lane} stream: {e}", p.id);
         let _ = p.conn.recv_stream(id).stop(PROTOCOL_VIOLATION_CODE);
@@ -2436,6 +2485,14 @@ fn map_connection_error(
             if u64::from(close.error_code) == ALPN_MISMATCH_CODE =>
         {
             DisconnectReason::AlpnMismatch
+        }
+        // The waiting room's (or a full server's) refusal: it read as an
+        // unclassified transport error, which the client took as final
+        // (review 2026-10, P2-16).
+        ConnectionError::ConnectionClosed(close)
+            if u64::from(close.error_code) == CONNECTION_REFUSED_CODE =>
+        {
+            DisconnectReason::Refused
         }
         ConnectionError::TransportError(te) if u64::from(te.code) == ALPN_MISMATCH_CODE => {
             DisconnectReason::AlpnMismatch

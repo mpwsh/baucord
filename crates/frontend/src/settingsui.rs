@@ -112,6 +112,11 @@ pub(crate) struct OpenedWith {
     /// Untouched, the list stays as it is now, with whatever a
     /// connection pinned or spent meanwhile (`events.rs`).
     servers_edited: bool,
+    /// The page picked a microphone or an output. Unpicked, the devices
+    /// stay as they are now: one unplugged meanwhile (the poll fell
+    /// back to the default) is not put back by Close (review 2026-10,
+    /// P2-3).
+    devices_picked: bool,
 }
 
 impl OpenedWith {
@@ -121,6 +126,7 @@ impl OpenedWith {
             avatar: std::fs::read(client::config::avatar_path()).ok(),
             profile_dirty: app.profile_dirty,
             servers_edited: false,
+            devices_picked: false,
         }
     }
 
@@ -142,6 +148,18 @@ impl OpenedWith {
             restored.servers.clone_from(&now.servers);
             restored.server.clone_from(&now.server);
         }
+        if !self.devices_picked {
+            restored
+                .audio
+                .input
+                .device
+                .clone_from(&now.audio.input.device);
+            restored
+                .audio
+                .output
+                .device
+                .clone_from(&now.audio.output.device);
+        }
         restored
     }
 }
@@ -150,6 +168,13 @@ impl OpenedWith {
 fn note_servers_edited(app: &mut AppState) {
     if let Some(opened) = &mut app.settings_opened {
         opened.servers_edited = true;
+    }
+}
+
+/// The page picked a microphone or an output.
+fn note_devices_picked(app: &mut AppState) {
+    if let Some(opened) = &mut app.settings_opened {
+        opened.devices_picked = true;
     }
 }
 
@@ -174,6 +199,7 @@ const TAB_AUDIO: i32 = 2;
 /// Nav index of the Debug tab, whose log view the settings timer
 /// refreshes while it shows.
 const TAB_DEBUG: i32 = 8;
+const TAB_LICENSES: i32 = 9;
 
 /// The Debug tab's log view: this many of the last lines…
 const LOG_TAIL_LINES: usize = 100;
@@ -521,11 +547,12 @@ pub(crate) fn wire_page(main: &MainWindow) {
     wire(SettingsSurface(main));
 }
 
-/// Close the page (saved, as its button does) if it is open: another
-/// page is taking the window.
+/// Close the page if it is open: another page is taking the window.
+/// Only Save and close keeps what the page changed, so this does what
+/// its Close does.
 pub(crate) fn close_if_open(app: &mut AppState) {
     if app.main.global::<State>().get_settings_open() {
-        close(app);
+        discard_and_close(app);
     }
 }
 
@@ -729,14 +756,29 @@ pub fn populate(app: &mut AppState) {
 
     set_credits(&s);
     set_about(&s);
-    set_licenses(&s);
+    // The licence list (hundreds of rows) when its tab shows, not on
+    // every open (review 2026-10, P3-10).
+    if sf.tab() == TAB_LICENSES {
+        set_licenses(&s);
+    }
 
-    let names = |devices: Vec<(String, bool)>| devices.into_iter().map(|(n, _)| n).collect();
-    refresh_devices(
-        app,
-        names(audio::VoiceChat::list_input_devices().unwrap_or_default()),
-        names(audio::VoiceChat::list_output_devices().unwrap_or_default()),
-    );
+    // The device poll's lists, when it has run: enumerating again here
+    // was a round trip to every driver on the UI thread at each open
+    // (P3-10).
+    let names = |devices: &[(String, bool)]| devices.iter().map(|(n, _)| n.clone()).collect();
+    let (inputs, outputs) =
+        if app.last_input_devices.is_empty() && app.last_output_devices.is_empty() {
+            (
+                names(&audio::VoiceChat::list_input_devices().unwrap_or_default()),
+                names(&audio::VoiceChat::list_output_devices().unwrap_or_default()),
+            )
+        } else {
+            (
+                names(&app.last_input_devices),
+                names(&app.last_output_devices),
+            )
+        };
+    refresh_devices(app, inputs, outputs);
 }
 
 /// The device pickers: "System default" first, the saved selection
@@ -999,7 +1041,7 @@ fn wire(sf: SettingsSurface<'_>) {
                 .and_then(|i| app.settings.servers.get(i))
             {
                 app.settings.server = entry.name.clone();
-                app.settings.save();
+                app.save_settings();
             }
             push_server_rows(app);
             fill_server_editor(app);
@@ -1025,7 +1067,7 @@ fn wire(sf: SettingsSurface<'_>) {
                 fingerprint: None,
                 channel_passwords: std::collections::HashMap::new(),
             });
-            app.settings.save();
+            app.save_settings();
             let sf = surface(app);
             let last = app.settings.servers.len() - 1;
             sf.state()
@@ -1051,7 +1093,7 @@ fn wire(sf: SettingsSurface<'_>) {
                 app.settings.server = app.settings.servers[0].name.clone();
             }
             app.settings.normalize_servers();
-            app.settings.save();
+            app.save_settings();
             let sf = surface(app);
             let clamped = index.min(app.settings.servers.len() - 1);
             sf.state()
@@ -1225,12 +1267,14 @@ fn wire(sf: SettingsSurface<'_>) {
     logic.on_input_device_selected(|index| {
         app::with_current(move |app| {
             let device = device_at(&app.picker_inputs, index);
+            note_devices_picked(app);
             app.set_input_device(device);
         });
     });
     logic.on_output_device_selected(|index| {
         app::with_current(move |app| {
             let device = device_at(&app.picker_outputs, index);
+            note_devices_picked(app);
             app.set_output_device(device);
         });
     });
@@ -1241,7 +1285,15 @@ fn wire(sf: SettingsSurface<'_>) {
             app.voice_tx().send(VoiceControl::SetInputGain(gain)).ok();
         });
     });
-    logic.on_tab_shown(|| app::with_current(sync_audio_tab));
+    logic.on_tab_shown(|| {
+        app::with_current(|app| {
+            let sf = surface(app);
+            if sf.tab() == TAB_LICENSES && sf.state().get_licenses().row_count() == 0 {
+                set_licenses(&sf.state());
+            }
+            sync_audio_tab(app);
+        });
+    });
     logic.on_output_gain_changed(|gain| {
         app::with_current(move |app| {
             app.settings.audio.output.gain = gain;
@@ -1293,7 +1345,7 @@ fn wire(sf: SettingsSurface<'_>) {
             if let Some(i) = app.keybind_recording {
                 let action = BindableAction::ALL[i.min(BindableAction::ALL.len() - 1)];
                 app.set_keybind(action, String::new());
-                app.settings.save();
+                app.save_settings();
             }
             cancel_capture(app);
             populate_binds_only(app);
@@ -1452,7 +1504,7 @@ fn finish_capture(app: &mut AppState, text: &str, ctrl: bool, alt: bool, shift: 
     let action = BindableAction::ALL[i.min(BindableAction::ALL.len() - 1)];
     let bind = build_bind_string(ctrl, alt, shift, &code);
     app.set_keybind(action, bind);
-    app.settings.save();
+    app.save_settings();
     cancel_capture(app);
     populate_binds_only(app);
 }
@@ -1495,11 +1547,12 @@ fn populate_binds_only(app: &mut AppState) {
 
 /// The settings timer: the Audio tab's meters 20 times a second and
 /// its echo-cancellation line 4 times, the Debug tab's log view every
-/// 2 s — and nothing but a 2 s look elsewhere, minimized, or with the
-/// app in the background. It ran at 8 Hz on every tab for as long as
-/// Settings was open (review P2-40). `tab-shown` re-paces it at once on
-/// a tab change ([`pace_meter_timer`]); coming back on screen is
-/// noticed by the next slow tick.
+/// 2 s, a 2 s look on the other tabs — and nothing minimized, in the
+/// tray or with the app in the background. It ran at 8 Hz on every tab
+/// for as long as Settings was open (review P2-40). `tab-shown`
+/// re-paces it at once on a tab change ([`pace_meter_timer`]); coming
+/// back on screen restarts it (`sync_audio_tab`, from `host_shown` and
+/// `main_revealed`).
 fn start_meter_timer(app: &mut AppState) {
     let levels = app.voice_levels();
     let aec = app.voice_aec();
@@ -1592,7 +1645,14 @@ fn pace_meter_timer(app: &mut AppState) -> bool {
     let showing = app::host_visible() && sf.showing();
     let audio = showing && sf.tab() == TAB_AUDIO && sf.section_showing();
     let pace = if audio { METER_TICK } else { IDLE_TICK };
-    if app.meter_timer.running() && app.meter_timer.interval() != pace {
+    if !showing {
+        // Out of sight there is nothing to read: no tick at all, until
+        // `sync_audio_tab` finds the page back (review 2026-10, P3-7).
+        app.meter_timer.stop();
+    } else if !app.meter_timer.running() {
+        app.meter_timer.restart();
+        app.meter_timer.set_interval(pace);
+    } else if app.meter_timer.interval() != pace {
         app.meter_timer.set_interval(pace);
     }
     // The meter is the microphone's: while the tab shows, it is open —
@@ -1801,15 +1861,15 @@ fn aec_status(report: Option<&audio::AecReport>) -> String {
     }
 }
 
-/// Close semantics (the Save button, the arrow, Escape and Back):
-/// cancel any recording, stop a running mic test, persist, hide.
+/// Save and close, the one way out that keeps what changed: cancel any
+/// recording, stop a running mic test, persist, hide.
 fn close(app: &mut AppState) {
     app.settings_opened = None;
     leave(app);
     // Collapse blank token fields and repair the default pointer
     // before the edits hit disk.
     app.settings.normalize_servers();
-    app.settings.save();
+    app.save_settings();
     app.push_connect_servers();
     // A new nickname while connected goes to the server, which renames
     // us for everyone or says why not (spec §7.1); the look goes out
@@ -1841,42 +1901,93 @@ fn leave(app: &mut AppState) {
     note_meter_run(false);
 }
 
-/// The footer's Close: what the page changed goes back to how it was
+/// The footer's Close, and Escape, Back and the arrow (`back()` in
+/// settings.slint): what the page changed goes back to how it was
 /// when it opened — in the running app as well, since every control
-/// applied at once — and the page closes. The settings file is written
-/// with that state when anything changed: the page's server and
-/// keybind edits save as they happen, so skipping the write would keep
-/// them on disk.
+/// applied at once — and the page closes. The file is written with
+/// that state when anything changed.
 fn discard_and_close(app: &mut AppState) {
     leave(app);
+    let before = app.settings.clone();
+    if put_back_unsaved(app) {
+        app.apply_settings_live(&before);
+        app.save_settings();
+        log::info!("settings: closed without keeping the page's changes");
+    }
+    surface(app).hide();
+}
+
+/// Whether the open page changed anything only Save and close would
+/// keep: the question before a quit (`AppState::leave_app`).
+pub(crate) fn has_unsaved(app: &AppState) -> bool {
+    let Some(opened) = &app.settings_opened else {
+        return false;
+    };
+    let restored = opened.restored_onto(&app.settings);
+    serde_json::to_value(&restored).ok() != serde_json::to_value(&app.settings).ok()
+        || std::fs::read(client::config::avatar_path()).ok() != opened.avatar
+}
+
+/// The settings as the file should hold them: while the page is open,
+/// without what it changed — only Save and close writes that. Every
+/// save goes through here (`AppState::save_settings`), so nothing the
+/// page changed reaches the disk by another road (a pin, a resized
+/// sidebar, a quit).
+pub(crate) fn settings_to_write(app: &AppState) -> std::borrow::Cow<'_, Settings> {
+    match &app.settings_opened {
+        Some(opened) => std::borrow::Cow::Owned(opened.restored_onto(&app.settings)),
+        None => std::borrow::Cow::Borrowed(&app.settings),
+    }
+}
+
+/// Put back what the open page changed — the settings, the picture
+/// file, whether the profile was due to be sent — and forget that the
+/// page was open. `true` when anything changed. Close ends with this,
+/// and so do a quit answered "without saving" and a shutdown nobody
+/// was asked about.
+pub(crate) fn put_back_unsaved(app: &mut AppState) -> bool {
     let Some(opened) = app.settings_opened.take() else {
-        surface(app).hide();
-        return;
+        return false;
     };
     let restored = opened.restored_onto(&app.settings);
     let avatar_now = std::fs::read(client::config::avatar_path()).ok();
     let avatar_changed = avatar_now != opened.avatar;
     let settings_changed =
         serde_json::to_value(&restored).ok() != serde_json::to_value(&app.settings).ok();
-    if settings_changed || avatar_changed {
-        app.settings = restored;
-        if avatar_changed {
-            let path = client::config::avatar_path();
-            let put_back = match &opened.avatar {
-                Some(bytes) => std::fs::write(&path, bytes),
-                None => std::fs::remove_file(&path),
-            };
-            if let Err(e) = put_back {
-                log::warn!("settings: could not put the picture back: {e}");
-            }
-            app.forget_avatar_blob();
-            app.reload_own_avatar();
-        }
-        app.profile_dirty = opened.profile_dirty;
-        app.apply_settings_live();
-        app.settings.save();
-        log::info!("settings: closed without keeping the page's changes");
+    if !settings_changed && !avatar_changed {
+        return false;
     }
+    app.settings = restored;
+    if avatar_changed {
+        let path = client::config::avatar_path();
+        let put_back = match &opened.avatar {
+            Some(bytes) => std::fs::write(&path, bytes),
+            None => std::fs::remove_file(&path),
+        };
+        if let Err(e) = put_back {
+            log::warn!("settings: could not put the picture back: {e}");
+        }
+        app.forget_avatar_blob();
+        app.reload_own_avatar();
+    }
+    app.profile_dirty = opened.profile_dirty;
+    true
+}
+
+/// A quit's question answered "Save and quit": what Save and close
+/// does.
+pub(crate) fn save_for_quit(app: &mut AppState) {
+    if app.main.global::<State>().get_settings_open() {
+        close(app);
+    }
+}
+
+/// A quit's question answered "Quit without saving": the page's
+/// changes go back and the page closes; the running app is not told
+/// (it is about to end), only the file.
+pub(crate) fn drop_for_quit(app: &mut AppState) {
+    leave(app);
+    put_back_unsaved(app);
     surface(app).hide();
 }
 
@@ -2060,6 +2171,17 @@ fn license_body_rows(notices: &Notices, index: usize) -> Vec<LicenseRow> {
         }
     }
     rows
+}
+
+/// The language changed: the licence list's headings are words too.
+/// Rebuilt now if its tab is up, else when it next shows.
+pub(crate) fn relabel_licenses(app: &AppState) {
+    let sf = surface(app);
+    if sf.showing() && sf.tab() == TAB_LICENSES {
+        set_licenses(&sf.state());
+    } else {
+        sf.state().set_licenses(ModelRc::default());
+    }
 }
 
 /// The whole list, with the open entries expanded.

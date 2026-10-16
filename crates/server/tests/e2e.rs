@@ -190,6 +190,23 @@ impl World {
             std::thread::sleep(Duration::from_millis(1));
         }
         self.net.step(TICK);
+        self.run_server_and_collect(clients);
+    }
+
+    /// One pass the way the real main loop runs: asleep until the
+    /// server's `next_wake` or the next datagram, whichever is first.
+    /// The fixed tick of [`Self::pump`] hid a periodic job `next_wake`
+    /// forgets: the server here would sleep past it (review 2026-10,
+    /// P3-66).
+    fn pump_on_wake(&mut self, clients: &mut [&mut TestClient]) {
+        let now = self.net.now();
+        let wake = self.server().next_wake();
+        self.net
+            .step_to_next_event(wake.saturating_duration_since(now));
+        self.run_server_and_collect(clients);
+    }
+
+    fn run_server_and_collect(&mut self, clients: &mut [&mut TestClient]) {
         let now = self.net.now();
         self.server().update(now);
         for c in clients.iter_mut() {
@@ -666,8 +683,16 @@ impl TestClient {
     }
 }
 
+/// A PNG as the relay reads one: the magic and an IHDR saying 16×16
+/// (the relay checks a picture's size from its header), then `seed`
+/// to `len` bytes.
 fn png_blob(seed: u8, len: usize) -> Vec<u8> {
     let mut v = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    v.extend_from_slice(&13u32.to_be_bytes());
+    v.extend_from_slice(b"IHDR");
+    v.extend_from_slice(&16u32.to_be_bytes());
+    v.extend_from_slice(&16u32.to_be_bytes());
+    v.extend_from_slice(&[8, 6, 0, 0, 0]);
     v.extend(std::iter::repeat_n(seed, len.saturating_sub(v.len())));
     v
 }
@@ -4019,13 +4044,12 @@ fn config_validation_rejects_bad_channel_lists() {
     assert_eq!(config.validate_channels().expect("valid"), 1);
     assert_eq!(config.channels[0].name, "General");
     // A 1.0 `authentication:` section and a stale 0.5 key both still
-    // parse (warned about and ignored at startup), and the section is
-    // never written back.
+    // parse (ignored: the field is gone, review 2026-10), and the
+    // section is never written back.
     let config: Config = serde_yaml::from_str(
         "authentication:\n  secure: true\n  password: pw\nnetwork:\n  bytes_per_tick: 4194304\n",
     )
     .expect("yaml");
-    assert!(config.authentication.secure);
     let written = serde_yaml::to_string(&config).expect("serialize");
     assert!(!written.contains("authentication"));
 }
@@ -4327,6 +4351,105 @@ fn a_file_larger_than_the_minute_budget_goes_alone() {
         _ => None,
     });
     assert_eq!(reason, UploadRejectReason::Refused);
+    drop(w);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A picture whose header claims more than any client decodes is not
+/// relayed: a few KB that would freeze whoever shows it (review
+/// 2026-10, CLI-1).
+#[test]
+fn a_picture_no_client_would_show_is_not_relayed() {
+    let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
+    let mut alice = w.connect_member("alice");
+    let mut bob = w.connect_member("bob");
+    let mut bomb = png_blob(1, 2000);
+    bomb[16..20].copy_from_slice(&16_384u32.to_be_bytes());
+    bomb[20..24].copy_from_slice(&16_384u32.to_be_bytes());
+    alice.send_image(&mut w, 1, &bomb);
+    bob.send_image(&mut w, 2, &png_blob(2, 2000));
+    w.settle(&mut [&mut alice, &mut bob], Duration::from_secs(3));
+    assert_eq!(alice.images_completed(), 1, "only bob's");
+}
+
+/// A file does not spend the pictures' minute: one large file filled the
+/// shared server-wide window, and every picture after it was refused
+/// for a minute (review 2026-10, P1-11).
+#[test]
+fn a_large_file_leaves_the_pictures_budget_alone() {
+    let dir = temp_dir("file-vs-picture");
+    let mut config = persistent_config(vec![open_channel("Lobby", true)], &dir);
+    config.limits.max_transfer_kb_per_minute = 1; // 1 KiB/min per client
+    config.limits.max_transfer_kb_per_minute_global = 1; // and room-wide
+    let mut w = World::new(config);
+    let mut alice = w.connect_member("alice");
+    let mut bob = w.connect_member("bob");
+
+    let big = b"three kilobytes of notes, one budget of one".repeat(70);
+    post_file(
+        &mut alice,
+        &mut w,
+        &mut [&mut bob],
+        1,
+        "big.txt",
+        "text/plain",
+        &big,
+        ConvRef::General,
+    )
+    .expect("files are counted apart, under a floor of the file cap");
+
+    let picture = png_blob(7, 600);
+    bob.send_image(&mut w, 2, &picture);
+    w.settle(&mut [&mut alice, &mut bob], Duration::from_secs(3));
+    assert_eq!(alice.images_completed(), 1, "the picture went through");
+    drop(w);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The watched config's channel list applies on a live server, and the
+/// sessions are told — on a server that sleeps on `next_wake` between
+/// passes, as the real one does (review 2026-10, P3-66).
+#[test]
+fn a_reloaded_config_rebuilds_the_channel_list() {
+    let dir = temp_dir("config-reload");
+    let path = dir.join("server.yaml");
+    test_config(vec![
+        open_channel("Lobby", true),
+        open_channel("Ops", false),
+    ])
+    .save_to_file(&path)
+    .expect("save");
+    let mut w = World::new(Config::from_file(&path).expect("load"));
+    w.server().watch_config_file(path.clone());
+    let mut alice = w.connect_member("alice");
+    alice.inbox.clear();
+
+    let mut edited = Config::from_file(&path).expect("load");
+    edited.channels.push(open_channel("Games", false));
+    edited.save_to_file(&path).expect("save");
+    // A coarse file clock must still see a new time.
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .and_then(|f| f.set_modified(std::time::SystemTime::now() + Duration::from_secs(5)))
+        .expect("mtime");
+
+    // Within a config check (3 s) and a margin, waking only when the
+    // server asks to.
+    let until = w.net.now() + Duration::from_secs(5);
+    let mut names = None;
+    while names.is_none() && w.net.now() < until {
+        w.pump_on_wake(&mut [&mut alice]);
+        names = alice.inbox.iter().find_map(|m| match m {
+            ServerMessage::ChannelListUpdated { channels, .. } => {
+                Some(channels.iter().map(|c| c.name.clone()).collect::<Vec<_>>())
+            }
+            _ => None,
+        });
+    }
+    let names = names.expect("the reload reached the session");
+    assert!(names.iter().any(|n| n == "Games"), "{names:?}");
+    assert!(names.iter().any(|n| n == "Ops"), "{names:?}");
     drop(w);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -5612,7 +5735,7 @@ fn a_stalled_store_fails_a_dm_within_the_deadline() {
 /// to stay, and a file with a count above zero is never deleted
 /// (review P2-11).
 #[test]
-fn a_file_dm_that_was_not_stored_gives_its_reference_back() {
+fn a_file_dm_that_was_not_stored_gives_its_reference_back_once_the_store_says_so() {
     let dir = temp_dir("dm-file-stall");
     let mut w = World::new(persistent_config(vec![open_channel("Lobby", true)], &dir));
     let mut alice = w.connect_member("alice");
@@ -5657,8 +5780,22 @@ fn a_file_dm_that_was_not_stored_gives_its_reference_back() {
         send_as_dm(&mut alice, &mut w, &mut bob, 71),
         Err(DmFailReason::Store)
     );
-    assert_eq!(refs(&mut w), Some(1), "the failed DM holds nothing");
+    // A timeout does not say whether it was stored: the reference stays
+    // until the store says what points at the file (review 2026-10,
+    // P2-24) — given back at once, a DM written after all could lose
+    // its file to the prune.
+    assert_eq!(refs(&mut w), Some(2), "kept while unknown");
     drop(stalled);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while refs(&mut w) != Some(1) {
+        assert!(
+            Instant::now() < deadline,
+            "the recount never came: {:?}",
+            refs(&mut w)
+        );
+        w.settle(&mut [&mut alice, &mut bob], Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(5));
+    }
 
     assert_eq!(send_as_dm(&mut alice, &mut w, &mut bob, 72), Ok(()));
     assert_eq!(refs(&mut w), Some(2), "the room's post and the DM");

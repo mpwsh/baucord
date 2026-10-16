@@ -224,7 +224,6 @@ fn main() {
     println!();
 
     let config = VoiceChatConfig {
-        noise_suppression: true,
         // Very low threshold — don't want the gate to eat our impulse.
         gate_threshold: 0.005,
         ..Default::default()

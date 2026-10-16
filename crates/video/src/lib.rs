@@ -47,6 +47,8 @@ pub mod pool;
 pub mod pointer;
 #[cfg(target_os = "ios")]
 pub mod videotoolbox;
+#[cfg(target_os = "linux")]
+pub mod x11;
 pub mod yuv;
 
 /// Quality preset for screen sharing.
@@ -288,7 +290,6 @@ pub struct DecodedFrame {
     pub data: Vec<u8>,
     pub width: u32,
     pub height: u32,
-    pub timestamp_ms: u64,
     pub format: PictureFormat,
 }
 
@@ -335,25 +336,9 @@ pub enum CodecError {
 /// and this makes them visible from the sender's log alone.
 #[must_use]
 pub fn describe_annexb_nals(data: &[u8]) -> String {
-    let mut names: Vec<String> = Vec::new();
-    let mut i = 0usize;
-    while i + 3 < data.len() {
-        if data[i] != 0 || data[i + 1] != 0 {
-            i += 1;
-            continue;
-        }
-        let hdr = if data[i + 2] == 1 {
-            i + 3
-        } else if data[i + 2] == 0 && i + 4 < data.len() && data[i + 3] == 1 {
-            i + 4
-        } else {
-            i += 1;
-            continue;
-        };
-        if hdr >= data.len() {
-            break;
-        }
-        let name = match data[hdr] & 0x1F {
+    let names: Vec<String> = annexb::nal_units(data)
+        .into_iter()
+        .map(|unit| match annexb::nal_type(unit) {
             1 => "slice".to_string(),
             5 => "IDR".to_string(),
             6 => "SEI".to_string(),
@@ -361,10 +346,8 @@ pub fn describe_annexb_nals(data: &[u8]) -> String {
             8 => "PPS".to_string(),
             9 => "AUD".to_string(),
             t => format!("nal{t}"),
-        };
-        names.push(name);
-        i = hdr + 1;
-    }
+        })
+        .collect();
     if names.is_empty() {
         "no start codes found".to_string()
     } else {
@@ -546,11 +529,28 @@ pub trait VideoDecoder {
     fn next_poll(&self, _now: std::time::Instant) -> Option<std::time::Instant> {
         None
     }
+
+    /// The decoder lost its session (a failed decode; iOS takes it back
+    /// in the background) and drops every frame until a keyframe: the
+    /// caller asks the sharer for one. A still share sends none of its
+    /// own, and the picture stayed frozen (review 2026-10, P1-10).
+    fn needs_keyframe(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nal_types_are_named_in_order() {
+        let au = [
+            0, 0, 0, 1, 0x67, 1, 0, 0, 1, 0x68, 2, 0, 0, 1, 0x65, 3, 0, 0, 1, 0x0C, 4,
+        ];
+        assert_eq!(describe_annexb_nals(&au), "SPS,PPS,IDR,nal12");
+        assert_eq!(describe_annexb_nals(&[1, 2, 3]), "no start codes found");
+    }
 
     mod scaled_bitrate {
         use super::*;

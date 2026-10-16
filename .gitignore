@@ -1,6 +1,4 @@
 /target
-/backups
-diagnostics*.txt
 .DS_Store
 prompt.md
 *.log

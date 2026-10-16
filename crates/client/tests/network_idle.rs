@@ -3,8 +3,9 @@
 //! has its own socket wait since review P1-1.
 //!
 //! A bare QUIC endpoint on loopback stands in for the server: enough
-//! for the handshake, the client's `Hello`, and voice datagrams back.
-//! The client is the real network thread, driven through its channels.
+//! for the handshake, the client's `Hello`, a `Welcome` that admits it,
+//! and voice datagrams back. The client is the real network thread,
+//! driven through its channels.
 
 use std::{
     net::SocketAddr,
@@ -29,6 +30,8 @@ use transport::{Budget, ClientKey, Driver, Event, PeerId, ServerIdentity, UdpIo}
 struct Shared {
     client: Option<PeerId>,
     hello_bytes: usize,
+    /// The `Welcome` went out: the client is admitted.
+    welcomed: bool,
     /// Voice datagrams to send now, with the moment they were queued.
     outbox: Vec<(Vec<u8>, Instant)>,
     sent_at: Vec<Instant>,
@@ -48,6 +51,20 @@ fn serve(stop: &AtomicBool, shared: &Mutex<Shared>, udp: &mut UdpIo, driver: &mu
         if let Some(peer) = s.client {
             while let Some(frame) = driver.recv(peer, Lane::Control) {
                 s.hello_bytes += frame.len();
+            }
+            // Admit it, as a server does: what the client runs once
+            // admitted (link stats, telemetry, reports) is what an idle
+            // session costs. A connection still at its Hello did not
+            // show it (review 2026-10, P3-46).
+            if s.hello_bytes > 0 && !s.welcomed {
+                s.welcomed = true;
+                let welcome = protocol::ServerMessage::Welcome {
+                    client_id: 42,
+                    user_id: None,
+                    features: protocol::features::SERVER_1_1,
+                };
+                let bytes = protocol::encode_server_message(&welcome).expect("welcome");
+                let _ = driver.send(now, peer, Lane::Control, &bytes);
             }
             for (bytes, _) in std::mem::take(&mut s.outbox) {
                 let _ = driver.send(now, peer, Lane::Voice, &bytes);
@@ -117,28 +134,39 @@ fn a_quiet_connection_sleeps_and_still_hears_a_datagram_at_once() {
         })
         .expect("connect");
 
-    // The handshake and the Hello: inbound datagrams reach the client.
+    // The handshake, the Hello and the Welcome: inbound datagrams reach
+    // the client.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while shared.lock().unwrap().hello_bytes == 0 {
+    while !shared.lock().unwrap().welcomed {
         assert!(Instant::now() < deadline, "the client never said Hello");
         thread::sleep(Duration::from_millis(10));
     }
-    // Let the handshake's tail (acks, lane tags) settle.
-    thread::sleep(Duration::from_millis(500));
+    // Let the handshake's and the admission's tail (acks, lane tags,
+    // the first telemetry) settle.
+    thread::sleep(Duration::from_secs(2));
 
     // ── Asleep: a quiet connection wakes only when something is due —
-    // the 5 s keep-alive and its ack, the 2 s link stats — plus the
-    // inbound watcher's two looks a second (review P1-2). The 100 ms
+    // the 5 s keep-alive and its ack, the 2 s link stats (review P1-2);
+    // the inbound watcher no longer looks twice a second (review
+    // 2026-10, P2-40). The 100 ms
     // quiet tick made it about twelve; polling the socket, as Windows
     // did until review P1-1, a thousand.
+    // Measured over the idle steady state, long enough to hold the 5 s
+    // keep-alive and the 10 s telemetry: one second, unadmitted, saw
+    // neither (review 2026-10, P3-46).
+    let window = Duration::from_secs(12);
     let (passes_before, watcher_before) = (network::loop_passes(), network::watcher_wakes());
-    thread::sleep(Duration::from_secs(1));
+    thread::sleep(window);
     let passes = network::loop_passes() - passes_before;
     let watcher = network::watcher_wakes() - watcher_before;
-    eprintln!("network loop: {passes} wakes and {watcher} watcher wakes in a quiet second");
+    #[allow(clippy::cast_precision_loss)]
+    let per_second = (passes + watcher) as f64 / window.as_secs_f64();
+    eprintln!(
+        "network loop: {passes} wakes and {watcher} watcher wakes in {window:?} ({per_second:.1}/s)"
+    );
     assert!(
-        passes + watcher < 25,
-        "{passes} loop and {watcher} watcher wakes in a quiet second (something polls)"
+        per_second < 5.0,
+        "{passes} loop and {watcher} watcher wakes in {window:?} (something polls)"
     );
 
     // ── Awake on arrival: a voice datagram reaches the engine at once,

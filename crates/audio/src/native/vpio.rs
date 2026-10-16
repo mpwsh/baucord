@@ -52,6 +52,7 @@ use rtrb::{Consumer, Producer};
 use super::{
     avsession,
     pump::{CapturePump, RenderPump},
+    CaptureStartError, RenderStartError,
 };
 use crate::{
     aec::reasons, input_config::InputConfig, latch::Ring, stats::AudioStats, OPUS_SAMPLE_RATE,
@@ -474,14 +475,6 @@ pub struct NativeCapture {
     pub aec_verdict: Result<(), &'static str>,
 }
 
-/// Handed back when the unit could not be opened, so the cpal path can
-/// use the ring and the latch instead.
-pub struct CaptureStartError {
-    pub reason: String,
-    pub producer: Producer<f32>,
-    pub wake_tx: Ring,
-}
-
 impl NativeCapture {
     /// Attach the microphone to the voice-processing unit — the plan's
     /// ([`prepare`]), or one opened here if there is none.
@@ -547,13 +540,6 @@ pub struct NativeRender {
     pub device_name: String,
 }
 
-/// Handed back when the unit could not be opened.
-pub struct RenderStartError {
-    pub reason: String,
-    pub consumer: Consumer<f32>,
-    pub wake_tx: Ring,
-}
-
 impl NativeRender {
     /// Attach the speaker to the voice-processing unit — the plan's
     /// ([`prepare`]), or one opened here if there is none.
@@ -580,7 +566,7 @@ impl NativeRender {
         let attached = Arc::new(AtomicBool::new(true));
         unit.render.attach(Half {
             attached: attached.clone(),
-            pump: RenderPump::new(consumer, wake_tx, stats, callback_frames),
+            pump: RenderPump::new(consumer, wake_tx, stats, Some(callback_frames)),
         });
         Ok(Self {
             attached,

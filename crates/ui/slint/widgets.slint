@@ -8,6 +8,7 @@
 import { Icon, IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
 import { MenuEntry, State } from "globals.slint";
+import { ListView, ScrollView } from "std-widgets.slint";
 
 // ── Tooltips ────────────────────────────────────────────────────────────
 
@@ -636,9 +637,26 @@ export component Card inherits Rectangle {
 /// its first field focused does that in `opened`, not in the field's
 /// own `init`: that one runs before this component's, and the scope
 /// then took the keyboard back — typing and Enter went nowhere.
+/// The part of the window a page may use (main.slint's `page-rect`):
+/// clear of a phone's status and navigation bars and of the keyboard.
+export struct PageRect {
+    x: length,
+    y: length,
+    width: length,
+    height: length,
+}
+
 export component Modal inherits Rectangle {
     /// The card's width, where the window has the room.
     in property <length> card-width: 380px;
+    /// Where the card may sit. It was centred in the whole window, so
+    /// on a phone its buttons sat under the keyboard its own field had
+    /// raised (review 2026-10, P2-23). Unset: the whole window.
+    in property <PageRect> page;
+    property <length> area-x: root.page.width > 0 ? root.page.x : 0;
+    property <length> area-y: root.page.height > 0 ? root.page.y : 0;
+    property <length> area-width: root.page.width > 0 ? root.page.width : root.width;
+    property <length> area-height: root.page.height > 0 ? root.page.height : root.height;
     /// The dialog is up and has the keyboard: focus a field here.
     callback opened();
     /// Escape, Back, or a click outside the card.
@@ -662,15 +680,23 @@ export component Modal inherits Rectangle {
             return root.key(ev);
         }
         Card {
-            x: (parent.width - self.width) / 2;
-            y: (parent.height - self.height) / 2;
-            width: Math.min(root.card-width, root.width - 48px);
-            height: body.preferred-height;
+            width: Math.min(root.card-width, root.area-width - 48px);
+            // Taller than the room left: the card scrolls.
+            height: Math.min(body.preferred-height, root.area-height - 2 * Theme.gap-md);
+            x: root.area-x + (root.area-width - self.width) / 2;
+            y: root.area-y + (root.area-height - self.height) / 2;
             TouchArea { }   // swallow clicks inside the card
-            body := VerticalLayout {
-                padding: Theme.gap-lg;
-                spacing: Theme.gap-md;
-                @children
+            ScrollView {
+                mouse-drag-pan-enabled: State.touch-host;
+                // Up and down only: the body is laid out to the card's
+                // width.
+                horizontal-scrollbar-policy: always-off;
+                content-width: self.visible-width;
+                body := VerticalLayout {
+                    padding: Theme.gap-lg;
+                    spacing: Theme.gap-md;
+                    @children
+                }
             }
         }
     }
@@ -854,7 +880,10 @@ export component MenuPanel inherits Rectangle {
                 }
             }
             if !e.slider : row := Rectangle {
-                height: 30px;
+                // Finger-sized on a touch host: the long-press menu is
+                // the only way to Copy, Report or Delete on a phone, and
+                // its rows were 30 px (review 2026-10, P3-18).
+                height: State.touch-host ? 44px : 30px;
                 border-radius: Theme.radius-sm;
                 background: e.enabled && (it.has-hover || root.open-entry == i)
                     ? Theme.hover : transparent;
@@ -950,19 +979,30 @@ export component Dropdown inherits Rectangle {
         clicked => { pop.show(); }
     }
 
+    // A finger-sized row on a touch host (review 2026-10, P3-18).
+    property <length> row-height: State.touch-host ? 44px : 30px;
     pop := PopupWindow {
         x: 0;
         y: root.height + 4px;
         width: root.width;
+        // At most eight and a half rows, the rest a scroll away (and a
+        // finger's pan): options past the window's height could not be
+        // reached, up to 100 roles (review 2026-10, P3-22). A ListView,
+        // so only the rows in view exist.
+        height: Math.min(root.options.length * root.row-height, 8.5 * root.row-height) + 8px;
         Rectangle {
             background: Theme.bg-tertiary;
             border-radius: Theme.radius-md;
             border-width: 1px;
             border-color: Theme.border;
-            VerticalLayout {
-                padding: 4px;
+            ListView {
+                x: 4px;
+                y: 4px;
+                width: parent.width - 8px;
+                height: parent.height - 8px;
+                mouse-drag-pan-enabled: State.touch-host;
                 for opt[i] in root.options : Rectangle {
-                    height: 30px;
+                    height: root.row-height;
                     border-radius: Theme.radius-sm;
                     background: it.has-hover ? Theme.hover
                         : i == root.current ? Theme.accent : transparent;

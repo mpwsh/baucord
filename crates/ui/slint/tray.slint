@@ -43,7 +43,7 @@ export component BaucordTray inherits SystemTrayIcon {
     /// `people[index]`, muted or unmuted for us.
     callback toggle-person(int);
 
-    // A flat glyph that still reads at 16 px (scripts/tray-icons.py),
+    // The app icon's dog on a disc, made by hand at 64 px; the disc is
     // red while nobody hears us.
     icon: root.quiet ? @image-url("../../../assets/icons/tray-quiet.png")
         : @image-url("../../../assets/icons/tray.png");

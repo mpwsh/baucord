@@ -26,7 +26,7 @@ use std::{
     ptr::NonNull,
 };
 
-use app_core::files::{safe_name, unique_path, PickSlot};
+use app_core::files::{safe_name, write_new, PickSlot};
 use block2::RcBlock;
 use frontend::host::{ChimeRoute, Hooks, KeepAlive, Notice, NoticeKind, OnPick, Saved};
 use i18n::t;
@@ -126,8 +126,7 @@ impl Hooks for IosHost {
             .ok_or("the app has no Documents folder")?
             .join("Downloads");
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let target = unique_path(&dir, &safe_name(name));
-        std::fs::write(&target, bytes).map_err(|e| e.to_string())?;
+        let target = write_new(&dir, &safe_name(name), bytes).map_err(|e| e.to_string())?;
         let file = target
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())

@@ -40,12 +40,19 @@ impl AppState {
             }
         }
 
+        // A bounded share each pass, so one busy source cannot hold the
+        // event loop; what is left posts the next pass at once. The
+        // cut-off used to wait for the next message or the 2 s timer —
+        // a join burst on a big server left rows late (review 2026-10,
+        // P2-1).
+        let mut more = false;
         for _ in 0..256 {
             match st.network.msg_rx.try_recv() {
                 Ok(msg) => st.handle_network_message(msg),
                 Err(_) => break,
             }
         }
+        more |= !st.network.msg_rx.is_empty();
 
         for _ in 0..32 {
             match st.voice.event_rx.try_recv() {
@@ -53,6 +60,7 @@ impl AppState {
                 Err(_) => break,
             }
         }
+        more |= !st.voice.event_rx.is_empty();
 
         // Non-frame screen events, forwarded by the present-prep
         // thread (which owns screen.event_rx now — see present.rs).
@@ -61,6 +69,10 @@ impl AppState {
                 Ok(evt) => st.handle_screen_event(evt),
                 Err(_) => break,
             }
+        }
+        more |= !st.ui_screen_rx.is_empty();
+        if more {
+            super::wake();
         }
         // Frames arrive as ready-made SharedPixelBuffers: the copy was
         // paid on the prep thread; presenting is an Image wrap + a
@@ -101,7 +113,6 @@ impl AppState {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     /// Present one prepared frame: wrap the (already-copied) pixel
     /// buffer in an Image handle and hand it to the viewer window. The
     /// heavy work happened on the prep thread; this path stays well
@@ -158,29 +169,6 @@ impl AppState {
             ScreenEvent::FrameReady { .. } => {
                 debug_assert!(false, "FrameReady is consumed by the present-prep thread");
             }
-            ScreenEvent::PeerStartedSharing {
-                client_id,
-                width,
-                height,
-            } => {
-                let username = self.username_of(client_id);
-                info!("{username} started sharing ({width}x{height})");
-                if !self.client_blocked(client_id) {
-                    self.push_activity(&t!("chat-peer-sharing", "name" => username.as_str()));
-                }
-            }
-            ScreenEvent::PeerStoppedSharing { client_id } => {
-                let username = self.username_of(client_id);
-                info!("{username} stopped sharing");
-                if !self.client_blocked(client_id) {
-                    self.push_activity(
-                        &t!("chat-peer-stopped-sharing", "name" => username.as_str()),
-                    );
-                }
-                if let Some(viewer) = self.viewers.remove(&client_id) {
-                    viewer.close();
-                }
-            }
         }
     }
 
@@ -205,7 +193,7 @@ impl AppState {
                 if let Some(server) = self.settings.default_server_mut()
                     && server.invite_code.take().is_some()
                 {
-                    self.settings.save();
+                    self.save_settings();
                     crate::settingsui::refresh_servers(self);
                 }
                 crate::settingsui::refresh_safety(self);
@@ -246,7 +234,7 @@ impl AppState {
                 if let Some(server) = self.settings.default_server_mut() {
                     server.invite_code = None;
                 }
-                self.settings.save();
+                self.save_settings();
                 let s = self.main.global::<State>();
                 s.set_invite_prompt_text(
                     t!(match why {
@@ -344,7 +332,7 @@ impl AppState {
                 if let Some(own) = self.session.chat.own_texts.get_mut(&msg_id) {
                     own.clone_from(&text);
                 }
-                let text = app_core::emoji::replace_shortcodes(&text);
+                let text = app_core::emoji::for_display(&text);
                 // In place when the message is on screen; a notice
                 // when it scrolled out of the window (or predates it).
                 let edited = self.with_conversation(None, |app| {
@@ -474,12 +462,15 @@ impl AppState {
                         // the placeholder into this message.
                         let already = self.with_conversation(None, |app| app.history.has(id));
                         if !already {
-                            self.want_picture(&attachment, key, id);
+                            self.want_picture(&file, key, id);
                             self.push_chat_file(&meta, file);
                         }
                     }
+                    // The picture is fetched where the card is shown
+                    // (`take_direct`): a DM never opened gets it with
+                    // its page, and it used to be fetched twice (review
+                    // 2026-10, P2-5).
                     client::ConvRef::Dm(_) => {
-                        self.want_picture(&attachment, key, id);
                         self.take_direct(from, &username, id, ts, Incoming::File(file));
                     }
                 }
@@ -489,17 +480,23 @@ impl AppState {
                     client::ConvRef::General => None,
                     client::ConvRef::Dm(user) => Some(user),
                 };
-                for (msg_id, a) in &items {
-                    self.want_picture(a, key, *msg_id);
-                }
-                self.with_conversation(key, |app| {
-                    for (msg_id, a) in items {
+                let files: Vec<(u64, app_core::chat::FileMeta)> = items
+                    .into_iter()
+                    .map(|(msg_id, a)| {
                         let file = app_core::chat::FileMeta {
                             blob: a.blob_id,
                             name: a.name,
                             mime: a.mime,
                             size: a.size,
                         };
+                        (msg_id, file)
+                    })
+                    .collect();
+                for (msg_id, file) in &files {
+                    self.want_picture(file, key, *msg_id);
+                }
+                self.with_conversation(key, |app| {
+                    for (msg_id, file) in files {
                         if let Some(i) = app.history.attach_file(msg_id, file) {
                             let row = app.chat_row_at(i);
                             app.chat_model.set_row_data(i, row);
@@ -564,6 +561,7 @@ impl AppState {
                     .session
                     .details
                     .insert(client_id, (user_id, roles.clone()));
+                self.session.account_sessions.insert(user_id, client_id);
                 if let Some(user) = self.session.users.get_mut(&client_id) {
                     user.role = role_of(&roles);
                     user.level = level;
@@ -659,7 +657,7 @@ impl AppState {
             NetworkMessage::ConnectionLost { kind, detail } => {
                 const MAX_AUTO_RECONNECTS: u32 = 5;
                 // Network, not credentials: come back on our own, with
-                // backoff (2, 4, 8, 16, 30 s), instead of dumping the
+                // backoff (`reconnect_wait`), instead of dumping the
                 // user on the connect screen with a transport error.
                 // The user sees one plain sentence per kind; the
                 // transport's wording goes to the log only.
@@ -669,8 +667,8 @@ impl AppState {
                     LossKind::Reset => "error-lost-reset",
                     LossKind::Unreachable => "error-lost-unreachable",
                     LossKind::ServerRestart => "error-lost-restart",
+                    LossKind::Full => "error-lost-full",
                 });
-                self.push_chat_system(&what);
                 // Where to go back to, if the reconnect is automatic.
                 // Only a live session knows: a retry that failed in turn
                 // is not in any room, and used to overwrite the room
@@ -701,8 +699,8 @@ impl AppState {
                     self.show_error(&format!("{what} {}", t!("error-lost-gave-up")));
                 } else {
                     self.reconnect_attempts += 1;
-                    let secs = (2u64 << (self.reconnect_attempts - 1)).min(30);
-                    let secs_text = secs.to_string();
+                    let wait = reconnect_wait(kind, self.reconnect_attempts);
+                    let secs_text = wait.as_secs().max(1).to_string();
                     self.show_toast(
                         ToastKind::Warning,
                         &format!(
@@ -712,18 +710,15 @@ impl AppState {
                     );
                     let weak = APP.with(|a| a.borrow().as_ref().map(Rc::downgrade));
                     if let Some(weak) = weak {
-                        self.reconnect_timer.start(
-                            slint::TimerMode::SingleShot,
-                            Duration::from_secs(secs),
-                            move || {
+                        self.reconnect_timer
+                            .start(slint::TimerMode::SingleShot, wait, move || {
                                 with_app(&weak, |app| {
                                     if !app.connected {
                                         let nickname = app.settings.user.nickname.clone();
                                         app.handle_connect(&nickname);
                                     }
                                 });
-                            },
-                        );
+                            });
                     }
                 }
             }
@@ -742,7 +737,7 @@ impl AppState {
                     if let Some(server) = self.settings.default_server_mut() {
                         server.fingerprint = Some(fingerprint.clone());
                     }
-                    self.settings.save();
+                    self.save_settings();
                     crate::settingsui::refresh_servers(self);
                     if first_use {
                         info!("Pinned server identity {fingerprint}");
@@ -760,7 +755,6 @@ impl AppState {
                     "expected" => expected.as_str(),
                     "observed" => observed.as_str()
                 );
-                self.push_chat_system(&text);
                 self.teardown_connection();
                 self.show_connect_phase();
                 self.show_error(&text);
@@ -829,7 +823,6 @@ impl AppState {
                     what
                 };
                 if self.connected {
-                    self.push_chat_system(&t!("chat-disconnected", "reason" => what.as_str()));
                     self.teardown_connection();
                     self.show_connect_phase();
                 } else {
@@ -888,7 +881,16 @@ impl AppState {
             NetworkMessage::ChannelListUpdated {
                 channels,
                 memberships,
-            } => self.handle_channels_updated(&channels, &memberships),
+            } => {
+                // A channel's menu holds its wire id, which a reload on
+                // the server can give to another channel: close it
+                // rather than act on the wrong one (review 2026-10,
+                // P1-8).
+                if matches!(self.menu_target, Some(MenuTarget::Channel(_))) {
+                    self.close_menu();
+                }
+                self.handle_channels_updated(&channels, &memberships);
+            }
             NetworkMessage::UserLeft {
                 client_id,
                 username,
@@ -923,7 +925,7 @@ impl AppState {
                     self.session.chat.own_texts.insert(id, text.clone());
                 }
                 // Render shortcodes from clients that send them raw.
-                let text = app_core::emoji::replace_shortcodes(&text);
+                let text = app_core::emoji::for_display(&text);
                 self.push_chat_message(&meta, &text, false);
                 // Ordinary messages are silent by design; a mention may
                 // chime if the person asked for it.
@@ -936,9 +938,12 @@ impl AppState {
                 // image's (review P1-17). One that has no card (the
                 // avatar) or whose card is gone shows nowhere.
                 let card = match upload {
-                    client::network::UploadKey::Image => {
-                        self.session.transfers.image_upload.map(|id| (None, id))
-                    }
+                    client::network::UploadKey::Image(token) => self
+                        .session
+                        .transfers
+                        .image_uploads
+                        .contains(&token)
+                        .then_some((None, token)),
                     client::network::UploadKey::Blob(upload_id) => self
                         .session
                         .transfers
@@ -972,7 +977,7 @@ impl AppState {
                     pending: false,
                 };
                 if meta.own {
-                    self.drop_image_card();
+                    self.drop_oldest_image_card();
                 }
                 let shown =
                     self.with_conversation(None, |app| media::push_image_row(app, &meta, data));
@@ -1053,6 +1058,21 @@ impl AppState {
                     .active_sharers
                     .insert(client_id, (width, height));
                 self.update_user_list();
+                // The screen thread hears it from here, reliably
+                // (review 2026-10, P2-13).
+                self.screen
+                    .tx
+                    .send(ScreenControl::PeerStartedSharing {
+                        client_id,
+                        width,
+                        height,
+                    })
+                    .ok();
+                let username = self.username_of(client_id);
+                info!("{username} started sharing ({width}x{height})");
+                if !self.client_blocked(client_id) {
+                    self.push_activity(&t!("chat-peer-sharing", "name" => username.as_str()));
+                }
                 // A stream going up in our channel — ours included: the
                 // sharer hears that they are live, the same as the room.
                 let in_our_channel = self
@@ -1070,19 +1090,29 @@ impl AppState {
             NetworkMessage::ScreenShareStopped { client_id } => {
                 self.session.active_sharers.remove(&client_id);
                 self.update_user_list();
+                // Its decoder, buffer and sound go on the screen thread;
+                // the viewer closes here.
+                self.screen
+                    .tx
+                    .send(ScreenControl::PeerStoppedSharing { client_id })
+                    .ok();
+                let username = self.username_of(client_id);
+                info!("{username} stopped sharing");
+                if !self.client_blocked(client_id) {
+                    self.push_activity(
+                        &t!("chat-peer-stopped-sharing", "name" => username.as_str()),
+                    );
+                }
+                if let Some(viewer) = self.viewers.remove(&client_id) {
+                    viewer.close();
+                }
             }
             // ── 1.1.2: profiles and blobs (spec §7, §7.1) ────────────
             NetworkMessage::UserProfile { client_id, profile } => {
                 self.take_profile(client_id, profile);
             }
             NetworkMessage::ProfileUpdated { user_id, profile } => {
-                let client = self
-                    .session
-                    .details
-                    .iter()
-                    .find(|(_, (u, _))| *u == user_id)
-                    .map(|(c, _)| *c);
-                if let Some(client_id) = client {
+                if let Some(client_id) = self.session_of(&user_id) {
                     self.take_profile(client_id, profile);
                 } else if let Some(name) = self
                     .session
@@ -1189,6 +1219,11 @@ impl AppState {
                 }
             }
             NetworkMessage::BlobFailed { blob_id } => {
+                // Asked again the next time it is wanted: a failure
+                // used to keep it pending, never fetched again this
+                // session (review 2026-10, P2-5).
+                self.session.transfers.pending_pictures.remove(&blob_id);
+                self.session.avatar_fetches.remove(&blob_id);
                 if let Some(PendingDownload { name, conv, msg_id }) =
                     self.session.transfers.pending_downloads.remove(&blob_id)
                 {
@@ -1201,21 +1236,26 @@ impl AppState {
             }
             NetworkMessage::Blob { blob_id, data } => {
                 if let Some(rows) = self.session.transfers.pending_pictures.remove(&blob_id) {
+                    let shared: std::sync::Arc<[u8]> = data.as_slice().into();
                     for (conv, msg_id) in rows {
-                        let bytes = data.clone();
+                        let bytes = std::sync::Arc::clone(&shared);
                         self.with_conversation(conv, |app| {
                             media::picture_from_file(app, msg_id, bytes);
                         });
                     }
+                }
+                // Only what a look asked for is an avatar. Every other
+                // blob used to land here too — each chat picture decoded
+                // on the UI thread, kept for the session and written to
+                // the avatar cache for good (review 2026-10, P0-1).
+                if self.session.avatar_fetches.remove(&blob_id) {
+                    self.take_avatar_blob(blob_id, &data);
                 }
                 if let Some(PendingDownload { name, conv, msg_id }) =
                     self.session.transfers.pending_downloads.remove(&blob_id)
                 {
                     self.set_transfer(conv, msg_id, None);
                     self.save_download(blob_id, name, conv, msg_id, data);
-                } else {
-                    self.session.avatar_fetches.remove(&blob_id);
-                    self.take_avatar_bytes(blob_id, &data, true);
                 }
             }
             NetworkMessage::BlobMissing { blob_id } => {
@@ -1263,7 +1303,7 @@ impl AppState {
                         }
                         app.session.oldest_history_id.get_or_insert(msg_id);
                         if let Some(png) = picture {
-                            media::picture_from_file(app, msg_id, png);
+                            media::picture_from_file(app, msg_id, png.into());
                         }
                     });
                     if let Some(user) = key
@@ -1344,4 +1384,25 @@ impl AppState {
     // ════════════════════════════════════════════════════════════════
     //  CONNECTION FLOW
     // ════════════════════════════════════════════════════════════════
+}
+
+/// How long before reconnect attempt `attempt` (1, 2, …) after a loss of
+/// `kind`: 2, 4, 8, 16, 30 s — a full server 5, 10, 20, 40, 60 s — each
+/// moved by up to half either way. Every client used to come back at
+/// exactly 2 s after a deploy, and an office behind one address filled
+/// the server's waiting room at once, where a refusal was final (review
+/// 2026-10, P2-16).
+fn reconnect_wait(kind: LossKind, attempt: u32) -> Duration {
+    let step = attempt.saturating_sub(1).min(5);
+    let secs = match kind {
+        LossKind::Full => (5u64 << step).min(60),
+        _ => (2u64 << step).min(30),
+    };
+    // A spread, not a secret: the clock's nanoseconds are as good as a
+    // random number here.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let factor = 0.5 + f64::from(nanos % 1000) / 1000.0;
+    Duration::from_secs(secs).mul_f64(factor)
 }

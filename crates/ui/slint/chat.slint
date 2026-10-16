@@ -813,10 +813,11 @@ component NavBack inherits Rectangle {
     callback clicked;
     property <int> elsewhere: State.dm-unread-total
         + (State.active-dm >= 0 ? State.general-unread : 0);
-    width: 32px;
-    height: 32px;
+    // Finger-sized on a touch host (review 2026-10, P3-18).
+    width: State.touch-host ? 40px : 32px;
+    height: self.width;
     IconBtn {
-        size: 32px;
+        size: parent.width;
         icon-size: 20px;
         icon: IconSet.ArrowLeft;
         idle-color: Theme.text-primary;
@@ -849,10 +850,10 @@ component HeaderBtn inherits Rectangle {
     in property <Icon> icon;
     in property <string> tooltip;
     callback clicked;
-    width: 32px;
+    width: State.touch-host ? 40px : 32px;
     IconBtn {
         y: (parent.height - self.height) / 2;
-        size: 32px;
+        size: parent.width;
         icon-size: 18px;
         icon: root.icon;
         tooltip: root.tooltip;
@@ -865,6 +866,11 @@ export component ChatPane inherits Rectangle {
     /// The narrow layout's chat page (ANDROID-SPEC.md D26): the header
     /// leads with the way back to the list.
     in property <bool> narrow: false;
+    /// The pane is on screen. Off (a page over it, the window in the
+    /// tray or minimized, a phone app in the background) a follow owed
+    /// waits, and is done when the pane is back: it ran 8 to 90 frames
+    /// a message whether or not anyone saw it (review 2026-10, P1-3).
+    in property <bool> drawn: true;
     background: Theme.bg-primary;
 
     public function scroll-to-end() {
@@ -955,7 +961,7 @@ export component ChatPane inherits Rectangle {
 
     Timer {
         interval: 16ms;
-        running: root.follow-pending && !root.user-scrolling;
+        running: root.follow-pending && !root.user-scrolling && root.drawn;
         triggered => {
             root.scroll-to-end();
             root.follow-ticks += 1;
@@ -1326,7 +1332,7 @@ export component ChatPane inherits Rectangle {
         // Editing one of our messages: say so, and give Escape a
         // visible way out.
         if State.editing : Rectangle {
-            height: 26px;
+            height: State.touch-host ? 44px : 26px;
             border-radius: Theme.radius-sm;
             background: Theme.bg-secondary;
             HorizontalLayout {
@@ -1350,7 +1356,9 @@ export component ChatPane inherits Rectangle {
                     horizontal-stretch: 1;
                 }
                 IconBtn {
-                    size: 22px;
+                    // Finger-sized on a touch host (review 2026-10,
+                    // P3-18); the bar grows with it.
+                    size: State.touch-host ? 40px : 22px;
                     icon-size: 14px;
                     icon: IconSet.X;
                     clicked => { Logic.edit-cancel(); }
@@ -1585,9 +1593,13 @@ export component ChatPane inherits Rectangle {
             // A ListView, so only the rows in view exist: as one
             // layout the palette built all 344 cells — about a thousand
             // items — every time it opened (review P3-38).
-            ListView {
-                // 8 columns of 40px cells, gap-xs breathing room
-                property <int> cols: 8;
+            emoji-list := ListView {
+                // As many 40 px cells as the width holds (8 at the full
+                // 392 px), gap-xs between: a fixed 8 lost its last
+                // column under 388 px, a phone's width (review 2026-10,
+                // P2-21). A finger pans it (ANDROID-SPEC.md D27).
+                property <int> cols: Math.max(1, Math.floor((self.width + Theme.gap-xs) / (40px + Theme.gap-xs)));
+                mouse-drag-pan-enabled: State.touch-host;
                 x: Theme.gap-sm; y: Theme.gap-sm;
                 width: parent.width - 2 * Theme.gap-sm;
                 height: parent.height - 2 * Theme.gap-sm - 26px;
@@ -1600,9 +1612,9 @@ export component ChatPane inherits Rectangle {
                         height: 40px;
                         alignment: start;
                         spacing: Theme.gap-xs;
-                        for c in 8 : Rectangle {
+                        for c in emoji-list.cols : Rectangle {
                             width: 40px;
-                            property <int> idx: r * 8 + c;
+                            property <int> idx: r * emoji-list.cols + c;
                             border-radius: Theme.radius-sm;
                             background: et.has-hover ? Theme.hover : transparent;
                             if idx < State.emoji.length : Text {
@@ -1613,6 +1625,7 @@ export component ChatPane inherits Rectangle {
                                 // VS16 sequences on the Skia raster
                                 // path (the palette's tofu boxes).
                                 font-family: Platform.os == OperatingSystemType.macos
+                                    || Platform.os == OperatingSystemType.ios
                                     ? "Apple Color Emoji"
                                     : Platform.os == OperatingSystemType.windows
                                         ? "Segoe UI Emoji"

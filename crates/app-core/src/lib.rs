@@ -33,5 +33,3 @@ pub mod roster;
 pub mod stats;
 pub mod update;
 pub mod usage;
-
-pub use emoji_table::EMOJI;

@@ -32,7 +32,8 @@ impl AppState {
         s.set_latency_line(
             t!("latency-line",
                 "audio" => audio_str,
-                "network" => net_str(rtt_ms, loss_pct))
+                "network" => net_str(rtt_ms, loss_pct, |rtt, loss| t!("latency-net-loss",
+                    "rtt" => rtt, "loss" => loss)))
             .into(),
         );
         // In Mb, beside the arrows the sidebar draws.
@@ -40,7 +41,6 @@ impl AppState {
         s.set_latency_down(format!("{:.1}", kbps_down / 1000.0).into());
     }
 
-    #[allow(clippy::cast_precision_loss)]
     /// The share is over: stop its timer and clear the stats line (it
     /// kept showing the last sample).
     pub(super) fn stop_stream_stats(&mut self) {
@@ -79,36 +79,42 @@ impl AppState {
         if !self.main_on_screen() {
             return;
         }
-        let stats = app_core::stats::StreamStats {
-            quality: quality_str,
-            avg_frame_kb: frame_bytes as f32 / 1024.0,
-            encode_ms: encode_us as f32 / 1000.0,
-            viewers,
-            fps_scale_pct,
-            loss_pct,
-        };
         let line1 = t!("stream-stats-quality",
-            "quality" => stats.quality.as_str(), "viewers" => stats.viewers);
+            "quality" => quality_str.as_str(), "viewers" => viewers);
         let mut line2 = t!("stream-stats-frame",
-            "kb" => format!("{:.0}", stats.avg_frame_kb),
-            "ms" => format!("{:.1}", stats.encode_ms));
-        if stats.degraded() {
+            "kb" => format!("{:.0}", frame_bytes as f32 / 1024.0),
+            "ms" => format!("{:.1}", encode_us as f32 / 1000.0));
+        // Below 100 the sender is shedding fps for lossy viewers: the
+        // block turns warning-colored, so the sharer notices without
+        // reading numbers.
+        let degraded = fps_scale_pct < 100;
+        if degraded {
             line2.push_str(" · ");
             line2.push_str(&t!("stream-stats-degraded",
-                "fps" => stats.fps_scale_pct,
-                "loss" => format!("{:.1}", stats.loss_pct)));
+                "fps" => fps_scale_pct,
+                "loss" => format!("{loss_pct:.1}")));
         }
         let s = self.main.global::<State>();
         s.set_stream_stats(format!("{line1}\n{line2}").into());
-        s.set_stream_degraded(stats.degraded());
+        s.set_stream_degraded(degraded);
     }
 
     /// Whether the main screen is actually being rendered: false on the
-    /// connect view, hidden to the tray, minimized, or with a phone app
-    /// in the background. Stats updates and resource sampling are
-    /// skipped while this is false.
+    /// connect view, under a page (Settings, the admin panel, a phone's
+    /// stream — main.slint's `main-shown`), hidden to the tray,
+    /// minimized, or with a phone app in the background. Stats updates,
+    /// resource sampling, roster rebuilds and chat GIFs wait while this
+    /// is false (review 2026-10, P2-30); `Logic.main-screen-shown`
+    /// catches them up.
     pub(super) fn main_on_screen(&self) -> bool {
-        self.main.global::<State>().get_phase() == Phase::Main
+        let s = self.main.global::<State>();
+        // A phone's picture viewer covers it whole.
+        let viewer_covers = s.get_viewer_open() && s.get_touch_host();
+        s.get_phase() == Phase::Main
+            && !s.get_settings_open()
+            && !s.get_admin_open()
+            && !s.get_watch_open()
+            && !viewer_covers
             && host_visible()
             && self.main.window().is_visible()
             && !self.main.window().is_minimized()
@@ -118,6 +124,24 @@ impl AppState {
     /// the background paused. The stats lines come back with the next
     /// 2-second sample by themselves.
     pub(super) fn host_shown(&mut self) {
+        self.set_app_shown(true);
+        // The stream left in the background: asked for again; the
+        // server starts it with a keyframe.
+        if let Some(id) = self.paused_watch.take()
+            && self.viewers.contains_key(&id)
+            && self.session.active_sharers.contains_key(&id)
+        {
+            self.screen
+                .tx
+                .send(ScreenControl::Watch { client_id: id })
+                .ok();
+            self.network
+                .tx
+                .send(NetworkControl::Send(ClientMessage::SubscribeScreen {
+                    target_id: id,
+                }))
+                .ok();
+        }
         self.clear_seen_notices();
         // The roster changes the background held back (review P1-9).
         self.flush_roster();
@@ -138,12 +162,59 @@ impl AppState {
     /// may record behind the user's back, and an open microphone would
     /// keep iOS from suspending an app that is not even connected.
     pub(super) fn host_hidden(&mut self) {
+        self.set_app_shown(false);
+        // A phone in the background stops watching: nothing of the
+        // stream comes any more, its sound included — about 3.6 GB an
+        // hour came down for a page nobody saw (review 2026-10, P1-2;
+        // ANDROID-SPEC.md D74). The page stays, and asks again on
+        // return.
+        if let Some(id) = self.page_viewer_id() {
+            self.paused_watch = Some(id);
+            self.screen
+                .tx
+                .send(ScreenControl::StopWatching { client_id: id })
+                .ok();
+            self.network
+                .tx
+                .send(NetworkControl::UnsubscribeScreen { target_id: id })
+                .ok();
+        }
         self.set_audio_tab_open(false);
+    }
+
+    /// Whether anything of ours is on screen, for what only draws
+    /// (`State.app-shown`: the chat's follow). Off in the tray,
+    /// minimized, wholly covered, or a phone app in the background.
+    pub(crate) fn set_app_shown(&self, shown: bool) {
+        let s = self.main.global::<State>();
+        if s.get_app_shown() == shown {
+            return;
+        }
+        s.set_app_shown(shown);
+        // The screen's own timers at the pace of what is seen: shown,
+        // the device poll every 2.5 s and the resource line every 2 s;
+        // out of sight the poll every 10 s (a picked device that went
+        // away still falls back to the default) and no resource line.
+        // Both ran at full pace from launch to exit (review 2026-10,
+        // P2-33).
+        self.device_timer
+            .set_interval(Duration::from_millis(if shown { 2500 } else { 10_000 }));
+        if shown {
+            self.resource_timer.restart();
+        } else {
+            self.resource_timer.stop();
+        }
+        // The link stats feed only the screen: the network thread stops
+        // handing them over (P2-48, already so on the phones).
+        client::network::set_ui_visible(shown);
     }
 
     /// The desktop's main window is back in view (out of the tray,
     /// restored, uncovered): what waited for that happens now.
     pub(crate) fn main_revealed(&mut self) {
+        self.set_app_shown(true);
+        // Settings, if that is what is back: its timer and meters.
+        crate::settingsui::sync_audio_tab(self);
         // A roster held back while out of sight (review P1-9).
         self.flush_roster();
         self.resume_gifs();
@@ -163,8 +234,7 @@ impl AppState {
             let size = img.size();
             size.width as usize * size.height as usize * 4
         };
-        let rss = crate::resources::native_monitor_memory()
-            .or_else(|| self.usage.resident())
+        let rss = app_core::usage::memory()
             .map_or_else(|| "?".to_string(), |b| format!("{:.0} MB", mb(b as usize)));
 
         // Chat rows over every conversation; their pictures are in the
@@ -219,16 +289,14 @@ impl AppState {
         if !self.main_on_screen() {
             return;
         }
-        if let Some((cpu_one_core, resident)) = self.usage.sample() {
-            // % of one core; normalize to % of the whole machine
-            // (task-manager style).
+        // % of one core (0 the first time, with nothing to measure
+        // from); the memory as the user's own task monitor shows it.
+        let cpu_one_core = self.usage.percent_of_one_core().unwrap_or(0.0);
+        if let Some(mem_bytes) = app_core::usage::memory() {
+            // Normalize to % of the whole machine (task-manager style).
             let cores =
                 std::thread::available_parallelism().map_or(1, std::num::NonZero::get) as f32;
             let cpu_pct = cpu_one_core / cores;
-            // Memory: the platform-native figure (what the user's own
-            // task monitor shows), with the resident size as the
-            // fallback.
-            let mem_bytes = crate::resources::native_monitor_memory().unwrap_or(resident);
             let mem_mb = mem_bytes as f64 / (1024.0 * 1024.0);
             self.main.global::<State>().set_resource_line(
                 t!("resource-line",
@@ -243,12 +311,78 @@ impl AppState {
     //  MISC
     // ════════════════════════════════════════════════════════════════
 
-    /// Persist geometry + settings immediately (the tray's Quit, and a
-    /// host going into the background — the normal shutdown also does
-    /// this, but only after the loop exits).
+    /// Write the settings file — without what the open Settings page
+    /// changed: only its Save and close keeps that (ANDROID-SPEC.md
+    /// D73). Every save in the app goes through here.
+    pub(crate) fn save_settings(&self) {
+        crate::settingsui::settings_to_write(self).save();
+    }
+
+    /// Persist geometry + settings immediately (a quit, and a host
+    /// going into the background — the normal shutdown also does this,
+    /// but only after the loop exits).
     pub fn save_settings_now(&mut self) {
         self.save_window_geometry();
-        self.settings.save();
+        self.save_settings();
+    }
+
+    /// Leave the app as `how` says, unless the Settings page holds
+    /// changes nobody saved: then the window comes up and asks first —
+    /// Save and quit, Quit without saving, or Cancel (`answer_leave`).
+    /// Every quit the user starts comes here; when the OS ends the app
+    /// there is nobody to ask, and `shutdown` keeps nothing unsaved.
+    pub(crate) fn leave_app(&mut self, how: Leaving) {
+        if crate::settingsui::has_unsaved(self) {
+            self.pending_leave = Some(how);
+            self.show_main();
+            self.main.global::<State>().set_quit_ask_open(true);
+            return;
+        }
+        self.finish_leaving(how);
+    }
+
+    /// The question's answer: keep the page's changes (`Some(true)`),
+    /// drop them (`Some(false)`), or stay (`None`).
+    pub(crate) fn answer_leave(&mut self, keep: Option<bool>) {
+        self.main.global::<State>().set_quit_ask_open(false);
+        let Some(how) = self.pending_leave.take() else {
+            return;
+        };
+        match keep {
+            Some(true) => crate::settingsui::save_for_quit(self),
+            Some(false) => crate::settingsui::drop_for_quit(self),
+            None => {
+                // The Settings page under the dialog takes the keyboard
+                // back.
+                self.main.invoke_focus_composer();
+                return;
+            }
+        }
+        self.finish_leaving(how);
+    }
+
+    fn finish_leaving(&mut self, how: Leaving) {
+        self.save_settings_now();
+        match how {
+            Leaving::Quit => {
+                let _ = slint::quit_event_loop();
+            }
+            Leaving::InstallUpdate(path) => {
+                // Off the UI thread: it ends the process when it is done.
+                let spawned = std::thread::Builder::new()
+                    .name("update-install".into())
+                    .spawn(move || {
+                        if let Err(e) = crate::updater::extract_and_install(&path) {
+                            let _ = slint::invoke_from_event_loop(move || {
+                                with_current(|app| app.show_error(&e));
+                            });
+                        }
+                    });
+                if let Err(e) = spawned {
+                    self.show_error(&e.to_string());
+                }
+            }
+        }
     }
 
     pub fn show_error(&mut self, error: &str) {
@@ -376,8 +510,10 @@ impl AppState {
     pub(super) fn shutdown(&mut self) {
         info!("Shutting down");
 
+        // Settings still open with changes: nobody chose to keep them.
+        crate::settingsui::put_back_unsaved(self);
         self.save_window_geometry();
-        self.settings.save();
+        self.save_settings();
 
         self.voice.tx.send(VoiceControl::Stop).ok();
 

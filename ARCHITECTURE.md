@@ -256,7 +256,12 @@ bulk never fills the bottleneck queue that voice datagrams share.
 
 `config::Budget` holds every tunable: idle timeout (30 s both sides),
 client keep-alive (5 s; it was 2 s until 1.2.1 — the simulator holds
-an idle connection through 40 % loss on it), ACK delay, datagram
+an idle connection through 40 % loss on it), server keep-alive (a PING
+after 20 s of quiet, `SERVER_KEEP_ALIVE`: it wakes a phone asleep in
+the lobby and keeps its NAT mapping, review 2026-10 P1-6, ANDROID-SPEC
+D74; the cost is that a client that vanished is noticed after up to
+about 50 s — the 30 s idle timeout restarts at the server's own
+keep-alive into the dead link — where it was about 30), ACK delay, datagram
 buffers, stream/connection
 receive windows, `send_window`, socket buffer sizes, media pace. Values
 are documented inline with their rationale; change them there, not at
@@ -551,16 +556,41 @@ P2-5). The reason string is a wire contract with the client
   the screen and voice threads (`try_send`), state to the app (an
   unbounded channel, so this thread never waits for the UI — review
   P1-16 — and a wake of the Slint event loop).
-- **voice** (`voice.rs`) — owns the audio engine; `VoiceControl` in,
-  `VoiceEvent` out. At each start it hands the engine's packet handles
-  to the network thread (`NetworkControl::VoiceLink`), so packets never
-  pass through it (review P1-5); it wakes on commands and the speaking
-  light's edges, and once a second for device supervision. Receives
-  `SetUplinkLoss` / `SetLinkRtt` from receiver reports.
-- **screen** (`screen.rs`) — capture/encode when sharing, jitter
-  buffer/decode per watched stream; `ScreenControl` in, `ScreenEvent`
-  out. Receives `UplinkStats` (the share of groups the transport
-  abandoned) for its bitrate ladder and `StreamHealth` for display.
+- **voice** (`voice.rs`, `client-voice`) — owns the audio engine;
+  `VoiceControl` in, `VoiceEvent` out. At each start it hands the
+  engine's packet handles to the network thread
+  (`NetworkControl::VoiceLink`), so packets never pass through it
+  (review P1-5). It wakes on commands, the speaking light's edges and
+  the engine's `trouble()` latch (a stream failed, a default device
+  moved), and otherwise sleeps until `VoiceChat::next_service()` — a
+  side waiting to be reopened, or the 2 s default-device poll where
+  streams are open and the OS sends no device events — or an hour
+  (`IDLE_WAIT`). A phone in the lobby with nothing open, or a Windows
+  desktop whose device watcher runs, has nothing due at all; it ticked
+  every second whenever an engine existed (review 2026-10, P2-41).
+  Receives `SetUplinkLoss` / `SetLinkRtt` from receiver reports.
+- **screen-share** and **screen-watch** (`screen.rs`) — one loop, two
+  threads behind one `ScreenTx`, which sends each `ScreenControl` to
+  the thread it is for: our own share (capture, encode, the bitrate
+  ladder on `UplinkStats`, `StreamHealth`) and the streams we watch
+  (reassembly, the jitter buffers, decode, their sound). On one thread
+  a sharer who also watched lost capture ticks to decoding (review
+  P2-44). `ScreenEvent` out, read by the frontend's present thread.
+- **net-inbound** (`inbound_wake.rs`) — blocks on the socket and rings
+  the network loop when a datagram lands (below). Its wait is a 30 s
+  backstop (`WATCH_SLICE`): the end of a session wakes it with a
+  datagram of its own; it was 500 ms, two wakes a second for the whole
+  session (review 2026-10, P2-40).
+- **upload-prep** — short-lived workers the network thread starts for
+  a blob upload: one hashes the file before the announcement, one
+  frames its chunks once the server wants them
+  (`NetworkControl::BlobPrepared` brings each result back). Hashing and framing a large file on the network
+  thread held it, voice included, for 25–100 ms (review 2026-10,
+  P2-39).
+- Below them, in `video`: **dxgi-capture** (Windows; §7.3) and the
+  parked **yuv-band-N** converters; in `audio`, each open device's
+  worker and **sysaudio-procloop** (Windows: a share's sound, the
+  system mix minus what our own process plays).
 
 The loop in `run_network_loop` selects on the control channel, the
 voice encoder's packets and the inbound wake (a `ReadWaiter` thread
@@ -582,8 +612,12 @@ Ending a session produces one of:
 - `Disconnected { kind: DisconnectKind, detail }` — final. `UserRequested`,
   `Refused(reason)`, `Outdated`, `LocalError`, `Other`.
 - `ConnectionLost { kind: LossKind, detail }` — the app reconnects with
-  backoff (2/4/8/16/30 s, five attempts). `Timeout`, `Reset`,
-  `Unreachable` (handshake or Hello never got through), `ServerRestart`.
+  backoff, five attempts: 2/4/8/16/30 s, and 5/10/20/40/60 s for
+  `Full`, each moved by up to half either way so the clients of one
+  restarted server do not all knock at once (`reconnect_wait`, review
+  2026-10, P2-16). `Timeout`, `Reset`, `Unreachable` (handshake or
+  Hello never got through), `ServerRestart`, `Full` (the server refused
+  the connection, `DisconnectReason::Refused`: it is full).
 - `NeedInvite { why }` — the server wants a code (first visit, or the
   one sent was refused); has its own inline prompt.
 - `IdentityChanged { expected, observed }` — refused before any data;
@@ -599,7 +633,7 @@ the transport's wording and goes to the log only.
   one datagram). Inbound datagrams → `split_sender` → `VoiceData` →
   straight into the engine through the link's `IncomingSender`, with
   no hop through the voice thread (review P1-5).
-- Our share's frames and sound leave the screen thread and the
+- Our share's frames and sound leave screen-share and the
   system-audio encoder as `MediaOut` on their own bounded channel
   (`MEDIA_QUEUE`, `try_send`): a burst drops frames and never queues in
   front of a command. Commands and state travel on unbounded channels,
@@ -612,12 +646,23 @@ the transport's wording and goes to the log only.
   finishes the group.
 - Video in: `recv_video` items per track; `GroupReset` forgets that
   sharer's partial frame in the reassembler and requests a keyframe.
+  A frame of a stream nobody can see (a minimized desktop viewer,
+  `set_stream_hidden`) is dropped here, before it reaches the
+  screen-watch thread (review 2026-10, P1-2).
+- Stream sound in: once screen-watch has started a stream's decoder it
+  registers the decoder's `StreamAudioSender` (`route_stream_audio`),
+  and the network thread hands each packet to it directly; until then
+  (and after the decoder goes) packets go through screen-watch, which
+  starts one. Each 20 ms packet of every watched stream was a wake of
+  the screen thread (review 2026-10, P2-45).
 - Images: `send_media` on one paced stream; progress from
   `upload_progress`. Inbound chunks are reassembled per (sender,
   upload) and hash-checked.
-- Blobs: `UploadBlob` announces (`UploadBegin`), sends the chunks only
-  on `UploadAccept { needed: true }`, and synthesizes `UploadDone`
-  itself on `needed: false`. `FetchBlob` answers arrive as `BlobChunk`
+- Blobs: `UploadBlob` takes its turn (`upload_turns.rs`: one announced
+  upload a session at a time), is hashed on an `upload-prep` worker,
+  announces (`UploadBegin`), sends the chunks only on `UploadAccept {
+  needed: true }`, framed on a worker too, and synthesizes
+  `UploadDone` itself on `needed: false`. `FetchBlob` answers arrive as `BlobChunk`
   and are reassembled per hash (`accept_blob_chunk`), the hash being
   the blob's id and the only thing trusted.
 
@@ -636,15 +681,19 @@ that collapsed sends little because it is overloaded, not idle
 
 Every 10 s (when negotiated) a `TelemetrySample` goes to the server:
 path numbers from `LinkStats`, plus whatever the voice and screen
-threads last reported through `TelemetryAudio/Sharing/Viewing`.
+threads last reported through `TelemetryAudio/Sharing/Viewing`. A quiet
+interval — no share, nothing watched, under 2 kbit/s either way — is
+skipped, one a minute still going (review 2026-10, P3-40).
 Notable moments (`ShareStarted`, `SendBufferPressure`, …) go
 immediately as `TelemetryEvent`.
 
 ### Settings (`config.rs`)
 
 `Settings` persists to `settings.json`, next to the executable when
-writable (portable) else the platform config dir. A save writes a file
-beside it and renames it into place, keeping the previous one as
+writable (portable) else the platform config dir. A save that would
+write what the file already says writes nothing (review 2026-10,
+P3-43); otherwise it writes a file beside it, syncs it to the disk and
+renames it into place, keeping the previous one as
 `settings.json.bak`; a file that does not parse is set aside as
 `settings.json.corrupt` and the backup (else the defaults) is used —
 never another install's file. `ServerEntry { name, address,
@@ -658,8 +707,14 @@ are dropped on load rather than trusted. `load_client_key()` creates
 
 Beside `settings.json` also live `avatar.png` (our own picture,
 128×128, `ProfileSettings.avatar` says whether it exists) and
-`avatars/<sha256>`, the cache of other people's pictures — one
-transfer per hash per client. `Settings` sections added in 1.1:
+`avatar-cache/<sha256>`, the cache of other people's profile
+pictures — one transfer per hash per client; only a picture someone's
+look names goes in (chat pictures never do), and the folder before
+it, `avatars/`, which took every chat picture too, is deleted at
+startup. They are decoded on an `avatar-decode` worker that starts
+when there is a picture and ends with an empty queue, the cache read
+included, and a picture over 512 px a side is refused
+(`MAX_RECEIVED_AVATAR_DIM`): the initial shows instead (`avatars.rs`). `Settings` sections added in 1.1:
 `ui` (text scale, chat prefs, image budget), `profile`, `startup`,
 `sounds`, `audio.push_to_talk`; every field has a serde default so
 older files load unchanged.
@@ -680,10 +735,17 @@ is what `cargo check -p frontend --no-default-features` builds.
 Native dialogs and the URL launcher are the `host` module's
 `DesktopHooks`, one implementation of the trait the phones implement
 too. Keybinds are watched, not registered (`hotkeys.rs`): the
-`keywatch` crate's thread sleeps on the OS's key events and reads the
-state of the bound keys when one arrives, so a bound key still types
-everywhere else and an idle keyboard costs nothing; where the state
-cannot be read the bindings are registered hotkeys instead.
+`keywatch` crate's `key-watch` thread sleeps on the OS's key events
+and reads the state of the bound keys when one arrives, so a bound key
+still types everywhere else; where the state cannot be read the
+bindings are registered hotkeys instead. Until the events have
+announced three presses in the process, a slow clock watches over them
+in case they never come (another registration took them): 250 ms after
+a key event or the start, doubling while nothing happens up to one
+look every 4 s, and only a look that ran its full wait counts against
+the events — Windows wakes the thread for other messages too. Once
+proven, for every later watcher of the process as well (a rebind, a
+reconnect), an idle keyboard costs nothing (review 2026-10, P2-34).
 
 Profile flow: `send_own_profile` runs after `Session` and on Save &
 close of Settings when the look changed (`profile_dirty`); with a
@@ -699,7 +761,10 @@ path, two front ends.
 `app.rs` is the `AppState`: one `Rc<RefCell<_>>` reached through
 `with_current` from Slint callbacks and timers. It drains
 `NetworkMessage`/`VoiceEvent`/`ScreenEvent` on every event-loop pass
-(the worker threads wake the loop via `WakeFn`). The methods are filed
+(the worker threads wake the loop via `WakeFn`), a bounded share each
+pass — up to 256 network messages, 32 voice events and 64 screen
+events — and wakes itself again at once when more is waiting, so one
+busy source cannot hold the loop (review 2026-10, P2-1). The methods are filed
 by concern in child modules under `src/app/` — `events` (the drain
 and `handle_network_message`, which is exhaustive over
 `NetworkMessage`; the compiler will tell you where to add an arm),
@@ -710,17 +775,39 @@ new methods go in the child that owns the concern.
 
 Some of that work is held to what can be seen or used. The roster model
 is rebuilt at most once per event-loop pass and only while the main
-screen is on screen (`flush_roster`); a speaking or audio-state edge
-rewrites its one row (`refresh_voice_row`, review P1-9). Global
+screen is drawn (`flush_roster`); a speaking or audio-state edge
+rewrites its one row (`refresh_voice_row`, review P1-9). "Drawn" is
+`main_on_screen()`: not on the connect view, not under a page
+(Settings, the admin panel, a phone's stream page or picture viewer),
+not hidden to the tray or minimized, and on a phone not in the
+background; `Logic.main-screen-shown` catches the roster and the GIFs
+up when the main screen comes back (review 2026-10, P2-30). The stream
+stats and the resource line wait on the same test. Global
 keybinds are watched only between `Connected` and teardown, and only
 the bound keys (`HotkeyManager::set_connected`, review P1-3). Pictures
 from the wire decode only as PNG, JPEG or GIF
 (`images::decode_received`, review P1-20).
 
-`main.rs` sets up file logging (append-mode `baucord.log`) and a panic
-hook that writes thread, location and backtrace into it — release builds
-abort on panic and a GUI process has no stderr, so without the hook a
-crash leaves no trace.
+Nothing that decodes, reads or hashes a file runs on the UI thread;
+each worker starts when there is work and none stays behind idle:
+`picture-decode` (a chat picture's preview while its row is on screen,
+newest request first, at most 12 waiting; `pictures.rs`, review
+2026-10, P1-4), `gif-decode` (every playing GIF's next frame, one
+thread while any is open), `gallery-decode` (the picture viewer's full
+size), `avatar-decode` (§6), `picture-load` (a picked, pasted or
+dropped picture read, decoded and shrunk for sending, EXIF orientation
+applied and its metadata dropped), `file-read` (a file to send, P2-6),
+`save-download` and `cache-cleanup` (the old `avatars/` folder, once a
+launch). Their results come back through `slint::invoke_from_event_loop`
+as pixels; the `slint::Image` is made on the UI thread.
+
+`main.rs` sets up file logging — `baucord.log` in the config folder,
+beside `settings.json`, rolled over to `baucord.log.1` past 5 MB like
+the phones' (`app_core::logfile::FileSink`; it was appended to for ever
+in the working folder, review 2026-10, P2-47) — and a panic hook that
+writes thread, location and backtrace into it: release builds abort on
+panic and a GUI process has no stderr, so without the hook a crash
+leaves no trace. Settings → Debug shows, sends and clears that file.
 
 `app-core` holds the view models the UI binds to (roster, chat with
 markdown/links/images/gifs, composer, emoji, stats formatting) and is
@@ -757,32 +844,48 @@ The hosts' hooks are one trait, `frontend::host::Hooks` (`host.rs`
 save a download, open a target or a link, keep alive (the service, or
 on iOS the moment to ask for notifications), keep the screen on, and
 the notification calls (§7.4). A phone tells the app when it goes to the
-background (`set_host_visible`), and everything that only feeds the
-screen — stats lines, GIFs, stream frames, the device poll — stops
-until it comes back.
+background (`set_host_visible`), and what only feeds the screen waits
+until it comes back (`set_app_shown`, the desktop's tray and minimize
+too): the network thread stops handing over the link stats, the
+resource line's timer stops, the GIFs pause, the stats lines skip
+their update, and the device poll slows from every 2.5 s to every
+10 s — it still runs, so a picked device that went away falls back to
+the default (review 2026-10, P2-33). A phone also stops watching: the
+stream page stays, but the app unsubscribes, nothing of the stream
+comes, its sound included, and it subscribes again on return, starting
+from a keyframe (review 2026-10, P1-2; ANDROID-SPEC D74).
 
 ### 7.3 Audio and video per platform
 
 | | capture/playback | echo cancellation | video decode | screen capture |
 |---|---|---|---|---|
-| Windows | WASAPI, event-driven on an MMCSS thread (`native/wasapi.rs`); cpal enumerates, and opens only if that stream will not (CLI-12) | the Communications category, verified (AEC-SPEC §4) | FFmpeg (static) | DXGI |
-| macOS | cpal (CoreAudio) | none yet (VPIO planned, AEC-SPEC §9) | FFmpeg (static) | xcap |
-| Linux | cpal (ALSA/PipeWire) | none | FFmpeg (system) | xcap (X11; Wayland is screenshots) |
+| Windows | WASAPI, event-driven on an MMCSS thread (`native/wasapi.rs`); cpal enumerates, and opens only if that stream will not (CLI-12) | the Communications category in a voice room only, verified (AEC-SPEC §4) | FFmpeg (static) | DXGI (`dxgi.rs`), screenshots where it fails |
+| macOS | cpal (CoreAudio) | none yet (VPIO planned, AEC-SPEC §9) | FFmpeg (static) | screenshots (xcap) |
+| Linux | cpal (ALSA/PipeWire) | none | FFmpeg (system) | X11: damage-driven reads (`x11.rs`); Wayland: screenshots (xcap) |
 | Android | AAudio voice-call streams (`native/aaudio.rs`, `native/android.rs`) | `AcousticEchoCanceler` on the capture session, read back (E9) | MediaCodec (`video::mediacodec`, `video::yuv`) | — |
 | iPhone | the VPIO unit for both sides (`native/vpio.rs`, `native/avsession.rs`) | VPIO, bypass read back (E10) | VideoToolbox (`video::videotoolbox`, `video::annexb`) | — |
 
 Every backend feeds the same contract: one capture callback's samples
-into a ring, one render callback's buffer out of one (`native/pump.rs`),
+into a ring, one render callback's buffer out of one (`native/pump.rs`:
+the callback backends, WASAPI's loops and the cpal fallbacks all go
+through its `CapturePump`/`RenderPump` — the downmix and the fan-out
+existed three times and had drifted, review 2026-10, P2-49),
 no locks or allocation on the real-time thread, the playout cushion
 sized from the device's callback (ANDROID-SPEC D24). Whether echo
 cancellation is on is decided from the stream that was opened, never
 assumed from the device, and Settings → Audio says what was found.
 
-`VoiceChat::service()` (the voice thread, at least once a second)
-supervises the devices: a stream that failed is reopened, the OS default is followed,
-and a side that is not open — it never opened, or its reopen failed
-because the device was gone — is tried again every 2 s until it opens
-(`input_pending`, `output_pending`; PRODUCTION-PLAN.md CLI-9).
+`VoiceChat::service()` (the voice thread, when `trouble()` rings or
+`next_service()` comes) supervises the devices: a stream that failed is
+reopened, the OS default is followed (Windows' device notifications;
+a 2 s poll elsewhere, while a stream is open), and a side that is not
+open — it never opened, or its reopen failed because the device was
+gone — is tried again until it opens (`input_pending`,
+`output_pending`; PRODUCTION-PLAN.md CLI-9): after 2 s, then twice as
+long each time up to a minute, from 2 s again on a device event, a
+pick, a room change or a success (review 2026-10, P2-38). Each failure
+is flagged in `AudioStats` (`Health`) and rings `trouble()`, so the
+voice thread needs no tick to notice (P2-41).
 
 The phones open only what their presence needs
 (`VoiceChat::set_presence`, ANDROID-SPEC D53, IOS-SPEC D51): nothing in the lobby on
@@ -795,13 +898,24 @@ it (`InputConfig::in_room`).
 
 The audio workers wait on their device's latch — the callback rings it
 — with a 200 ms safety wait, and their owner rings it on drop so a stop
-is immediate (review P1-4). Muted, the capture worker sleeps; the chain
-resets once, on the unmute edge.
+is immediate (review P1-4). Muted or out of a room, the capture callback
+pushes nothing and stops ringing, and the worker waits 5 s at a time
+(`SILENCED_WAIT`): unmuting rings it at once. It was the 200 ms safety
+wait, five wakes a second for as long as one stayed muted or in the
+lobby (review 2026-10, P3-24). The chain resets once, on the unmute
+edge.
 
 Windows' "Default" device means the Communications default unless echo
 cancellation is Off, for the AEC decision, both streams and the device
 watcher alike (`communications_default`, review P1-18); an output change
-that moves the plan or the reference reopens both sides.
+that moves the plan or the reference reopens both sides. The streams go
+on the call path — the platform canceller, and on Windows the
+Communications category that lowers every other app — in a voice room
+only, on every platform (`call_path_wanted`): from connect on, the
+lobby included, a speakers user under Automatic had everything else
+turned down for nothing to cancel (review 2026-10, P1-5; AEC-SPEC
+§4.6). The desktop re-plans on a presence change only when the plan
+moves.
 
 A watched stream's audio has an output of its own (stereo, its own
 volume, untouched by deafen) — except on a phone's call path, where it
@@ -816,41 +930,81 @@ picked in Settings, or where voice opened (review P1-19), and its device
 callback reads the ring through the same pacing (`stream::pace`): 60 ms
 cushion on the desktop, the phones' 100 ms there. The decoder picks per
 frame; its own output reopens when its device goes away or the pick
-changes. A sharer sends each 20 ms packet of its sound as it is encoded
-(PRODUCTION-PLAN LAT-2).
+changes. A muted stream is neither decoded nor played, and its output
+rests (review 2026-10, P3-27). Its packets reach the decoder from the
+network thread directly (§6, P2-45). A sharer sends each 20 ms packet
+of its sound as it is encoded (PRODUCTION-PLAN LAT-2).
 
 A watched stream's video goes: the jitter buffer (3 s of frames at the
 stream's rate, so at least one keyframe interval; a frame ≥ 1 s behind
 live jumps to a newer buffered keyframe; a gap jumps to a buffered
 keyframe or asks for one the moment a later frame lands, review P1-12)
-→ the screen thread decodes
+→ screen-watch decodes
 (FFmpeg and VideoToolbox to RGBA; MediaCodec hands over its YUV planes
 as they are, `video::PictureFormat`, one per frame fed even when the
 codec finishes them in pairs, `video::held`; between frames
 `VideoDecoder::poll` hands out a picture still waiting once the stream
 pauses, at the time `next_poll` asks for) → `FrameReady` → the frontend's
-present thread (`frontend::present`), which drains its queue, keeps
-the newest frame of each stream and only then converts or copies it,
-straight into one of the stream's three reused `SharedPixelBuffer`s
-(YUV over up to four cores, `yuv::to_rgba_into`) → the UI takes the
-newest prepared frame per stream and sets it as an `Image`. A device
+present thread (`present-prep`, `frontend::present`), which drains its
+queue, keeps the newest frame of each stream and only then converts or
+copies it, straight into one of the stream's three reused
+`SharedPixelBuffer`s (YUV over up to four cores, `yuv::to_rgba_into`,
+on a `yuv::BandPool` of parked `yuv-band-N` threads started by the
+first YUV picture and ended with the last stream's buffers — a scope
+per picture started up to three threads a frame, review 2026-10,
+P2-35) → the UI takes the newest prepared frame per stream and sets it
+as an `Image`. Skia then copies it into a buffer of its own to draw it
+(SESSION-GUIDE §4, Memory). A device
 that cannot keep up shows fewer frames, never older ones: the picture
 stays live with its sound (MOB-18). Frame buffers go round
 `video::pool` instead of being allocated per frame — DXGI's captures
 too, and FFmpeg decodes straight into one when the width is a multiple
 of 16 (review P1-11); the pool is held (`retain`/`release`) only while
-something is shared or watched, and freed after (P2-43). The sharer's
-mouse pointer is not in what Windows hands over: `dxgi.rs` draws it
-into each captured frame (`pointer.rs`), and a move with nothing else
-changing is a frame of its own (P2-25). Closing a viewer drops the stream's decoder,
-buffer and audio in the screen thread (`ScreenControl::StopWatching`);
-the next viewer starts from a keyframe. The screen thread sleeps until
+something is shared or watched, and freed after (P2-43), and it hands
+out no buffer more than twice the size asked for (review 2026-10,
+P3-37). Closing a viewer drops the stream's decoder,
+buffer and audio in screen-watch (`ScreenControl::StopWatching`);
+the next viewer starts from a keyframe. The screen threads sleep until
 a capture tick, a frame's playout slot, a decoder poll or a log line
-(review P1-7), and reaches the UI only through the present thread,
-which wakes it. A stream nobody can see (the phone in the background, a
-minimized viewer: `ScreenControl::SetVisible`) is not decoded; its
-sound plays on, and seen again it waits for a keyframe and asks for
-one.
+(review P1-7), and reach the UI only through the present thread,
+which wakes it. A stream nobody can see on the desktop (a minimized
+viewer: `ScreenControl::SetVisible`) is not decoded: its frames are
+dropped on the network thread (§6), its decoder is let go with the
+pictures it held and a `ParkedDecoder` stands in (review 2026-10,
+P2-44); its sound plays on, and seen again it starts from a keyframe
+it asks for. A phone in the background stops watching instead (§7.2).
+A decoder that lost its session (`VideoDecoder::needs_keyframe`: a
+failed decode; iOS takes VideoToolbox's back in the background) asks
+the sharer for a keyframe, once per loss — a still share sends none of
+its own, and the picture stayed frozen (review 2026-10, P1-10).
+
+Sharing, the capture side. On Windows a `dxgi-capture` worker owns the
+desktop duplication and queues what changed: a new picture
+(`Captured::Desktop`), or only a pointer move (`Captured::PointerMoved`,
+which the consumer draws again into the picture it holds — reading the
+unchanged desktop out once more was a full-frame copy per move, review
+2026-10, P3-35). The pointer is not in what Windows hands over:
+`dxgi.rs` draws it in (`pointer.rs`, P2-25). When the share's pictures
+are at most half the desktop's size either way, the desktop is halved
+on the GPU before it is read back (`Halver`: a two-level texture whose
+second level `GenerateMips` builds — 8 MB read for a 4K desktop shared
+at 1080p, not 33; off where the device cannot build BGRA mips, review
+2026-10, P2-46). DXGI failing for good (an HDR desktop, a rotated
+output — review 2026-10, P2-10) falls back to screenshots; a drought
+(a locked screen) does too, and from there streaming is tried again
+every 10 s (`STREAM_RETRY_INTERVAL`, P2-12). On Linux under X11,
+`video::x11::X11Capturer` keeps one connection and reads a monitor
+(`GetImage`, the server's own BGRX) only where the DAMAGE extension
+reports drawing; xcap opened four connections and read the whole
+monitor 30–60 times a second (review 2026-10, P2-43). The screenshot
+backend (macOS, Wayland, Windows' fallback) looks at a screen still for
+2 s five times a second instead of at the share's rate. A share nobody
+watches — no `StreamHealth` from the server for 3 s — captures at the
+still screen's pace, one picture a second; a viewer subscribing makes
+the server ask for a keyframe, which ends it at once (review 2026-10,
+P1-1). After 90 failed encodes in a row (each one already reopened the
+session) the share moves to the next encoder in the list (review
+2026-10, P2-11).
 
 ### 7.4 Notifications on the phones
 
@@ -882,15 +1036,20 @@ service, so a phone whose app is closed or suspended gets nothing
 
 ```bash
 cargo test --all                # everything; media crates need their system libs
-cargo test -p transport         # 54 tests, the sim scenarios among them
-cargo test -p server            # 65 unit + 94 e2e through the simulator (2026-10-11)
+cargo test -p transport         # the sim scenarios among them
+cargo test -p server            # unit tests, and the e2e suite through the simulator
 cargo clippy --all-targets      # all = deny, pedantic = warn
 cargo +nightly fmt --all        # imports_granularity/group_imports are nightly-only
 ```
 
-The chat pane's scrolling has its own harness,
+CI (`pr-check.yaml`) runs the same with `--locked`, formats with a
+dated nightly (`nightly-2026-10-10`: move it on purpose, with a format
+commit), type-checks the Windows-only code from Linux with MinGW
+(`windows` job: `clippy --target x86_64-pc-windows-gnu` over the crates
+without a UI), and runs the chat pane's scrolling harness,
 `tools/chat-scroll-sim` (`cargo run` in it): the real `.slint` pane
-driven headless through 48 cases (ANDROID-SPEC D66).
+driven headless through 48 cases (ANDROID-SPEC D66), with the row caps
+taken from `app_core::chat` (review 2026-10, P3-59).
 
 Adding a server behavior: write it as an `e2e.rs` test first — `World`
 gives you a server node and `TestClient`s that speak the real protocol

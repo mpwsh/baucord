@@ -4,6 +4,10 @@ nickname = Apodo
 connect = Conectar
 settings = Configuración
 quit = Salir
+quit-unsaved-title = ¿Guardar los cambios de Configuración?
+quit-unsaved-body = Cambiaste opciones y no las guardaste.
+quit-unsaved-save = Guardar y salir
+quit-unsaved-discard = Salir sin guardar
 error-nickname-empty = El apodo no puede estar vacío
 
 # ── Aviso de dispositivo faltante ───────────────────────────────────────
@@ -144,12 +148,12 @@ stream-stats-quality = { $quality } · { $viewers } viendo
 stream-stats-frame = { $kb }KB · { $ms }ms cod
 stream-stats-degraded = { $fps }% fps · pérdida { $loss }%
 latency-line = Audio: { $audio } | Server: { $network }
+latency-net-loss = { $rtt }ms · { $loss }% pérdida
 # The transfer rates' unit, after the download rate (the arrows are drawn).
 latency-unit = Mb
 
 # ── Chat ────────────────────────────────────────────────────────────────
 send = Enviar
-chat-disconnected = Desconectado: { $reason }
 disconnect-reason-user = El usuario se desconectó
 chat-user-joined = { $name } se unió
 chat-user-joined-channel = { $name } se unió a { $channel }
@@ -333,6 +337,7 @@ error-refused-rate-limited = Demasiados intentos fallidos — esperá un minuto 
 error-outdated = Esta versión de baucord no coincide con el servidor. Actualizá baucord y probá de nuevo.
 error-local = No se pudo iniciar la conexión: { $detail }
 error-lost-restart = El servidor se está reiniciando.
+error-lost-full = El servidor está lleno en este momento.
 
 # ── Historial, progreso, canales (spec §5, §6, §9) ───────────────────────
 chat-history-loaded = { $count } mensaje(s) anteriores{ $more ->
@@ -413,12 +418,16 @@ chat-new-messages = { $count ->
 chat-load-earlier = Cargar mensajes anteriores
 chat-loading = Cargando…
 chat-no-earlier = No hay mensajes anteriores.
+chat-earlier-limit = Hasta acá llega el chat en pantalla.
 chat-edit-not-applied = El servidor no aplicó la edición — puede que el mensaje sea muy viejo para cambiarlo.
 chat-delete-not-applied = El servidor no borró el mensaje — puede que sea muy viejo para cambiarlo.
 confirm-delete-message-title = ¿Borrar este mensaje?
 confirm-delete-message-body = Se elimina para todos.
 confirm-delete-message-body-admin = Se elimina para todos; el registro de auditoría guarda una línea.
 confirm-delete-message = Borrar mensaje
+confirm-clear-chat-title = ¿Borrar este chat?
+confirm-clear-chat-body = Sus mensajes se van solo de este dispositivo; los demás conservan los suyos.
+confirm-clear-chat = Borrar chat
 
 # ── 1.1 canales desde la interfaz ─────────────────────────────────────
 channel-new = Canal nuevo
@@ -543,7 +552,7 @@ chat-image-size = Imágenes que enviás
 chat-image-size-hint = Las imágenes más grandes se achican para entrar. Los servidores limitan las subidas a 10 MB.
 image-size-max = Máximo (10 MB)
 privacy-header = Privacidad
-privacy-note = Mientras estás conectado, un servidor ve tu apodo, el id de tu clave, tus roles y nivel, en qué canal estás, y cada 10 segundos una línea de telemetría: latencia ida y vuelta, pérdida de paquetes, los nombres de tus dispositivos de audio y video, tu versión de la app y sistema operativo. Los admins de ese servidor pueden leer la última línea en el roster.
+privacy-note = Mientras estás conectado, un servidor ve tu apodo, el id de tu clave, tus roles y nivel, en qué canal estás, y cada 10 segundos (una vez por minuto si la conexión está quieta) una línea de telemetría: latencia ida y vuelta, pérdida de paquetes, los nombres de tus dispositivos de audio y del codificador de video con el que compartís, tu versión de la app y sistema operativo. Los admins de ese servidor pueden leer la última línea en el roster.
 audio-transmission = Transmisión
 audio-vad = Detección de voz
 audio-ptt = Pulsar para hablar
@@ -552,7 +561,7 @@ audio-ptt-hint = Mantené apretada para hablar:
 audio-ptt-unbound = Todavía no hay tecla — asigná una en la pestaña Teclado.
 audio-aec = Cancelación de eco
 audio-aec-hint = Evita que los demás se escuchen a sí mismos por tus parlantes. En automático no toca los auriculares.
-audio-aec-hint-windows = Evita que los demás se escuchen a sí mismos por tus parlantes. En automático no toca los auriculares. Con parlantes, Windows puede bajar el volumen de otras apps mientras hablás (Configuración de sonido → Comunicaciones).
+audio-aec-hint-windows = Evita que los demás se escuchen a sí mismos por tus parlantes. En automático no toca los auriculares. Con parlantes, Windows puede bajar el volumen de otras apps mientras estás en un canal de voz (Configuración de sonido → Comunicaciones).
 audio-aec-hint-android = Evita que los demás se escuchen a sí mismos por el parlante. En automático no toca los auriculares. Con el parlante, el teléfono trata la voz como una llamada: los botones de volumen ajustan el volumen de llamada.
 audio-aec-hint-ios = Evita que los demás se escuchen a sí mismos por el parlante. En automático no toca los auriculares. Con el parlante, el iPhone trata la voz como una llamada: los botones de volumen ajustan el volumen de llamada y las otras apps suenan un poco más bajo.
 audio-aec-auto = Automática (solo parlantes)
@@ -566,9 +575,9 @@ aec-status-canceller-off = No disponible — la cancelación de eco no se pudo a
 aec-status-refused = No disponible — el sistema no abrió el audio de llamada. Los detalles están en baucord.log.
 aec-status-unsupported = Todavía no está disponible en este sistema.
 aec-status-idle = Se aplica cuando entrás a un canal de voz.
-aec-lowering = Windows baja el volumen de tus otras apps mientras baucord está conectado, y no dejó que baucord lo desactive. En la configuración de sonido de Windows, pestaña Comunicaciones, elegí "No hacer nada".
+aec-lowering = Windows baja el volumen de tus otras apps mientras estás en un canal de voz, y no dejó que baucord lo desactive. En la configuración de sonido de Windows, pestaña Comunicaciones, elegí "No hacer nada".
 aec-lowering-fix = Abrir la configuración de sonido de Windows
-aec-lowering-told = Windows baja el volumen de tus otras apps mientras baucord está conectado. En Configuración → Audio está cómo evitarlo.
+aec-lowering-told = Windows baja el volumen de tus otras apps mientras estás en un canal de voz. En Configuración → Audio está cómo evitarlo.
 ptt-tooltip = Pulsar para hablar — mantené
 
 # ── Perfiles por la red (spec §7.1) ───────────────────────────────────
@@ -811,6 +820,7 @@ file-download-broken = La descarga de { $name } falló; probá de nuevo
 file-open = Abrir
 file-save-again = Descargar de nuevo
 file-gone = Ese archivo ya no está en tu carpeta de Descargas
+file-shown-in-folder = { $name } puede ejecutar programas, así que se abre su carpeta: inicialo desde ahí si confiás en él.
 file-open-error = No se pudo abrir el archivo: { $error }
 file-cancel = Cancelar
 admin-channel = Registros de admin

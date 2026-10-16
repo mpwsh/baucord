@@ -29,6 +29,10 @@ identity:
   # Logs people send from their app land in logs/ underneath.
   dir: /app/data
 persistence:
+  # The database, inside the mounted folder: ./data/baucord/baucord/
+  # on the host. Written out so it does not depend on the container's
+  # working directory (the default is relative to it).
+  path: /app/data/baucord/baucord.db
   # How long the server keeps things (days; 0 = forever). Tell the
   # people on your server what you choose.
   history:

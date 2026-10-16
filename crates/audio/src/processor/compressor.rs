@@ -12,8 +12,7 @@
 //!
 //! ## Context interaction
 //!
-//! - **Reads**: `ctx.gate_open` (hold gain when closed),
-//!   `ctx.compressor_enabled` (bypass when `false`)
+//! - **Reads**: `ctx.gate_open` (hold gain when closed)
 //! - **Writes**: nothing (downstream processors don't need compressor state)
 //!
 //! ## Design
@@ -29,11 +28,6 @@
 //! `log10` + `powf` on every sample (~96k transcendental calls per second)
 //! only to take that same minimum.
 
-use std::sync::{
-    atomic::{AtomicU32, Ordering},
-    Arc,
-};
-
 use super::{AudioProcessor, FrameContext};
 
 /// Dynamic range compressor for real-time voice processing.
@@ -48,18 +42,23 @@ pub struct Compressor {
     envelope: f32,
     current_gain: f32,
 
-    knobs: Arc<Knobs>,
+    params: Params,
+    /// `params.makeup_db` as a gain, worked out once (it was a `powf`
+    /// per frame).
+    makeup_linear: f32,
 }
 
 impl Compressor {
-    pub fn new(knobs: Arc<Knobs>, attack_ms: f32, release_ms: f32) -> Self {
+    #[must_use]
+    pub fn new(params: Params, attack_ms: f32, release_ms: f32) -> Self {
         let sample_rate = 48_000.0_f32;
         let attack_coeff = (-1.0_f32 / (attack_ms.clamp(0.1, 50.0) * 0.001 * sample_rate)).exp();
         let release_coeff =
             (-1.0_f32 / (release_ms.clamp(10.0, 1000.0) * 0.001 * sample_rate)).exp();
 
         Self {
-            knobs,
+            params,
+            makeup_linear: db_to_linear(params.makeup_db),
             attack_coeff,
             release_coeff,
             envelope: 0.0,
@@ -67,12 +66,15 @@ impl Compressor {
         }
     }
 
-    /// Create with shared knobs and default voice-chat timing (5ms/150ms).
-    pub fn with_defaults(knobs: Arc<Knobs>) -> Self {
-        Self::new(knobs, 5.0, 150.0)
+    /// The voice chat's compressor: [`Params::default`], 5 ms attack,
+    /// 150 ms release.
+    #[must_use]
+    pub fn with_defaults() -> Self {
+        Self::new(Params::default(), 5.0, 150.0)
     }
 
     /// Current gain being applied (for diagnostics). 1.0 = no reduction.
+    #[cfg(test)]
     #[must_use]
     pub fn current_gain(&self) -> f32 {
         self.current_gain
@@ -83,11 +85,7 @@ impl Compressor {
         clippy::cast_precision_loss,
         reason = "frame length ≤ 960 samples, well within f32 precision"
     )]
-    fn process_inner(&mut self, samples: &mut [f32], gate_open: bool, enabled: bool) -> f32 {
-        if !enabled {
-            return 1.0;
-        }
-
+    fn process_inner(&mut self, samples: &mut [f32], gate_open: bool) -> f32 {
         // Gate closed / holding: freeze the gain (don't adapt to the noise
         // floor) but keep applying it so there is no level step.
         if !gate_open {
@@ -100,11 +98,13 @@ impl Compressor {
             return g;
         }
 
-        let threshold_db = f32::from_bits(self.knobs.threshold_db.load(Ordering::Relaxed));
-        let ratio = f32::from_bits(self.knobs.ratio.load(Ordering::Relaxed));
-        let knee_db = f32::from_bits(self.knobs.knee_db.load(Ordering::Relaxed));
-        let makeup_db = f32::from_bits(self.knobs.makeup_db.load(Ordering::Relaxed));
-        let makeup_linear = db_to_linear(makeup_db);
+        let Params {
+            threshold_db,
+            ratio,
+            knee_db,
+            ..
+        } = self.params;
+        let makeup_linear = self.makeup_linear;
 
         // ── Envelope detector (per sample), peak over the frame ─────
         let mut peak_env = 0.0f32;
@@ -150,11 +150,7 @@ impl AudioProcessor for Compressor {
     fn process(&mut self, samples: &mut [f32], ctx: &mut FrameContext) {
         // See AGC: the hold window carries only noise floor, so hold
         // gain rather than releasing upward through the noise tail.
-        self.process_inner(
-            samples,
-            ctx.gate_open && !ctx.gate_holding,
-            ctx.compressor_enabled,
-        );
+        self.process_inner(samples, ctx.gate_open && !ctx.gate_holding);
     }
 
     fn reset(&mut self) {
@@ -200,31 +196,28 @@ fn linear_to_db(linear: f32) -> f32 {
     }
 }
 
-/// Tuneable parameters for the compressor.
-///
-/// Lives inside [`InputConfig`](crate::input_config::InputConfig).
-/// All fields are atomic f32 bits for lock-free runtime adjustment.
-pub struct Knobs {
+/// The compressor's settings, fixed when it is made. They were atomics
+/// in [`InputConfig`](crate::input_config::InputConfig) that nothing
+/// ever wrote, read every frame (review 2026-10, P2-50).
+#[derive(Clone, Copy, Debug)]
+pub struct Params {
     /// Threshold in dBFS (-60..0). Default: -18.0.
-    pub threshold_db: AtomicU32,
-
+    pub threshold_db: f32,
     /// Compression ratio (1.0..20.0). Default: 4.0.
-    pub ratio: AtomicU32,
-
+    pub ratio: f32,
     /// Soft knee width in dB (0.0..12.0). Default: 6.0.
-    pub knee_db: AtomicU32,
-
+    pub knee_db: f32,
     /// Make-up gain in dB (0.0..24.0). Default: 0.0.
-    pub makeup_db: AtomicU32,
+    pub makeup_db: f32,
 }
 
-impl Default for Knobs {
+impl Default for Params {
     fn default() -> Self {
         Self {
-            threshold_db: AtomicU32::new((-18.0_f32).to_bits()),
-            ratio: AtomicU32::new(4.0_f32.to_bits()),
-            knee_db: AtomicU32::new(6.0_f32.to_bits()),
-            makeup_db: AtomicU32::new(0.0_f32.to_bits()),
+            threshold_db: -18.0,
+            ratio: 4.0,
+            knee_db: 6.0,
+            makeup_db: 0.0,
         }
     }
 }
@@ -245,23 +238,23 @@ mod tests {
 
     #[test]
     fn loud_signal_is_compressed() {
-        let knobs = Arc::new(Knobs {
-            threshold_db: AtomicU32::new((-20.0_f32).to_bits()),
-            ratio: AtomicU32::new(4.0_f32.to_bits()),
-            knee_db: AtomicU32::new(0.0_f32.to_bits()),
-            makeup_db: AtomicU32::new(0.0_f32.to_bits()),
-        });
+        let knobs = Params {
+            threshold_db: -20.0,
+            ratio: 4.0,
+            knee_db: 0.0,
+            makeup_db: 0.0,
+        };
         let mut comp = Compressor::new(knobs, 1.0, 50.0);
         let frame = sine_frame(0.5, 300.0, 480);
         let input_rms = frame_rms(&frame);
 
         for _ in 0..200 {
             let mut f = frame.clone();
-            comp.process_inner(&mut f, true, true);
+            comp.process_inner(&mut f, true);
         }
 
         let mut output = frame;
-        comp.process_inner(&mut output, true, true);
+        comp.process_inner(&mut output, true);
         let output_rms = frame_rms(&output);
 
         assert!(
@@ -272,23 +265,23 @@ mod tests {
 
     #[test]
     fn quiet_signal_passes_through() {
-        let knobs = Arc::new(Knobs {
-            threshold_db: AtomicU32::new((-10.0_f32).to_bits()),
-            ratio: AtomicU32::new(4.0_f32.to_bits()),
-            knee_db: AtomicU32::new(0.0_f32.to_bits()),
-            makeup_db: AtomicU32::new(0.0_f32.to_bits()),
-        });
+        let knobs = Params {
+            threshold_db: -10.0,
+            ratio: 4.0,
+            knee_db: 0.0,
+            makeup_db: 0.0,
+        };
         let mut comp = Compressor::new(knobs, 1.0, 50.0);
         let frame = sine_frame(0.01, 300.0, 480);
         let input_rms = frame_rms(&frame);
 
         for _ in 0..100 {
             let mut f = frame.clone();
-            comp.process_inner(&mut f, true, true);
+            comp.process_inner(&mut f, true);
         }
 
         let mut output = frame;
-        comp.process_inner(&mut output, true, true);
+        comp.process_inner(&mut output, true);
         let ratio = frame_rms(&output) / input_rms;
 
         assert!(
@@ -299,25 +292,25 @@ mod tests {
 
     #[test]
     fn holds_gain_when_gate_closed() {
-        let knobs = Arc::new(Knobs {
-            threshold_db: AtomicU32::new((-20.0_f32).to_bits()),
-            ratio: AtomicU32::new(4.0_f32.to_bits()),
-            knee_db: AtomicU32::new(0.0_f32.to_bits()),
-            makeup_db: AtomicU32::new(0.0_f32.to_bits()),
-        });
+        let knobs = Params {
+            threshold_db: -20.0,
+            ratio: 4.0,
+            knee_db: 0.0,
+            makeup_db: 0.0,
+        };
         let mut comp = Compressor::new(knobs, 1.0, 50.0);
 
         let loud = sine_frame(0.5, 300.0, 480);
 
         for _ in 0..200 {
             let mut f = loud.clone();
-            comp.process_inner(&mut f, true, true);
+            comp.process_inner(&mut f, true);
         }
         let gain_before = comp.current_gain();
 
         let mut silence = vec![0.0f32; 480];
         for _ in 0..100 {
-            comp.process_inner(&mut silence, false, true);
+            comp.process_inner(&mut silence, false);
         }
 
         assert!(
@@ -325,25 +318,6 @@ mod tests {
             "Gain should hold: before={gain_before:.4} after={:.4}",
             comp.current_gain()
         );
-    }
-
-    #[test]
-    fn bypass_passes_through() {
-        let knobs = Arc::new(Knobs {
-            threshold_db: AtomicU32::new((-20.0_f32).to_bits()),
-            ratio: AtomicU32::new(4.0_f32.to_bits()),
-            knee_db: AtomicU32::new(0.0_f32.to_bits()),
-            makeup_db: AtomicU32::new(0.0_f32.to_bits()),
-        });
-        let mut comp = Compressor::new(knobs, 0.0, 0.0);
-        let frame = sine_frame(0.8, 300.0, 480);
-        let mut output = frame.clone();
-        let gain = comp.process_inner(&mut output, true, false);
-
-        assert!((gain - 1.0).abs() < 0.001);
-        for (a, b) in frame.iter().zip(output.iter()) {
-            assert!((a - b).abs() < f32::EPSILON);
-        }
     }
 
     #[test]

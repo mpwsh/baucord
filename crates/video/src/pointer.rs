@@ -103,21 +103,15 @@ impl Shape {
             return None;
         }
         // The part of the pointer that lands on the frame, in the
-        // pointer's own coordinates and in the frame's.
-        let (x, y) = (i64::from(x), i64::from(y));
-        let left = x.max(0);
-        let top = y.max(0);
-        let right = (x + i64::from(self.width)).min(i64::from(frame_w));
-        let bottom = (y + i64::from(self.height)).min(i64::from(frame_h));
-        if left >= right || top >= bottom {
-            return None;
-        }
-        // All non-negative and within u32 by the clamps above.
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        let (left, top, right, bottom) =
-            (left as usize, top as usize, right as usize, bottom as usize);
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        let (skip_x, skip_y) = ((left as i64 - x) as usize, (top as i64 - y) as usize);
+        // frame's coordinates and in the pointer's own.
+        let covered = self.covered(frame_w, frame_h, x, y)?;
+        let (left, top) = (covered.x as usize, covered.y as usize);
+        let (right, bottom) = (left + covered.width as usize, top + covered.height as usize);
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)] // left ≥ x, top ≥ y
+        let (skip_x, skip_y) = (
+            (i64::from(covered.x) - i64::from(x)) as usize,
+            (i64::from(covered.y) - i64::from(y)) as usize,
+        );
 
         let stride = frame_w as usize * 4;
         for row in 0..bottom - top {
@@ -158,7 +152,50 @@ impl Shape {
                 }
             }
         }
-        #[allow(clippy::cast_possible_truncation)] // within the frame
+        Some(covered)
+    }
+
+    /// [`Self::draw`], keeping what the pointer covers first: a pointer
+    /// that moves on over an unchanged desktop is drawn again into the
+    /// same frame, with the desktop put back where it was ([`Under`])
+    /// — instead of reading the whole desktop out once more (review
+    /// 2026-10, P3-35).
+    pub fn draw_keeping(
+        &self,
+        frame: &mut [u8],
+        frame_w: u32,
+        frame_h: u32,
+        x: i32,
+        y: i32,
+    ) -> Option<Under> {
+        if frame.len() < frame_w as usize * frame_h as usize * 4 {
+            return None;
+        }
+        // Where it lands, from the drawing's own clipping: drawn into
+        // nothing, it says so.
+        let rect = self.covered(frame_w, frame_h, x, y)?;
+        let stride = frame_w as usize * 4;
+        let (left, width) = (rect.x as usize * 4, rect.width as usize * 4);
+        let mut pixels = Vec::with_capacity(width * rect.height as usize);
+        for row in rect.y as usize..(rect.y + rect.height) as usize {
+            pixels.extend_from_slice(&frame[row * stride + left..][..width]);
+        }
+        self.draw(frame, frame_w, frame_h, x, y);
+        Some(Under { rect, pixels })
+    }
+
+    /// The part of a `frame_w` × `frame_h` frame the pointer covers with
+    /// its top-left corner at (`x`, `y`): [`Self::draw`]'s clipping.
+    fn covered(&self, frame_w: u32, frame_h: u32, x: i32, y: i32) -> Option<Rect> {
+        let (x, y) = (i64::from(x), i64::from(y));
+        let left = x.max(0);
+        let top = y.max(0);
+        let right = (x + i64::from(self.width)).min(i64::from(frame_w));
+        let bottom = (y + i64::from(self.height)).min(i64::from(frame_h));
+        if left >= right || top >= bottom {
+            return None;
+        }
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)] // clamped above
         Some(Rect {
             x: left as u32,
             y: top as u32,
@@ -167,10 +204,84 @@ impl Shape {
         })
     }
 
+    /// The pointer for a frame read back at half size
+    /// (`dxgi.rs` halves a large desktop on the GPU): every other pixel
+    /// of every other row, of the same kind.
+    #[must_use]
+    pub fn halved(&self) -> Self {
+        let (width, height) = (self.width.div_ceil(2), self.height.div_ceil(2));
+        let (w, h) = (width as usize, height as usize);
+        match self.kind {
+            Kind::Color | Kind::MaskedColor => {
+                let mut data = Vec::with_capacity(w * h * 4);
+                for y in 0..h {
+                    for x in 0..w {
+                        data.extend_from_slice(&self.data[2 * y * self.pitch + 2 * x * 4..][..4]);
+                    }
+                }
+                Self {
+                    kind: self.kind,
+                    width,
+                    height,
+                    pitch: w * 4,
+                    data,
+                }
+            }
+            Kind::Monochrome => {
+                let pitch = w.div_ceil(8);
+                let mut data = vec![0u8; pitch * h * 2];
+                // The AND mask, then the XOR mask under it.
+                for (mask, from) in [(0, 0), (h, self.height as usize)] {
+                    for y in 0..h {
+                        for x in 0..w {
+                            if self.bit(2 * x, from + 2 * y) {
+                                data[(mask + y) * pitch + x / 8] |= 0x80 >> (x % 8);
+                            }
+                        }
+                    }
+                }
+                Self {
+                    kind: Kind::Monochrome,
+                    width,
+                    height,
+                    pitch,
+                    data,
+                }
+            }
+        }
+    }
+
     /// One bit of a monochrome mask: rows of bytes, the leftmost pixel
     /// in the highest bit.
     fn bit(&self, x: usize, row: usize) -> bool {
         self.data[row * self.pitch + x / 8] & (0x80 >> (x % 8)) != 0
+    }
+}
+
+/// The desktop under a drawn pointer, as it was before the drawing
+/// ([`Shape::draw_keeping`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Under {
+    /// The part of the frame the pointer covers.
+    pub rect: Rect,
+    /// Its pixels, row after row.
+    pixels: Vec<u8>,
+}
+
+impl Under {
+    /// Put the desktop back into the `frame_w`-wide frame it was taken
+    /// from. A frame of another size is left alone.
+    pub fn restore(&self, frame: &mut [u8], frame_w: u32) {
+        let r = self.rect;
+        let stride = frame_w as usize * 4;
+        let width = r.width as usize * 4;
+        if r.x + r.width > frame_w || frame.len() < (r.y + r.height) as usize * stride {
+            return;
+        }
+        for (i, row) in self.pixels.chunks_exact(width).enumerate() {
+            let at = (r.y as usize + i) * stride + r.x as usize * 4;
+            frame[at..at + width].copy_from_slice(row);
+        }
     }
 }
 
@@ -223,6 +334,66 @@ pub fn same_outside(a: &[u8], b: &[u8], width: u32, height: u32, except: Option<
         .all(|(ra, rb)| ra[..x0] == rb[..x0] && ra[x1..] == rb[x1..])
 }
 
+/// A `width` × `height` BGRA frame at half the size, each pixel the
+/// average of the four it covers (rounded): what the GPU makes of a
+/// desktop it halves (`dxgi.rs`), give or take a step of rounding, for
+/// a screenshot to be compared with.
+#[must_use]
+pub fn halve(frame: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let (w, h) = (width as usize, height as usize);
+    let (hw, hh) = (w / 2, h / 2);
+    let mut out = Vec::with_capacity(hw * hh * 4);
+    if frame.len() < w * h * 4 {
+        return out;
+    }
+    let stride = w * 4;
+    for y in 0..hh {
+        let (top, bottom) = (&frame[2 * y * stride..], &frame[(2 * y + 1) * stride..]);
+        for x in 0..hw {
+            for c in 0..4 {
+                let at = 2 * x * 4 + c;
+                let sum = u16::from(top[at])
+                    + u16::from(top[at + 4])
+                    + u16::from(bottom[at])
+                    + u16::from(bottom[at + 4]);
+                #[allow(clippy::cast_possible_truncation)] // ≤ 255
+                out.push(((sum + 2) / 4) as u8);
+            }
+        }
+    }
+    out
+}
+
+/// [`same_outside`], allowing each byte to be off by `tolerance`: a
+/// screenshot halved on the CPU against a desktop halved on the GPU
+/// round differently.
+#[must_use]
+pub fn close_outside(
+    a: &[u8],
+    b: &[u8],
+    width: u32,
+    height: u32,
+    except: Option<Rect>,
+    tolerance: u8,
+) -> bool {
+    let stride = width as usize * 4;
+    if a.len() != b.len() || a.len() != stride * height as usize {
+        return false;
+    }
+    let close = |ra: &[u8], rb: &[u8]| ra.iter().zip(rb).all(|(x, y)| x.abs_diff(*y) <= tolerance);
+    a.chunks_exact(stride)
+        .zip(b.chunks_exact(stride))
+        .enumerate()
+        .all(|(y, (ra, rb))| match except {
+            Some(r) if (r.y..r.y + r.height).contains(&(y as u32)) => {
+                let x0 = (r.x as usize).min(width as usize) * 4;
+                let x1 = (r.x as usize + r.width as usize).min(width as usize) * 4;
+                close(&ra[..x0], &rb[..x0]) && close(&ra[x1..], &rb[x1..])
+            }
+            _ => close(ra, rb),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,6 +406,85 @@ mod tests {
     fn px(frame: &[u8], w: u32, x: u32, y: u32) -> [u8; 4] {
         let at = ((y * w + x) * 4) as usize;
         frame[at..at + 4].try_into().unwrap()
+    }
+
+    #[test]
+    fn a_halved_pointer_keeps_every_other_pixel() {
+        // 3 × 2 colour: columns 0 and 2 of row 0 survive.
+        let data: Vec<u8> = (0..24).collect();
+        let half = Shape::new(Kind::Color, 3, 2, 12, &data).unwrap().halved();
+        assert_eq!((half.width, half.height, half.pitch), (2, 1, 8));
+        assert_eq!(half.data, [0, 1, 2, 3, 8, 9, 10, 11]);
+        // 4 × 2 monochrome: AND 1010/0000, XOR 0110/0000 → 11 and 01.
+        let mono = [0b1010_0000, 0, 0b0110_0000, 0];
+        let half = Shape::new(Kind::Monochrome, 4, 4, 1, &mono)
+            .unwrap()
+            .halved();
+        assert_eq!((half.width, half.height, half.pitch), (2, 1, 1));
+        assert_eq!(half.data, [0b1100_0000, 0b0100_0000]);
+        // It is still a shape that draws.
+        let mut f = frame(2, 1, [9, 9, 9, 255]);
+        assert!(half.draw(&mut f, 2, 1, 0, 0).is_some());
+    }
+
+    #[test]
+    fn halving_averages_and_compares_within_rounding() {
+        // 4 × 2 → 2 × 1.
+        let mut f = Vec::new();
+        for v in [0u8, 10, 20, 30, 1, 11, 21, 31] {
+            f.extend_from_slice(&[v, v, v, 255]);
+        }
+        let half = halve(&f, 4, 2);
+        assert_eq!(half, [6, 6, 6, 255, 26, 26, 26, 255]);
+        let mut gpu = half.clone();
+        gpu[0] = 5; // rounded the other way
+        assert!(close_outside(&half, &gpu, 2, 1, None, 2));
+        gpu[4] = 40; // a change
+        assert!(!close_outside(&half, &gpu, 2, 1, None, 2));
+        // …unless it is under the pointer.
+        let pointer = Rect {
+            x: 1,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+        assert!(close_outside(&half, &gpu, 2, 1, Some(pointer), 2));
+    }
+
+    #[test]
+    fn a_kept_desktop_is_put_back() {
+        let data = [0, 0, 255, 255].repeat(9);
+        let shape = Shape::new(Kind::Color, 3, 3, 12, &data).unwrap();
+        // A frame with something in every pixel, so a wrong restore shows.
+        let clean: Vec<u8> = (0..6 * 4 * 4).map(|i| i as u8).collect();
+        let mut f = clean.clone();
+        // Hanging off the right and bottom edges.
+        let under = shape.draw_keeping(&mut f, 6, 4, 4, 2).unwrap();
+        assert_eq!(
+            under.rect,
+            Rect {
+                x: 4,
+                y: 2,
+                width: 2,
+                height: 2
+            }
+        );
+        assert_ne!(f, clean);
+        under.restore(&mut f, 6);
+        assert_eq!(f, clean);
+        // Off the frame: nothing drawn, nothing kept.
+        assert!(shape.draw_keeping(&mut f, 6, 4, 6, 0).is_none());
+        assert!(shape.draw_keeping(&mut f, 6, 4, -3, 0).is_none());
+        // Drawn again somewhere else after the restore: the same as a
+        // fresh drawing there.
+        let mut fresh = clean;
+        shape.draw(&mut fresh, 6, 4, -1, -1);
+        let under = shape.draw_keeping(&mut f, 6, 4, -1, -1).unwrap();
+        assert_eq!(f, fresh);
+        // A frame it does not fit is not written.
+        let mut narrow = vec![7u8; 4 * 4];
+        under.restore(&mut narrow, 1);
+        assert_eq!(narrow, vec![7u8; 16]);
     }
 
     #[test]

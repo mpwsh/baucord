@@ -8,7 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-audio = { path = "../audio", features = ["serde"] }
+audio = { path = "../audio" }
 protocol = { path = "../protocol" }
 transport = { path = "../transport" }
 video = { path = "../video" }

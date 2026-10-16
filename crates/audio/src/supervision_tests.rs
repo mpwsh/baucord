@@ -164,6 +164,43 @@ fn desktop_without_a_microphone_plays_and_takes_it_when_it_comes() {
     assert_eq!(rig.did(), NOTHING);
 }
 
+/// A side that will not open is asked again after 2 s, then 4, 8, …
+/// up to a minute; a device event starts it over (review 2026-10,
+/// P2-38).
+#[test]
+fn a_missing_microphone_is_asked_for_less_and_less_often() {
+    use std::time::Duration;
+    let machine = Machine::new(Traits::DESKTOP);
+    machine.set(|w| {
+        w.inputs.clear();
+        w.default_input = None;
+    });
+    let mut rig = Rig::on(machine);
+    let _ = rig.vc.start();
+    rig.did();
+    let asked = |rig: &mut Rig, after: u64| {
+        let now = rig.clock.step(Duration::from_secs(after));
+        rig.vc.service_at(now);
+        !rig.did().is_empty()
+    };
+    assert!(asked(&mut rig, 2));
+    assert!(!asked(&mut rig, 3), "now 4 s");
+    assert!(asked(&mut rig, 1));
+    assert!(!asked(&mut rig, 7), "now 8 s");
+    assert!(asked(&mut rig, 1));
+    for _ in 0..6 {
+        asked(&mut rig, 60);
+    }
+    assert!(!asked(&mut rig, 59), "at most a minute");
+    assert!(asked(&mut rig, 1));
+    // The OS says the default moved: at once.
+    rig.vc
+        .stats
+        .default_input_changed
+        .store(true, Ordering::Relaxed);
+    assert!(asked(&mut rig, 2));
+}
+
 #[test]
 fn desktop_without_an_output_keeps_asking_for_one() {
     let machine = Machine::new(Traits::DESKTOP);
@@ -423,6 +460,71 @@ fn windows_on_speakers_takes_the_call_path_and_follows_the_communications_defaul
         rig.report().as_deref(),
         Some("platform (speakers) ref=speakers")
     );
+}
+
+/// The lobby has nothing to cancel, and a Communications stream has
+/// Windows turn every other app down: speakers under Automatic take the
+/// call path at the join and leave it at the leave (review 2026-10,
+/// P1-5). Before, it was taken at connect and held to disconnect.
+#[test]
+fn windows_on_speakers_takes_the_call_path_in_a_room_only() {
+    let mut rig = Rig::new(Traits::WINDOWS);
+    rig.vc.set_presence(false, true);
+    let _ = rig.vc.start();
+    let plain = [
+        "plan: plain streams",
+        "open output speakers (plain)",
+        "open microphone mic (plain)",
+    ];
+    assert_eq!(rig.did(), plain);
+    assert_eq!(rig.report(), None, "takes effect when you join voice");
+    // The lobby's ticks ask the platform nothing and change nothing.
+    let surveys = rig.machine.surveys();
+    assert!(!rig.tick());
+    assert_eq!(rig.machine.surveys(), surveys);
+    assert_eq!(rig.did(), NOTHING);
+
+    rig.vc.set_presence(true, true);
+    assert_eq!(
+        rig.did(),
+        [
+            "close microphone",
+            "close output",
+            "plan: call path",
+            "open output speakers (call)",
+            "open microphone mic (call), reference the communications default",
+        ]
+    );
+    assert_eq!(
+        rig.report().as_deref(),
+        Some("platform (speakers) ref=speakers")
+    );
+    // Muted in the room: the desktop keeps both.
+    rig.vc.set_presence(true, false);
+    assert_eq!(rig.did(), NOTHING);
+
+    rig.vc.set_presence(false, true);
+    let mut back = vec!["close microphone", "close output"];
+    back.extend(plain);
+    assert_eq!(rig.did(), back);
+}
+
+#[test]
+fn windows_on_headphones_joins_without_reopening() {
+    let machine = Machine::new(Traits::WINDOWS);
+    machine.set(|w| {
+        w.kinds.insert("speakers".into(), OutputKind::Headphones);
+    });
+    let mut rig = Rig::on(machine);
+    rig.vc.set_presence(false, true);
+    let _ = rig.vc.start();
+    rig.did();
+    assert_eq!(rig.report(), None);
+    rig.vc.set_presence(true, true);
+    assert_eq!(rig.report().as_deref(), Some("none (headphones)"));
+    rig.vc.set_presence(false, true);
+    assert_eq!(rig.did(), NOTHING, "plain streams in a room and out of one");
+    assert_eq!(rig.report(), None);
 }
 
 #[test]

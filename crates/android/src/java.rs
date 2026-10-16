@@ -199,6 +199,7 @@ pub fn keep_screen_on(on: bool) -> Result<(), String> {
 ///
 /// # Errors
 /// Any JNI failure, as text.
+#[cfg(feature = "app")]
 pub fn copy_text(label: &str, text: &str) -> Result<bool, String> {
     with_activity(|env, activity| {
         let jlabel = env.new_string(label)?;
@@ -306,12 +307,8 @@ pub fn register_natives() -> Result<(), String> {
 /// Any JNI failure, as text.
 #[cfg(feature = "app")]
 pub fn post_notice(notice: &frontend::notice::Notice) -> Result<(), String> {
-    let kind = match notice.kind {
-        frontend::notice::NoticeKind::Message => "message",
-        frontend::notice::NoticeKind::Activity => "activity",
-    };
     with_activity(|env, activity| {
-        let jkind = env.new_string(kind)?;
+        let jkind = env.new_string(notice.kind.name())?;
         let jkey = env.new_string(&notice.key)?;
         let jchannel = env.new_string(&notice.channel)?;
         let jtitle = env.new_string(&notice.title)?;
@@ -346,37 +343,42 @@ pub fn post_notice(notice: &frontend::notice::Notice) -> Result<(), String> {
 /// Any JNI failure, as text.
 #[cfg(feature = "app")]
 pub fn notices_allowed(kind: frontend::notice::NoticeKind) -> Result<bool, String> {
-    let kind = match kind {
-        frontend::notice::NoticeKind::Message => "message",
-        frontend::notice::NoticeKind::Activity => "activity",
-    };
-    with_activity(|env, activity| {
-        let jkind = env.new_string(kind)?;
-        env.call_method(
-            activity,
-            jni::jni_str!("noticesAllowed"),
-            jni::jni_sig!("(Ljava/lang/String;)Z"),
-            &[(&jkind).into()],
-        )?
-        .z()
-    })
-    .map_err(|e| e.to_string())
+    call_with_string(
+        jni::jni_str!("noticesAllowed"),
+        jni::jni_sig!("(Ljava/lang/String;)Z"),
+        kind.name(),
+    )
 }
 
-/// `BaucordActivity.playChime(wav)`: the message chime as a
-/// notification sound, while no voice stream is open (D53).
+/// `BaucordActivity.playChime(name, wav)`: chime `name` as a
+/// notification sound, while no voice stream is open (D53). Its WAV
+/// crosses into Java once a run (Java keeps the file); after that an
+/// empty array says "the one you have" — it was copied over on every
+/// chime (review 2026-10, P3-12).
 ///
 /// # Errors
 /// Any JNI failure, as text.
 #[cfg(feature = "app")]
-pub fn play_chime(wav: &[u8]) -> Result<(), String> {
+pub fn play_chime(name: &'static str, wav: &[u8]) -> Result<(), String> {
+    static SENT: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    let first = SENT
+        .lock()
+        .map(|mut sent| {
+            let first = !sent.contains(&name);
+            if first {
+                sent.push(name);
+            }
+            first
+        })
+        .unwrap_or(true);
     with_activity(|env, activity| {
-        let jwav = env.byte_array_from_slice(wav)?;
+        let jname = env.new_string(name)?;
+        let jwav = env.byte_array_from_slice(if first { wav } else { &[] })?;
         env.call_method(
             activity,
             jni::jni_str!("playChime"),
-            jni::jni_sig!("([B)V"),
-            &[(&jwav).into()],
+            jni::jni_sig!("(Ljava/lang/String;[B)V"),
+            &[(&jname).into(), (&jwav).into()],
         )?;
         Ok(())
     })
@@ -553,23 +555,34 @@ pub fn open_uri(uri: &str, mime: &str) -> Result<bool, String> {
     .map_err(|e| e.to_string())
 }
 
+/// An Activity method of one string that answers a boolean: the
+/// shape most of the calls here have, written once (review 2026-10,
+/// P3-16).
+#[cfg(feature = "app")]
+fn call_with_string<N, S>(name: N, sig: S, arg: &str) -> Result<bool, String>
+where
+    N: AsRef<jni::strings::JNIStr>,
+    S: AsRef<jni::signature::MethodSignature<'static, 'static>>,
+{
+    with_activity(|env, activity| {
+        let jarg = env.new_string(arg)?;
+        env.call_method(activity, &name, &sig, &[(&jarg).into()])?
+            .z()
+    })
+    .map_err(|e| e.to_string())
+}
+
 /// `BaucordActivity.uriExists(uri)`: a saved download is still there.
 ///
 /// # Errors
 /// Any JNI failure, as text.
 #[cfg(feature = "app")]
 pub fn uri_exists(uri: &str) -> Result<bool, String> {
-    with_activity(|env, activity| {
-        let juri = env.new_string(uri)?;
-        env.call_method(
-            activity,
-            jni::jni_str!("uriExists"),
-            jni::jni_sig!("(Ljava/lang/String;)Z"),
-            &[(&juri).into()],
-        )?
-        .z()
-    })
-    .map_err(|e| e.to_string())
+    call_with_string(
+        jni::jni_str!("uriExists"),
+        jni::jni_sig!("(Ljava/lang/String;)Z"),
+        uri,
+    )
 }
 
 /// `BaucordActivity.openUrl(url)`: the browser. `Ok(false)` when
@@ -579,15 +592,9 @@ pub fn uri_exists(uri: &str) -> Result<bool, String> {
 /// Any JNI failure, as text.
 #[cfg(feature = "app")]
 pub fn open_url(url: &str) -> Result<bool, String> {
-    with_activity(|env, activity| {
-        let jurl = env.new_string(url)?;
-        env.call_method(
-            activity,
-            jni::jni_str!("openUrl"),
-            jni::jni_sig!("(Ljava/lang/String;)Z"),
-            &[(&jurl).into()],
-        )?
-        .z()
-    })
-    .map_err(|e| e.to_string())
+    call_with_string(
+        jni::jni_str!("openUrl"),
+        jni::jni_sig!("(Ljava/lang/String;)Z"),
+        url,
+    )
 }

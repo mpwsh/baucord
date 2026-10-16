@@ -56,15 +56,21 @@ use windows::{
             Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN},
             Direct3D11::{
                 D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Resource,
-                ID3D11Texture2D, D3D11_BOX, D3D11_CPU_ACCESS_READ,
+                ID3D11ShaderResourceView, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET,
+                D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_CPU_ACCESS_READ,
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_SINGLETHREADED,
-                D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-                D3D11_USAGE_STAGING,
+                D3D11_FORMAT_SUPPORT_MIP_AUTOGEN, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
+                D3D11_RESOURCE_MISC_GENERATE_MIPS, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+                D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
             },
             Dxgi::{
-                Common::DXGI_FORMAT_B8G8R8A8_UNORM, CreateDXGIFactory1, IDXGIAdapter1, IDXGIDevice,
-                IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
-                DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+                Common::{
+                    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION_IDENTITY,
+                    DXGI_MODE_ROTATION_UNSPECIFIED,
+                },
+                CreateDXGIFactory1, IDXGIAdapter1, IDXGIDevice, IDXGIFactory1, IDXGIOutput,
+                IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_WAIT_TIMEOUT,
+                DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
                 DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR,
                 DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR,
                 DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME,
@@ -76,8 +82,8 @@ use windows::{
 };
 
 use crate::{
-    pointer::{Kind, Rect, Shape},
-    CaptureError,
+    pointer::{Kind, Shape, Under},
+    CaptureError, Quality,
 };
 
 /// How long `AcquireNextFrame` waits before reporting "no change".
@@ -118,9 +124,44 @@ pub struct CapturedFrame {
     pub height: u32,
     /// When it was read back from the desktop.
     pub at: Instant,
-    /// Where the pointer was drawn into it, if it was: the one part of
-    /// the picture a screenshot of the same desktop does not have.
-    pub pointer: Option<Rect>,
+    /// What the pointer drawn into it covers, as the desktop has it:
+    /// the one part of the picture a screenshot of the same desktop
+    /// does not have, and what goes back when the pointer moves on.
+    pub under: Option<Under>,
+    /// Read back at half the desktop's size, halved on the GPU
+    /// ([`Halver`]): a screenshot is halved before it is compared.
+    pub halved: bool,
+}
+
+/// What the capture worker queues.
+pub enum Captured {
+    /// The desktop changed: a new picture, pointer drawn in.
+    Desktop(CapturedFrame),
+    /// Only the pointer moved, or went: the consumer draws it again
+    /// into the picture it holds. Reading the unchanged desktop out
+    /// once more for it was a full-frame copy per pointer move (review
+    /// 2026-10, P3-35).
+    PointerMoved {
+        at: Instant,
+        /// Where it is now; `None` when it is not shown.
+        to: Option<PointerAt>,
+    },
+}
+
+impl Captured {
+    fn at(&self) -> Instant {
+        match self {
+            Self::Desktop(f) => f.at,
+            Self::PointerMoved { at, .. } => *at,
+        }
+    }
+}
+
+/// The pointer's picture and where its top-left corner is.
+pub struct PointerAt {
+    pub shape: Arc<Shape>,
+    pub x: i32,
+    pub y: i32,
 }
 
 /// Worker health as published for the consumer.
@@ -147,7 +188,7 @@ struct Shared {
     failure: Mutex<Option<String>>,
     /// Frame queue (depth [`FRAME_QUEUE_DEPTH`]): worker pushes,
     /// consumer pops oldest-first.
-    slot: Mutex<VecDeque<CapturedFrame>>,
+    slot: Mutex<VecDeque<Captured>>,
 }
 
 impl Shared {
@@ -179,12 +220,14 @@ impl DxgiDuplicator {
     /// Device and duplication are created synchronously on the caller
     /// so init failures (unsupported session, duplication limit, no
     /// such monitor) surface here, letting the caller fall back.
+    /// `quality` says how large the share's pictures are, and so
+    /// whether the desktop is halved before it is read back.
     ///
     /// # Errors
     ///
     /// Returns [`CaptureError`] if the monitor can't be found or the
     /// OS refuses the duplication.
-    pub fn new(monitor_index: usize) -> Result<Self, CaptureError> {
+    pub fn new(monitor_index: usize, quality: Quality) -> Result<Self, CaptureError> {
         let (device, context, duplication) = open_duplication(hmonitor_at(monitor_index)?)?;
 
         let shared = Arc::new(Shared {
@@ -197,7 +240,7 @@ impl DxgiDuplicator {
         let worker_shared = Arc::clone(&shared);
         let worker = std::thread::Builder::new()
             .name("dxgi-capture".into())
-            .spawn(move || worker_loop(worker_shared, monitor_index, device, context, duplication))
+            .spawn(move || worker_loop(worker_shared, quality, device, context, duplication))
             .map_err(|e| CaptureError::Capture(format!("spawn capture worker: {e}")))?;
 
         Ok(Self {
@@ -214,17 +257,21 @@ impl DxgiDuplicator {
     /// always took the older one: a frame interval of the screen, 17 to
     /// 33 ms, late for nothing (review P3-28). At matched rates the
     /// oldest still goes first: that is what the second slot is for
-    /// ([`FRAME_QUEUE_DEPTH`]).
+    /// ([`FRAME_QUEUE_DEPTH`]). A desktop picture is never dropped for
+    /// a pointer move after it: the move would be drawn on the old one.
     #[must_use]
-    pub fn take_frame(&self, every: Duration) -> Option<CapturedFrame> {
+    pub fn take_frame(&self, every: Duration) -> Option<Captured> {
         let mut queue = self.shared.slot.lock().unwrap();
         let surplus = match (queue.front(), queue.back()) {
             (Some(older), Some(newer)) if queue.len() > 1 => {
-                crate::capture::source_outpaces(newer.at.duration_since(older.at), every)
+                let replaces = matches!(older, Captured::PointerMoved { .. })
+                    || matches!(newer, Captured::Desktop(_));
+                replaces
+                    && crate::capture::source_outpaces(newer.at().duration_since(older.at()), every)
             }
             _ => false,
         };
-        if surplus && let Some(stale) = queue.pop_front() {
+        if surplus && let Some(Captured::Desktop(stale)) = queue.pop_front() {
             crate::pool::recycle(stale.data);
         }
         queue.pop_front()
@@ -261,7 +308,7 @@ impl Drop for DxgiDuplicator {
 
 fn worker_loop(
     shared: Arc<Shared>,
-    _monitor_index: usize,
+    quality: Quality,
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     duplication: IDXGIOutputDuplication,
@@ -272,9 +319,9 @@ fn worker_loop(
     let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
 
     // Persistent staging texture, recreated only when the source
-    // dimensions change (mode switches). It keeps the desktop as last
-    // read, which is what a pointer move is drawn onto.
+    // dimensions change (mode switches).
     let mut staging: Option<(ID3D11Texture2D, u32, u32)> = None;
+    let mut halver = unsafe { Halver::new(&device) };
     let mut pointer = Pointer::default();
 
     'outer: loop {
@@ -321,7 +368,7 @@ fn worker_loop(
                 // the desktop, and the pointer's frame is made below.
                 if info.LastPresentTime == 0 {
                     let _ = unsafe { duplication.ReleaseFrame() };
-                    unsafe { pointer_frame(&shared, &context, staging.as_ref(), &mut pointer) };
+                    pointer_moved(&shared, staging.is_some(), &mut pointer);
                     continue;
                 }
 
@@ -342,12 +389,25 @@ fn worker_loop(
                     continue;
                 }
 
-                let grabbed =
-                    unsafe { grab_frame(&device, &context, &duplication, resource, &mut staging) };
+                let grabbed = unsafe {
+                    grab_frame(
+                        &device,
+                        &context,
+                        &duplication,
+                        resource,
+                        &mut staging,
+                        &mut halver,
+                        quality,
+                    )
+                };
                 match grabbed {
                     Ok(Some(mut frame)) => {
                         pointer.draw(&mut frame);
-                        shared.slot.lock().unwrap().push_back(frame);
+                        shared
+                            .slot
+                            .lock()
+                            .unwrap()
+                            .push_back(Captured::Desktop(frame));
                     }
                     Ok(None) => {}
                     Err(GrabError::UnsupportedFormat(fmt)) => {
@@ -372,8 +432,8 @@ fn worker_loop(
         }
 
         // Nothing new from the desktop: a pointer move that found the
-        // queue full is given its frame now, if there is room.
-        unsafe { pointer_frame(&shared, &context, staging.as_ref(), &mut pointer) };
+        // queue full is sent now, if there is room.
+        pointer_moved(&shared, staging.is_some(), &mut pointer);
     }
 
     if com.is_ok() {
@@ -388,7 +448,12 @@ fn worker_loop(
 struct Pointer {
     /// Its picture; `None` until the first one comes, or after one that
     /// did not fit its own description.
-    shape: Option<Shape>,
+    shape: Option<Arc<Shape>>,
+    /// …at half size, for halved frames: made when first needed.
+    half_shape: Option<Arc<Shape>>,
+    /// The last desktop frame was halved: so is the picture a move is
+    /// drawn into.
+    halved: bool,
     /// Top-left corner of the picture on this output (the hot spot is
     /// already taken off by the system).
     x: i32,
@@ -467,7 +532,9 @@ impl Pointer {
                 described.Pitch,
                 &self.scratch[..filled],
             )
+            .map(Arc::new)
         });
+        self.half_shape = None;
         if self.shape.is_none() {
             log::debug!(
                 "dxgi capture: a pointer shape that cannot be drawn (type {}, {}x{}, pitch {}, {} bytes)",
@@ -485,43 +552,61 @@ impl Pointer {
     /// what was owed.
     fn draw(&mut self, frame: &mut CapturedFrame) {
         self.owed = false;
+        self.halved = frame.halved;
+        if let Some(p) = self.placed() {
+            frame.under =
+                p.shape
+                    .draw_keeping(&mut frame.data, frame.width, frame.height, p.x, p.y);
+        }
+    }
+
+    /// Where it is now, for a move over an unchanged desktop, which
+    /// settles what was owed.
+    fn moved(&mut self) -> Captured {
+        self.owed = false;
+        Captured::PointerMoved {
+            at: Instant::now(),
+            to: self.placed(),
+        }
+    }
+
+    /// Its picture and place in the frames being made: halved with them.
+    /// `None` when it is not shown.
+    fn placed(&mut self) -> Option<PointerAt> {
         if !self.visible {
-            return;
+            return None;
         }
-        if let Some(shape) = &self.shape {
-            frame.pointer = shape.draw(&mut frame.data, frame.width, frame.height, self.x, self.y);
+        let shape = self.shape.as_ref()?;
+        if !self.halved {
+            return Some(PointerAt {
+                shape: Arc::clone(shape),
+                x: self.x,
+                y: self.y,
+            });
         }
+        let half = self
+            .half_shape
+            .get_or_insert_with(|| Arc::new(shape.halved()));
+        Some(PointerAt {
+            shape: Arc::clone(half),
+            x: self.x.div_euclid(2),
+            y: self.y.div_euclid(2),
+        })
     }
 }
 
-/// The frame a pointer move is owed: the desktop as it was last read
-/// (it has not changed since, or that would have been a frame), with
-/// the pointer where it is now. Nothing if none is owed, the queue is
-/// full (the next pass asks again) or the desktop was never read (the
-/// first real frame will carry the pointer).
-unsafe fn pointer_frame(
-    shared: &Shared,
-    context: &ID3D11DeviceContext,
-    staging: Option<&(ID3D11Texture2D, u32, u32)>,
-    pointer: &mut Pointer,
-) {
-    let Some(staging) = staging else {
-        return;
-    };
-    if !pointer.owed || shared.slot.lock().unwrap().len() >= FRAME_QUEUE_DEPTH {
+/// Queue the pointer move owed, if one is: the desktop has not changed
+/// since it was last read (or that would have been a frame), and the
+/// consumer draws the pointer again into the picture it holds. Nothing
+/// if the queue is full (the next pass asks again) or the desktop was
+/// never read (the first real frame will carry the pointer).
+fn pointer_moved(shared: &Shared, desktop_read: bool, pointer: &mut Pointer) {
+    if !desktop_read || !pointer.owed {
         return;
     }
-    match unsafe { read_staging(context, staging) } {
-        Ok(mut frame) => {
-            pointer.draw(&mut frame);
-            shared.slot.lock().unwrap().push_back(frame);
-        }
-        Err(e) => {
-            // Not worth the duplication: the pointer waits for the
-            // next frame of the desktop.
-            pointer.owed = false;
-            log::debug!("dxgi capture: the pointer's frame could not be read: {e}");
-        }
+    let mut queue = shared.slot.lock().unwrap();
+    if queue.len() < FRAME_QUEUE_DEPTH {
+        queue.push_back(pointer.moved());
     }
 }
 
@@ -536,16 +621,147 @@ impl From<windows::core::Error> for GrabError {
     }
 }
 
-/// Copy the acquired frame into CPU memory (tightly packed BGRA).
-/// Releases the duplication frame as soon as the GPU copy is queued —
-/// before the (synchronizing) Map — so the duplication is held for the
-/// minimum time.
+// ── Halving on the GPU ──────────────────────────────────────────────────
+
+/// Halves a large desktop on the GPU before it is read back. A 4K
+/// desktop shared at 1080p was read back whole — 33 MB a frame, 30–60
+/// times a second — and scaled down by swscale on the CPU (review
+/// 2026-10, P2-46). When the share's pictures are at most half the
+/// desktop's size either way, the desktop goes into a two-level texture
+/// whose second level the GPU builds (`GenerateMips`: each pixel the
+/// average of four), and that level is what is read: 8 MB, and the
+/// encoder scales from there. Off for good on this duplicator when the
+/// device cannot build mips for BGRA or a texture cannot be made.
+struct Halver {
+    usable: bool,
+    /// The texture, its view (what `GenerateMips` takes) and the
+    /// desktop size it was made for.
+    target: Option<(ID3D11Texture2D, ID3D11ShaderResourceView, u32, u32)>,
+}
+
+impl Halver {
+    unsafe fn new(device: &ID3D11Device) -> Self {
+        let support = unsafe { device.CheckFormatSupport(DXGI_FORMAT_B8G8R8A8_UNORM) }.unwrap_or(0);
+        let usable = support & D3D11_FORMAT_SUPPORT_MIP_AUTOGEN.0 as u32 != 0;
+        if !usable {
+            log::info!(
+                "dxgi capture: the GPU cannot halve the desktop (no BGRA mips): full-size reads"
+            );
+        }
+        Self {
+            usable,
+            target: None,
+        }
+    }
+
+    /// Whether a `width` × `height` desktop is halved for `quality`,
+    /// with the texture for it made.
+    unsafe fn ready(
+        &mut self,
+        device: &ID3D11Device,
+        width: u32,
+        height: u32,
+        quality: Quality,
+    ) -> bool {
+        if !self.usable || !halves_cleanly(width, height, quality) {
+            return false;
+        }
+        if matches!(&self.target, Some((_, _, w, h)) if (*w, *h) == (width, height)) {
+            return true;
+        }
+        self.target = None;
+        match unsafe { Self::make(device, width, height) } {
+            Ok(target) => {
+                log::info!(
+                    "dxgi capture: {width}x{height} halved on the GPU before readback ({quality})"
+                );
+                self.target = Some(target);
+                true
+            }
+            Err(e) => {
+                log::warn!(
+                    "dxgi capture: cannot halve the desktop on the GPU ({e}): full-size reads"
+                );
+                self.usable = false;
+                false
+            }
+        }
+    }
+
+    unsafe fn make(
+        device: &ID3D11Device,
+        width: u32,
+        height: u32,
+    ) -> windows::core::Result<(ID3D11Texture2D, ID3D11ShaderResourceView, u32, u32)> {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 2,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: D3D11_RESOURCE_MISC_GENERATE_MIPS.0 as u32,
+        };
+        let mut tex = None;
+        unsafe { device.CreateTexture2D(&raw const desc, None, Some(&raw mut tex)) }?;
+        let tex =
+            tex.ok_or_else(|| windows::core::Error::from_hresult(windows::core::HRESULT(-1)))?;
+        let mut view = None;
+        unsafe { device.CreateShaderResourceView(&tex, None, Some(&raw mut view)) }?;
+        let view =
+            view.ok_or_else(|| windows::core::Error::from_hresult(windows::core::HRESULT(-1)))?;
+        Ok((tex, view, width, height))
+    }
+
+    /// Queue the halving of `source` into `staging` (half its size).
+    unsafe fn halve(
+        &self,
+        context: &ID3D11DeviceContext,
+        source: &ID3D11Resource,
+        staging: &ID3D11Resource,
+    ) -> windows::core::Result<()> {
+        let Some((tex, view, _, _)) = &self.target else {
+            return Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+                -1,
+            )));
+        };
+        let tex: ID3D11Resource = tex.cast()?;
+        unsafe {
+            context.CopySubresourceRegion(Some(&tex), 0, 0, 0, 0, Some(source), 0, None);
+            context.GenerateMips(view);
+            // Subresource 1: the second level of the only array slice.
+            context.CopySubresourceRegion(Some(staging), 0, 0, 0, 0, Some(&tex), 1, None);
+        }
+        Ok(())
+    }
+}
+
+/// Are the share's pictures of a `width` × `height` desktop at most half
+/// its size either way, so that halving it first loses nothing the
+/// encoder keeps?
+fn halves_cleanly(width: u32, height: u32, quality: Quality) -> bool {
+    let (out_w, out_h) = crate::codec::fit_dimensions(width, height, quality);
+    out_w * 2 <= width && out_h * 2 <= height
+}
+
+/// Copy the acquired frame into CPU memory (tightly packed BGRA), halved
+/// on the way when [`Halver`] says so. Releases the duplication frame as
+/// soon as the GPU copy is queued — before the (synchronizing) Map — so
+/// the duplication is held for the minimum time.
 unsafe fn grab_frame(
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
     duplication: &IDXGIOutputDuplication,
     resource: Option<IDXGIResource>,
     staging: &mut Option<(ID3D11Texture2D, u32, u32)>,
+    halver: &mut Halver,
+    quality: Quality,
 ) -> Result<Option<CapturedFrame>, GrabError> {
     let Some(resource) = resource else {
         let _ = unsafe { duplication.ReleaseFrame() };
@@ -558,7 +774,13 @@ unsafe fn grab_frame(
     if desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
         return Err(GrabError::UnsupportedFormat(desc.Format.0));
     }
-    let (width, height) = (desc.Width, desc.Height);
+    let halved = unsafe { halver.ready(device, desc.Width, desc.Height, quality) };
+    // The second level of a texture is half the first, rounded down.
+    let (width, height) = if halved {
+        ((desc.Width / 2).max(1), (desc.Height / 2).max(1))
+    } else {
+        (desc.Width, desc.Height)
+    };
 
     // (Re)build the staging texture only when dimensions change.
     let rebuild = match staging {
@@ -567,6 +789,9 @@ unsafe fn grab_frame(
     };
     if rebuild {
         let mut staging_desc = desc;
+        staging_desc.Width = width;
+        staging_desc.Height = height;
+        staging_desc.MipLevels = 1;
         staging_desc.BindFlags = 0;
         staging_desc.MiscFlags = 0;
         staging_desc.Usage = D3D11_USAGE_STAGING;
@@ -584,38 +809,43 @@ unsafe fn grab_frame(
     let staging = staging.as_ref().expect("built above");
     let (staging_tex, _, _) = staging;
 
-    let region = D3D11_BOX {
-        left: 0,
-        top: 0,
-        right: width,
-        bottom: height,
-        front: 0,
-        back: 1,
-    };
     let staging_res: ID3D11Resource = staging_tex.cast()?;
     let source_res: ID3D11Resource = source.cast()?;
-    unsafe {
-        context.CopySubresourceRegion(
-            Some(&staging_res),
-            0,
-            0,
-            0,
-            0,
-            Some(&source_res),
-            0,
-            Some(&raw const region),
-        );
+    if halved {
+        unsafe { halver.halve(context, &source_res, &staging_res) }?;
+    } else {
+        let region = D3D11_BOX {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+            front: 0,
+            back: 1,
+        };
+        unsafe {
+            context.CopySubresourceRegion(
+                Some(&staging_res),
+                0,
+                0,
+                0,
+                0,
+                Some(&source_res),
+                0,
+                Some(&raw const region),
+            );
+        }
     }
 
     // GPU copy is queued — the duplication frame is no longer needed.
     let _ = unsafe { duplication.ReleaseFrame() };
 
-    Ok(Some(unsafe { read_staging(context, staging) }?))
+    let mut frame = unsafe { read_staging(context, staging) }?;
+    frame.halved = halved;
+    Ok(Some(frame))
 }
 
 /// Read the staging texture out into CPU memory (tightly packed BGRA):
-/// the frame just copied into it, or — for a pointer move — the same
-/// desktop once more.
+/// the frame just copied into it.
 unsafe fn read_staging(
     context: &ID3D11DeviceContext,
     staging: &(ID3D11Texture2D, u32, u32),
@@ -656,7 +886,8 @@ unsafe fn read_staging(
         width,
         height,
         at: Instant::now(),
-        pointer: None,
+        under: None,
+        halved: false,
     })
 }
 
@@ -768,6 +999,18 @@ fn open_duplication(
         let duplication = output1
             .DuplicateOutput(&dxgi_device)
             .map_err(|e| werr("DuplicateOutput", e))?;
+        // A rotated output (a portrait monitor) is duplicated in its
+        // panel's own orientation: shared sideways, and flipping to the
+        // right way every 2 s when the GDI probe stepped in. The
+        // screenshot backend reads it the way it is shown (review
+        // 2026-10, P2-10).
+        let rotation = duplication.GetDesc().Rotation;
+        if rotation != DXGI_MODE_ROTATION_IDENTITY && rotation != DXGI_MODE_ROTATION_UNSPECIFIED {
+            return Err(CaptureError::Capture(format!(
+                "the output is rotated ({}): screenshots instead",
+                rotation.0
+            )));
+        }
 
         Ok((device, context, duplication))
     }

@@ -2,24 +2,19 @@
 //!
 //! Applied to outgoing messages before sending and to incoming
 //! messages before display (so older clients that send raw shortcodes
-//! still render nicely). The catalog ([`crate::EMOJI`]) also feeds the
+//! still render nicely). The catalog (`emoji_table::EMOJI`) also feeds the
 //! picker palette. Ported verbatim from the FLTK `ui/emoji.rs`.
 
 use std::{collections::HashMap, sync::OnceLock};
 
-use crate::EMOJI;
+use crate::emoji_table::EMOJI;
 
 /// Longest shortcode length we will consider when scanning.
 const MAX_SHORTCODE_LEN: usize = 40;
 
 fn shortcode_map() -> &'static HashMap<&'static str, &'static str> {
     static MAP: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
-    MAP.get_or_init(|| {
-        EMOJI
-            .iter()
-            .map(|(name, emoji, _)| (*name, *emoji))
-            .collect()
-    })
+    MAP.get_or_init(|| EMOJI.iter().map(|(name, emoji)| (*name, *emoji)).collect())
 }
 
 /// Strip VARIATION SELECTOR-16 (U+FE0F) for display. Slint's Skia
@@ -29,14 +24,37 @@ fn shortcode_map() -> &'static HashMap<&'static str, &'static str> {
 /// the selector, but visible beats boxed. Remove when the upstream
 /// shaping handles VS16 sequences.
 #[must_use]
-pub fn strip_variation_selectors(input: &str) -> String {
+pub(crate) fn strip_variation_selectors(input: &str) -> String {
     if !input.contains('\u{fe0f}') {
         return input.to_string();
     }
     input.chars().filter(|c| *c != '\u{fe0f}').collect()
 }
 
-/// Replace `:shortcode:` occurrences with their emoji.
+/// [`replace_shortcodes`], then [`strip_variation_selectors`]: a message
+/// as it is shown. The send path stripped the selectors too, so they
+/// were gone from history for good, though only the display needs it
+/// gone (review 2026-10, P3-49).
+#[must_use]
+pub fn for_display(input: &str) -> String {
+    strip_variation_selectors(&replace_shortcodes(input))
+}
+
+/// The picker's emoji: `(shortcode, glyph as shown)`, each glyph once
+/// — five had two names and showed twice — and without the selector
+/// the display strips anyway.
+#[must_use]
+pub fn palette() -> Vec<(&'static str, String)> {
+    let mut seen = std::collections::HashSet::new();
+    EMOJI
+        .iter()
+        .filter(|(_, glyph)| seen.insert(*glyph))
+        .map(|(name, glyph)| (*name, strip_variation_selectors(glyph)))
+        .collect()
+}
+
+/// Replace `:shortcode:` occurrences with their emoji. Variation
+/// selectors are kept: what is sent and stored is what was typed.
 ///
 /// Unknown codes are left untouched (`:whatever:` stays as typed).
 /// Scanning resumes right after a failed opening colon so things like
@@ -45,7 +63,7 @@ pub fn strip_variation_selectors(input: &str) -> String {
 pub fn replace_shortcodes(input: &str) -> String {
     // Fast path: no colon, no work (the common case for chat traffic).
     if !input.contains(':') {
-        return strip_variation_selectors(input);
+        return input.to_string();
     }
 
     let map = shortcode_map();
@@ -82,12 +100,23 @@ pub fn replace_shortcodes(input: &str) -> String {
         }
     }
     out.push_str(rest);
-    strip_variation_selectors(&out)
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selectors_are_kept_on_the_way_out_and_stripped_for_display() {
+        let typed = "fly \u{2708}\u{fe0f} :heart:";
+        assert!(replace_shortcodes(typed).contains('\u{fe0f}'));
+        assert!(!for_display(typed).contains('\u{fe0f}'));
+        let palette = palette();
+        let thumbs = palette.iter().filter(|(_, g)| g == "\u{1f44d}").count();
+        assert_eq!(thumbs, 1, "one 👍 for two names");
+        assert!(palette.iter().all(|(_, g)| !g.contains('\u{fe0f}')));
+    }
 
     #[test]
     fn vs16_is_stripped_for_display() {
@@ -96,12 +125,13 @@ mod tests {
             "a\u{2708}b"
         );
         assert_eq!(strip_variation_selectors("plain"), "plain");
-        // both replace paths normalize
+        // The display path normalizes; the send path keeps what was
+        // typed (P3-49).
         assert_eq!(
-            replace_shortcodes("\u{26a0}\u{fe0f} watch out"),
+            for_display("\u{26a0}\u{fe0f} watch out"),
             "\u{26a0} watch out"
         );
-        assert_eq!(replace_shortcodes(":warning: here"), "\u{26a0} here");
+        assert_eq!(for_display(":warning: here"), "\u{26a0} here");
     }
 
     #[test]

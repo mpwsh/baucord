@@ -58,8 +58,7 @@ use wasapi::{
     WaveFormat,
 };
 
-use super::input::SystemAudioBackend;
-use crate::{latch::Ring, stats::AudioStats};
+use crate::latch::Ring;
 
 /// Capture format: 48 kHz stereo f32 — exactly what the Opus encode
 /// worker wants, so `needs_resample` is false and rubato never runs.
@@ -93,45 +92,45 @@ const MAX_CONSECUTIVE_ERRORS: u32 = 50;
 /// One-shot setup report from the pump thread back to `start()`.
 type SetupReport = Result<(), String>;
 
-/// System audio backend that excludes our own process tree at capture
-/// time. Preferred over [`super::input`]'s endpoint loopback whenever the
-/// OS supports it.
+/// System audio capture that excludes our own process tree at capture
+/// time: the one backend [`super::input::SystemAudioCapture`] has (a
+/// trait for more than one is gone with the endpoint loopback, review
+/// 2026-10 P3-28).
 pub(crate) struct ProcessLoopback {
     /// Pump thread — owns COM and every WASAPI object for its lifetime.
     pump: Option<thread::JoinHandle<()>>,
     /// Signal to stop the pump thread.
     should_stop: Arc<AtomicBool>,
-    /// The pump left its loop without being told to
-    /// ([`SystemAudioBackend::failed`]).
+    /// The pump left its loop without being told to ([`Self::failed`]).
     failed: Arc<AtomicBool>,
     /// Ring producer, held until `start()` hands it to the pump thread.
     ring_producer: Option<Producer<f32>>,
     /// Wake latch to the encode worker — pinged after pushing samples so
     /// the worker can block instead of polling an empty ring.
     wake_tx: Option<Ring>,
-    /// Stats (shared with voice chat engine for unified reporting).
-    stats: Arc<AudioStats>,
 }
 
 impl ProcessLoopback {
+    /// The sample rate of what it captures (the encoder's own).
+    pub(crate) const SAMPLE_RATE: u32 = CAPTURE_SAMPLE_RATE;
+
     /// Create the backend. Infallible — all fallible work (COM, WASAPI
-    /// activation) happens in [`SystemAudioBackend::start`] so the caller
-    /// can fall back to another backend when this build of Windows lacks
-    /// process loopback.
-    pub(crate) fn new(ring_producer: Producer<f32>, wake_tx: Ring, stats: Arc<AudioStats>) -> Self {
+    /// activation) happens in [`Self::start`], whose failure means this
+    /// build of Windows lacks process loopback.
+    pub(crate) fn new(ring_producer: Producer<f32>, wake_tx: Ring) -> Self {
         Self {
             pump: None,
             should_stop: Arc::new(AtomicBool::new(false)),
             failed: Arc::new(AtomicBool::new(false)),
             ring_producer: Some(ring_producer),
             wake_tx: Some(wake_tx),
-            stats,
         }
     }
 }
 
-impl SystemAudioBackend for ProcessLoopback {
-    fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+impl ProcessLoopback {
+    /// Start capturing: the pump thread pushes into the ring.
+    pub(crate) fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.pump.is_some() {
             return Ok(());
         }
@@ -144,7 +143,6 @@ impl SystemAudioBackend for ProcessLoopback {
 
         let should_stop = self.should_stop.clone();
         let failed = self.failed.clone();
-        let stats = self.stats.clone();
 
         // One-shot handshake: the pump reports setup success or failure
         // exactly once, so activation errors surface synchronously here.
@@ -154,7 +152,7 @@ impl SystemAudioBackend for ProcessLoopback {
         let pump = thread::Builder::new()
             .name("sysaudio-procloop".into())
             .spawn(move || {
-                pump_thread(ring_producer, &wake_tx, &stats, &should_stop, &setup_tx);
+                pump_thread(ring_producer, &wake_tx, &should_stop, &setup_tx);
                 // Out of its loop and nobody asked: it gave up.
                 if !should_stop.load(Ordering::Relaxed) {
                     failed.store(true, Ordering::Relaxed);
@@ -179,7 +177,8 @@ impl SystemAudioBackend for ProcessLoopback {
         }
     }
 
-    fn stop(&mut self) {
+    /// Stop capturing and release every WASAPI object.
+    pub(crate) fn stop(&mut self) {
         self.should_stop.store(true, Ordering::Release);
         if let Some(pump) = self.pump.take() {
             // The pump notices the flag within one event wait (bounded
@@ -188,15 +187,9 @@ impl SystemAudioBackend for ProcessLoopback {
         }
     }
 
-    fn sample_rate(&self) -> u32 {
-        CAPTURE_SAMPLE_RATE
-    }
-
-    fn device_name(&self) -> String {
-        "System mix (own process excluded)".into()
-    }
-
-    fn failed(&self) -> bool {
+    /// The capture stopped by itself (its device went, the audio engine
+    /// kept failing) and will deliver nothing more.
+    pub(crate) fn failed(&self) -> bool {
         self.failed.load(Ordering::Relaxed)
     }
 }
@@ -214,7 +207,6 @@ impl Drop for ProcessLoopback {
 fn pump_thread(
     ring_producer: Producer<f32>,
     wake_tx: &Ring,
-    stats: &AudioStats,
     should_stop: &AtomicBool,
     setup_tx: &Sender<SetupReport>,
 ) {
@@ -230,7 +222,7 @@ fn pump_thread(
             // Audio-class scheduling (MMCSS "Pro Audio"), same as the
             // encode worker.
             let _rt = crate::platform::promote_current_thread(960, crate::OPUS_SAMPLE_RATE);
-            run_pump(&capture, &event, ring_producer, wake_tx, stats, should_stop);
+            run_pump(&capture, &event, ring_producer, wake_tx, should_stop);
             if let Err(e) = client.stop_stream() {
                 debug!("System audio process loopback: stop_stream failed: {e}");
             }
@@ -303,13 +295,15 @@ fn run_pump(
     event: &Handle,
     mut ring_producer: Producer<f32>,
     wake_tx: &Ring,
-    stats: &AudioStats,
     should_stop: &AtomicBool,
 ) {
     // Scratch for one engine packet; grows to the largest packet seen
     // (~10 ms ≈ 3.9 KiB at 48 kHz stereo f32) and is reused thereafter.
     let mut packet_buf: Vec<u8> = Vec::new();
     let mut consecutive_errors: u32 = 0;
+    // Packets that found the ring full, said when the pump stops (an
+    // `AudioStats` counter nobody read, before).
+    let mut overruns: u64 = 0;
 
     info!("System audio process-loopback pump started (48 kHz stereo f32)");
 
@@ -360,8 +354,9 @@ fn run_pump(
                         continue;
                     }
                     let got_bytes = got as usize * BYTES_PER_FRAME;
-                    let pushed =
-                        push_interleaved(&mut ring_producer, &packet_buf[..got_bytes], stats);
+                    let (pushed, full) =
+                        push_interleaved(&mut ring_producer, &packet_buf[..got_bytes]);
+                    overruns += u64::from(full);
                     if pushed > 0 {
                         // Wake the encode worker (a latch: rings it has
                         // not seen yet are one).
@@ -385,28 +380,35 @@ fn run_pump(
         }
     }
 
-    info!("System audio process-loopback pump stopped");
+    if overruns > 0 {
+        info!(
+            "System audio process-loopback pump stopped ({overruns} packet(s) found the ring full)"
+        );
+    } else {
+        info!("System audio process-loopback pump stopped");
+    }
 }
 
-/// Push one packet of interleaved stereo f32 into the ring, returning
-/// how many samples were pushed.
+/// Push one packet of interleaved stereo f32 into the ring: how many
+/// samples went in, and whether the ring was too full for all of them.
 ///
 /// The engine already delivers the exact layout the ring contract wants
-/// (L R L R … f32 at 48 kHz), so this is a straight byte→f32 copy.
+/// (L R L R … f32 at 48 kHz), so this is a straight byte→f32 copy, in
+/// one chunk rather than a push per sample.
 /// SILENT-flagged buffers never reach here — the pump drops them.
-fn push_interleaved(ring_producer: &mut Producer<f32>, bytes: &[u8], stats: &AudioStats) -> usize {
+fn push_interleaved(ring_producer: &mut Producer<f32>, bytes: &[u8]) -> (usize, bool) {
     let total = bytes.len() / BYTES_PER_SAMPLE;
     // Never split a stereo pair across a full-ring drop: an odd push
     // count would permanently swap L/R for everything that follows.
     let available = ring_producer.slots() & !1_usize;
     let n = total.min(available);
-    if n < total {
-        stats.input_overruns.fetch_add(1, Ordering::Relaxed);
-    }
-    for sample in bytes.chunks_exact(BYTES_PER_SAMPLE).take(n) {
-        let value = f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
-        // Cannot fail: n ≤ free slots and this thread is the sole producer.
-        let _ = ring_producer.push(value);
-    }
-    n
+    // Cannot fail: n ≤ free slots and this thread is the sole producer.
+    let pushed = ring_producer.write_chunk_uninit(n).map_or(0, |chunk| {
+        chunk.fill_from_iter(
+            bytes
+                .chunks_exact(BYTES_PER_SAMPLE)
+                .map(|s| f32::from_le_bytes([s[0], s[1], s[2], s[3]])),
+        )
+    });
+    (pushed, n < total)
 }

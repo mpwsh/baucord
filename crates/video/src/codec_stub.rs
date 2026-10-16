@@ -22,6 +22,10 @@ impl FfmpegEncoder {
         Err(CodecError::EncoderInit(UNSUPPORTED.into()))
     }
 
+    pub fn new_without(_quality: Quality, _skip: &[&str]) -> Result<Self, CodecError> {
+        Err(CodecError::EncoderInit(UNSUPPORTED.into()))
+    }
+
     pub fn encoder_name(&self) -> &'static str {
         unreachable!("stub FfmpegEncoder cannot be constructed")
     }

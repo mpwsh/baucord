@@ -33,7 +33,7 @@ impl AppState {
                 return;
             }
         }
-        self.settings.save();
+        self.save_settings();
         crate::settingsui::refresh_servers(self);
 
         let Some(client_key) = self.client_key.clone() else {
@@ -102,9 +102,7 @@ impl AppState {
                 self.push_command_output(&line);
             }
             "leave" => self.handle_disconnect(),
-            "quit" | "exit" if super::HOST_CAN_QUIT => {
-                let _ = slint::quit_event_loop();
-            }
+            "quit" | "exit" if super::HOST_CAN_QUIT => self.leave_app(super::Leaving::Quit),
             "quit" | "exit" => self.push_command_output(&t!("quit-ios")),
             "users" => self.send_admin(AdminCommand::ListUsers, PendingAdmin::Show),
             "restrictions" | "bans" => {
@@ -249,10 +247,8 @@ impl AppState {
                 // Their current roles, known while they are online.
                 let mut roles: Vec<client::RoleId> = match &target {
                     AdminTarget::User(user_id) => self
-                        .session
-                        .details
-                        .values()
-                        .find(|(u, _)| u == user_id)
+                        .session_of(user_id)
+                        .and_then(|c| self.session.details.get(&c))
                         .map(|(_, r)| r.clone())
                         .unwrap_or_default(),
                     _ => Vec::new(),
@@ -365,11 +361,8 @@ impl AppState {
                         let owner = facts
                             .and_then(|f| f.owner)
                             .and_then(|o| {
-                                self.session
-                                    .details
-                                    .iter()
-                                    .find(|(_, (u, _))| *u == o)
-                                    .and_then(|(client_id, _)| self.session.users.get(client_id))
+                                self.session_of(&o)
+                                    .and_then(|client_id| self.session.users.get(&client_id))
                                     .map(|u| u.username.clone())
                             })
                             .unwrap_or_else(|| t!("channel-owner-server"));
@@ -471,7 +464,7 @@ impl AppState {
             && let Some(server) = self.settings.default_server_mut()
         {
             server.channel_passwords.insert(spec.name.clone(), password);
-            self.settings.save();
+            self.save_settings();
         }
         self.network
             .tx
@@ -504,7 +497,7 @@ impl AppState {
                     server.channel_passwords.remove(&spec.name);
                 }
             }
-            self.settings.save();
+            self.save_settings();
         }
         self.network
             .tx
@@ -917,7 +910,7 @@ impl AppState {
                         r.id,
                         format_wall_stamp(r.ts),
                         r.target_name,
-                        report_reason_text(r.reason)
+                        reason_label(r.reason)
                     );
                     if !r.excerpt.is_empty() {
                         let short: String = r.excerpt.chars().take(120).collect();
@@ -1011,11 +1004,11 @@ impl AppState {
         s.set_invite_dialog_error("".into());
         self.network
             .tx
-            .send(NetworkControl::CreateInvite {
+            .send(NetworkControl::Send(ClientMessage::CreateInvite {
                 grants_role,
                 expires_secs,
                 max_uses,
-            })
+            }))
             .ok();
     }
 
@@ -1051,11 +1044,11 @@ impl AppState {
         }
         self.network
             .tx
-            .send(NetworkControl::CreateInvite {
+            .send(NetworkControl::Send(ClientMessage::CreateInvite {
                 grants_role,
                 expires_secs,
                 max_uses,
-            })
+            }))
             .ok();
     }
 }

@@ -15,21 +15,27 @@
 //! Lives outside `AppState`: Slint calls the pane's callback while it
 //! lays out or draws, which may be inside a call on the app.
 
-use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::mpsc};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    sync::{mpsc, Arc},
+};
 
 use log::warn;
 
-/// Decoded previews kept for rows that are not on screen any more, in
-/// bytes of RGBA. Scrolling back over the last few screens of pictures
-/// finds them ready; past that they are decoded again. The rows on
-/// screen hold their own previews whatever this says.
-pub const PREVIEW_BUDGET: usize = 16 * 1024 * 1024;
+/// Decoded previews kept, in bytes of RGBA — those of the rows on
+/// screen count toward it too, so a screenful of large pictures leaves
+/// less room for the ones scrolled past. Scrolling back over the last
+/// few screens of pictures finds them ready; past that they are decoded
+/// again. A row on screen whose preview is trimmed keeps drawing it
+/// (its binding holds the image) until it asks again.
+pub(crate) const PREVIEW_BUDGET: usize = 16 * 1024 * 1024;
 
 /// One image row's picture.
 struct Picture {
     /// The wire bytes, as received: what the gallery, Save, Copy and a
-    /// GIF's playback read.
-    bytes: Rc<Vec<u8>>,
+    /// GIF's playback read — and the decoder, without a copy.
+    bytes: Arc<[u8]>,
     is_gif: bool,
     /// A decode is queued or running.
     decoding: bool,
@@ -58,16 +64,22 @@ struct Store {
 
 struct Job {
     row_id: i32,
-    bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
     max_edge: u32,
 }
+
+/// The most decodes waiting at once. Each is a row the pane asked for;
+/// a fling past dozens of pictures asks for all of them, and only the
+/// last few are still on screen when the decoder gets to them. The
+/// rest are let go, and a row still built asks again.
+const QUEUE_MAX: usize = 12;
 
 thread_local! {
     static STORE: RefCell<Store> = RefCell::new(Store::default());
 }
 
 /// Keep `bytes` as the picture of row `row_id`.
-pub fn insert(row_id: i32, bytes: Rc<Vec<u8>>, is_gif: bool) {
+pub fn insert(row_id: i32, bytes: Arc<[u8]>, is_gif: bool) {
     STORE.with_borrow_mut(|s| {
         s.drop_preview(row_id);
         s.pictures.insert(
@@ -102,11 +114,11 @@ pub fn clear() {
 
 /// Row `row_id`'s wire bytes, and whether they are an animated GIF.
 #[must_use]
-pub fn bytes(row_id: i32) -> Option<(Rc<Vec<u8>>, bool)> {
+pub fn bytes(row_id: i32) -> Option<(Arc<[u8]>, bool)> {
     STORE.with_borrow(|s| {
         s.pictures
             .get(&row_id)
-            .map(|p| (Rc::clone(&p.bytes), p.is_gif))
+            .map(|p| (Arc::clone(&p.bytes), p.is_gif))
     })
 }
 
@@ -138,7 +150,7 @@ pub fn preview(row_id: i32) -> slint::Image {
         picture.decoding = true;
         let job = Job {
             row_id,
-            bytes: picture.bytes.as_ref().clone(),
+            bytes: Arc::clone(&picture.bytes),
             max_edge,
         };
         (None, Some(job))
@@ -170,9 +182,11 @@ fn send(job: Job) {
 }
 
 /// The decoder: one thread for every picture, the newest request
-/// first (it is the one on screen when someone scrolls fast). Each
-/// result goes back to the UI thread, which wraps the pixels in an
-/// image (`slint::Image` stays on the thread that draws it).
+/// first (it is the one on screen when someone scrolls fast), at most
+/// [`QUEUE_MAX`] waiting — the older ones are answered "skipped", and a
+/// row still on screen asks again (review 2026-10, P1-4). Each result
+/// goes back to the UI thread, which wraps the pixels in an image
+/// (`slint::Image` stays on the thread that draws it).
 fn start_decoder() -> Option<mpsc::Sender<Job>> {
     let (tx, rx) = mpsc::channel::<Job>();
     let spawned = std::thread::Builder::new()
@@ -187,6 +201,22 @@ fn start_decoder() -> Option<mpsc::Sender<Job>> {
                     }
                 }
                 queue.extend(rx.try_iter());
+                if queue.len() > QUEUE_MAX {
+                    let skipped: Vec<i32> = queue
+                        .drain(..queue.len() - QUEUE_MAX)
+                        .map(|job| job.row_id)
+                        .collect();
+                    let posted = slint::invoke_from_event_loop(move || {
+                        for row_id in skipped {
+                            if self::skipped(row_id) {
+                                crate::app::with_current(|app| app.picture_ready(row_id));
+                            }
+                        }
+                    });
+                    if posted.is_err() {
+                        return;
+                    }
+                }
                 let Some(job) = queue.pop() else { continue };
                 let pixels = ui::convert::decode_preview_pixels(&job.bytes, job.max_edge)
                     .map(|(pixels, _, _)| pixels)
@@ -210,6 +240,17 @@ fn start_decoder() -> Option<mpsc::Sender<Job>> {
             None
         }
     }
+}
+
+/// A decode was let go before it ran (UI thread): the row may ask
+/// again. True when the row is still there, so the pane can be told.
+fn skipped(row_id: i32) -> bool {
+    STORE.with_borrow_mut(|s| {
+        s.pictures.get_mut(&row_id).is_some_and(|p| {
+            p.decoding = false;
+            true
+        })
+    })
 }
 
 /// A decode came back (UI thread). True when the row is still there
@@ -288,8 +329,8 @@ pub fn stats() -> (usize, usize, usize, usize) {
 mod tests {
     use super::*;
 
-    fn bytes() -> Rc<Vec<u8>> {
-        Rc::new(vec![0; 16])
+    fn bytes() -> Arc<[u8]> {
+        vec![0; 16].into()
     }
 
     fn pixels(w: u32, h: u32) -> slint::SharedPixelBuffer<slint::Rgba8Pixel> {

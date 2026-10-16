@@ -78,7 +78,7 @@ impl AppState {
         self.voice
             .tx
             .send(VoiceControl::Start {
-                settings: Box::new(self.settings.clone()),
+                config: Box::new(self.engine_config()),
                 our_client_id: Some(client_id),
                 in_room: self.voice_in_room,
             })
@@ -147,7 +147,7 @@ impl AppState {
         };
         let (saved, moved) = self.settings.claim_peer_audio(user_id, &name);
         if moved {
-            self.settings.save();
+            self.save_settings();
         }
         let Some(saved) = saved else {
             return;
@@ -205,7 +205,19 @@ impl AppState {
     }
 
     pub(super) fn handle_user_left(&mut self, client_id: u64, username: &str) {
-        self.session.details.remove(&client_id);
+        if let Some((user, _)) = self.session.details.remove(&client_id)
+            && self.session.account_sessions.get(&user) == Some(&client_id)
+        {
+            // Online elsewhere still? That session stands for them.
+            match self.session.details.iter().find(|(_, (u, _))| *u == user) {
+                Some((other, _)) => {
+                    self.session.account_sessions.insert(user, *other);
+                }
+                None => {
+                    self.session.account_sessions.remove(&user);
+                }
+            }
+        }
         self.session.telemetry_notes.remove(&client_id);
         self.session.profiles.remove(&client_id);
         self.rebuild_dms_model();
@@ -247,7 +259,7 @@ impl AppState {
 
     /// In the lobby or the AFK room: connected where the relay drops
     /// voice.
-    fn out_of_voice(&self) -> bool {
+    pub(super) fn out_of_voice(&self) -> bool {
         let afk = self.our_channel().is_some_and(|id| {
             self.session
                 .channel_details
@@ -486,7 +498,7 @@ impl AppState {
         let height = height.clamp(100.0, 480.0).round() as u16;
         if height != self.settings.ui.messages_height {
             self.settings.ui.messages_height = height;
-            self.settings.save();
+            self.save_settings();
         }
     }
 
@@ -496,7 +508,7 @@ impl AppState {
         let width = width.clamp(220.0, 480.0).round() as u16;
         if width != self.settings.ui.sidebar_width {
             self.settings.ui.sidebar_width = width;
-            self.settings.save();
+            self.save_settings();
         }
     }
 
@@ -504,7 +516,7 @@ impl AppState {
     /// and remember which.
     pub(super) fn toggle_messages(&mut self) {
         self.settings.ui.messages_collapsed = !self.settings.ui.messages_collapsed;
-        self.settings.save();
+        self.save_settings();
         self.push_ui_prefs();
     }
 

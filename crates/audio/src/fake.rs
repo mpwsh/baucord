@@ -412,8 +412,8 @@ pub(crate) fn default_output_name() -> Option<Option<String>> {
     with(|w| w.default_output.clone())
 }
 
-/// A clock for `service_at`: each step is past the restart backoff and
-/// the device poll.
+/// A clock for `service_at`: each step is past the longest retry wait
+/// (`RETRY_MAX`) and the device poll.
 pub(crate) struct Clock(Instant);
 
 impl Clock {
@@ -421,9 +421,14 @@ impl Clock {
         Self(Instant::now())
     }
 
-    /// The next supervision tick, three seconds on.
+    /// The next supervision tick, a minute and a second on.
     pub(crate) fn tick(&mut self) -> Instant {
-        self.0 += Duration::from_secs(3);
+        self.step(Duration::from_secs(61))
+    }
+
+    /// The clock `by` later.
+    pub(crate) fn step(&mut self, by: Duration) -> Instant {
+        self.0 += by;
         self.0
     }
 }

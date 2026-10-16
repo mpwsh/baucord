@@ -260,9 +260,11 @@ for running one is on the website:
 it: how the image and the published files come to be.
 
 The compose file runs the published image `mpwsh/baucord:latest`,
-which `docker.yaml` builds from the `Dockerfile` and pushes on every
-release (amd64 only; also tagged with the version and the commit; a
-pre-release does not move `latest`). If a release's image build fails,
+which `docker.yaml` builds from the `Dockerfile`, starts once, and
+pushes on every release (amd64 only; also tagged with the version and
+the commit; only the newest stable release moves `latest` — a
+pre-release, a backport or a rebuilt older tag does not). If a
+release's image build fails,
 *Run workflow* on the `docker` workflow with the release's tag rebuilds
 and pushes it. For another
 architecture or unreleased code, replace `image:` with `build: .`.

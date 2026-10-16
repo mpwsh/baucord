@@ -63,21 +63,12 @@ pub fn compute_rms(samples: &[f32]) -> f32 {
 /// frame before calling the chain, and reads result fields after.
 ///
 /// Stack-allocated, cheap to create per frame.
-// The flags are independent per-frame switches read by different
-// stages; a state enum would have to enumerate their product.
-#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct FrameContext {
     // ── Pipeline config (set by worker before chain runs) ───────────
-    /// Whether noise suppression is enabled this frame.
-    pub denoise_enabled: bool,
-
-    /// Whether the compressor is enabled this frame.
-    pub compressor_enabled: bool,
-
-    /// Whether AGC is enabled this frame.
-    pub agc_enabled: bool,
-
+    // Noise suppression, AGC and the compressor were switches here that
+    // nothing ever turned off, with a bypass branch each (review
+    // 2026-10, P2-50): they always run.
     /// Input gain multiplier (read from user setting).
     pub input_gain: f32,
 
@@ -114,9 +105,6 @@ pub struct FrameContext {
 impl Default for FrameContext {
     fn default() -> Self {
         Self {
-            denoise_enabled: true,
-            compressor_enabled: true,
-            agc_enabled: true,
             input_gain: 1.0,
             gate_open: true,
             gate_holding: false,
@@ -136,9 +124,7 @@ impl Default for FrameContext {
 /// the shared [`FrameContext`] to coordinate with other processors in
 /// the chain.
 ///
-/// Processors that support runtime bypass should check the relevant
-/// `FrameContext` field (e.g., `ctx.denoise_enabled`) and early-return
-/// inside `process` — the chain always runs every stage.
+/// The chain always runs every stage.
 pub trait AudioProcessor: Send {
     /// Process one frame of audio in-place.
     ///

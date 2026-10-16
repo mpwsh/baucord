@@ -3,7 +3,10 @@
 # (rustup fetches the pinned version) instead of silently building
 # with whatever the tag says.
 ARG RUST_VERSION=1.95
-FROM lukemathwalker/cargo-chef:latest-rust-${RUST_VERSION} AS chef
+# Debian 12 (bookworm), like the runtime image below: the untagged
+# variant moved to Debian 13, whose glibc 2.41 the runtime's 2.36
+# cannot run (review 2026-10, P2-28).
+FROM lukemathwalker/cargo-chef:latest-rust-${RUST_VERSION}-bookworm AS chef
 WORKDIR /app
 
 # ── Plan: dependency recipe from the manifests only ─────────────────────
@@ -36,7 +39,8 @@ RUN cargo build --profile deploy --locked --package server --bin server
 # ── Runtime ─────────────────────────────────────────────────────────────
 # Distroless: glibc + CA certs, no shell, no package manager. The server
 # is pure Rust (rustls, no OpenSSL) so `cc` is all it needs. The builder
-# is Debian bookworm (glibc 2.36) and so is this base — no glibc drift.
+# is Debian bookworm (glibc 2.36) and so is this base — no glibc drift;
+# docker.yaml starts the image once before it pushes it.
 # uid 10000 matches setup.sh's chown of ./data/baucord.
 FROM gcr.io/distroless/cc-debian12
 # /app is owned by the runtime uid (no shell here, so ownership comes

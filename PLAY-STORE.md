@@ -296,6 +296,16 @@ Types must match what the service does.
 | connected, in the lobby | the same types, no audio open | `specialUse`, no wake lock |
 | disconnected | none | none |
 
+In the lobby nothing holds the CPU: with the screen off the phone
+sleeps through its own 5 s keep-alive, and what keeps the session open
+is the server's PING every 20 s, which wakes it (ANDROID-SPEC.md D74;
+servers after 1.2.1). A 1.2.1 server sends a quiet session nothing, so
+against one the session ends after 30 s with the screen off and the
+phone reconnects when it wakes — a DM meanwhile is not notified. The
+special use's text ("keeps the connection … open while they wait in
+its lobby") holds against an updated server: record the lobby video
+against one, with the screen off for a few minutes before the DM.
+
 **The Console's declaration for 1.2** (App content → Foreground
 service permissions): untick *Media playback*; keep *Microphone*
 (what it does: "Keeps the microphone working when the user leaves the

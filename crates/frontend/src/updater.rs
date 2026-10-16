@@ -198,36 +198,44 @@ fn download_zip(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok());
 
-    let mut file = std::fs::File::create(&dest)
-        .map_err(|e| format!("Failed to create {}: {e}", dest.display()))?;
+    // Written as `.part` and renamed when whole: a download that fails
+    // or is cancelled leaves nothing behind, and a zip under the real
+    // name is always a whole one (review 2026-10, P3-11).
+    let part = dest.with_extension("zip.part");
+    let mut file = std::fs::File::create(&part)
+        .map_err(|e| format!("Failed to create {}: {e}", part.display()))?;
 
     let mut reader = resp.body_mut().as_reader();
     let mut buf = [0u8; 16384];
     let mut downloaded: u64 = 0;
 
-    loop {
+    let copied = loop {
         if cancelled.load(Ordering::Relaxed) {
-            drop(file);
-            let _ = std::fs::remove_file(&dest);
-            return Err("Download cancelled".into());
+            break Err("Download cancelled".to_string());
         }
-
-        let n =
-            std::io::Read::read(&mut reader, &mut buf).map_err(|e| format!("Read error: {e}"))?;
-
+        let n = match std::io::Read::read(&mut reader, &mut buf) {
+            Ok(n) => n,
+            Err(e) => break Err(format!("Read error: {e}")),
+        };
         if n == 0 {
-            break;
+            break Ok(());
         }
-
-        std::io::Write::write_all(&mut file, &buf[..n]).map_err(|e| format!("Write error: {e}"))?;
-
+        if let Err(e) = std::io::Write::write_all(&mut file, &buf[..n]) {
+            break Err(format!("Write error: {e}"));
+        }
         downloaded += n as u64;
-
         if let Some(total) = content_length {
             #[allow(clippy::cast_precision_loss)]
             let frac = (downloaded as f32 / total as f32).clamp(0.0, 1.0);
             progress.store(frac.to_bits(), Ordering::Relaxed);
         }
+    };
+    drop(file);
+    if let Err(e) = copied.and_then(|()| {
+        std::fs::rename(&part, &dest).map_err(|e| format!("Failed to keep the download: {e}"))
+    }) {
+        let _ = std::fs::remove_file(&part);
+        return Err(e);
     }
 
     progress.store(1.0f32.to_bits(), Ordering::Relaxed);
@@ -240,8 +248,9 @@ fn download_zip(
 
 /// Extract the downloaded zip, replace both executables, and relaunch.
 ///
-/// Runs synchronously on the UI thread — it's fast (local file I/O)
-/// and ends in `process::exit`.
+/// Runs on a thread of its own (`AppState::finish_leaving`): extracting
+/// the zip took the window with it for seconds (review 2026-10, P3-11).
+/// Ends in `process::exit`; returns only on an error.
 ///
 /// Steps:
 /// 1. Extract root-level zip entries to a staging dir next to the exe.

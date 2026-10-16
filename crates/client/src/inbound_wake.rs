@@ -27,8 +27,12 @@ use crossbeam_channel::{Receiver, Sender};
 use transport::UdpIo;
 
 /// How long the watcher sleeps in `poll` before checking whether its
-/// session ended (it also ends when the loop drops the re-arm side).
-const WATCH_SLICE: std::time::Duration = std::time::Duration::from_millis(500);
+/// session ended: a backstop only. The end of a session wakes it with a
+/// datagram of its own ([`InboundWake`]'s drop), and it also ends when
+/// the loop drops the re-arm side. It was 500 ms: two wakes a second
+/// for the whole session, only to look at the stop flag (review
+/// 2026-10, P2-40).
+const WATCH_SLICE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Returns from the watchers' waits since the process started: their
 /// share of the thread wakes a quiet session costs.
@@ -46,6 +50,9 @@ pub(crate) struct InboundWake {
     stop: Arc<AtomicBool>,
     /// A ring was taken; the watcher waits for the re-arm.
     owed: bool,
+    /// The watched socket, as a datagram from this machine reaches it:
+    /// how the drop wakes the watcher at once.
+    wake_addr: Option<std::net::SocketAddr>,
 }
 
 impl InboundWake {
@@ -71,6 +78,11 @@ impl InboundWake {
                 }
                 let waited = waiter.wait(WATCH_SLICE);
                 WATCH_WAKES.fetch_add(1, Ordering::Relaxed);
+                // Woken to leave (the drop's datagram), or past the
+                // backstop after the session ended.
+                if stop_watch.load(Ordering::Relaxed) {
+                    return;
+                }
                 match waited {
                     Ok(true) => {}
                     Ok(false) => continue,
@@ -89,11 +101,22 @@ impl InboundWake {
             log::warn!("inbound wake thread refused ({e}); polling the socket instead");
             return None;
         }
+        let wake_addr = udp.local_addr().ok().map(|mut addr| {
+            if addr.ip().is_unspecified() {
+                addr.set_ip(if addr.is_ipv4() {
+                    std::net::Ipv4Addr::LOCALHOST.into()
+                } else {
+                    std::net::Ipv6Addr::LOCALHOST.into()
+                });
+            }
+            addr
+        });
         Some(Self {
             ready_rx,
             rearm_tx,
             stop,
             owed: false,
+            wake_addr,
         })
     }
 
@@ -117,9 +140,22 @@ impl InboundWake {
 
 impl Drop for InboundWake {
     fn drop(&mut self) {
-        // The watcher leaves at its next look (≤ WATCH_SLICE), or at
-        // once if it is waiting for a re-arm that will never come.
+        // The watcher leaves at once: woken by a datagram to its socket
+        // (a byte the transport throws away as no QUIC packet), or by
+        // the re-arm channel closing if it waits for one. Should the
+        // datagram not get through, it leaves at its next look
+        // (≤ WATCH_SLICE).
         self.stop.store(true, Ordering::Relaxed);
+        if let Some(addr) = self.wake_addr {
+            let local: std::net::SocketAddr = if addr.is_ipv4() {
+                (std::net::Ipv4Addr::LOCALHOST, 0).into()
+            } else {
+                (std::net::Ipv6Addr::LOCALHOST, 0).into()
+            };
+            if let Ok(socket) = std::net::UdpSocket::bind(local) {
+                let _ = socket.send_to(&[0], addr);
+            }
+        }
     }
 }
 

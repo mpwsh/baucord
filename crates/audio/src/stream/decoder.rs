@@ -46,8 +46,13 @@ const STREAM_FRAME_SIZE: usize = 960;
 /// Number of channels.
 const STREAM_CHANNELS: usize = 2;
 
-/// Interleaved decode buffer size: 960 samples/ch × 2 channels.
-const DECODE_BUF_SIZE: usize = STREAM_FRAME_SIZE * STREAM_CHANNELS;
+/// Samples per channel in Opus' longest frame (120 ms at 48 kHz).
+const MAX_FRAME_SIZE: usize = 5_760;
+
+/// Interleaved decode buffer size: room for Opus' longest frame. It held
+/// exactly 20 ms, which is what we send; a longer frame, which the wire
+/// allows, failed to decode and was concealed (review 2026-10, P3-29).
+const DECODE_BUF_SIZE: usize = MAX_FRAME_SIZE * STREAM_CHANNELS;
 
 /// How long after the voice output stopped mixing a stream stays on the
 /// mix: a voice output reopening (a reroute, a re-plan) stops for a few
@@ -358,6 +363,19 @@ impl Sink {
         }
     }
 
+    /// Muted: let go of the own output (its device callback runs for
+    /// nothing) and the mix source; [`Self::play`] brings back
+    /// whichever is wanted.
+    fn rest(&mut self) {
+        // Only one is ever held; both are let go either way.
+        let held = self.own.take().is_some() | self.mix.take().is_some();
+        if held {
+            debug!("Stream audio muted: output released");
+        }
+        self.downmix.reset();
+        self.counters.queued_ms.store(0, Ordering::Relaxed);
+    }
+
     fn open_own(&self) -> Result<StreamAudioOutput, Box<dyn std::error::Error>> {
         let open = |device: Option<&str>| -> Result<_, Box<dyn std::error::Error>> {
             let mut output = StreamAudioOutput::with_controls(
@@ -426,6 +444,8 @@ struct StreamDecoderWorker {
 
     last_seq: Option<u32>,
     frame_buffer: Vec<f32>,
+    /// The stream is muted, and nothing of it is decoded or played.
+    resting: bool,
 }
 
 impl StreamDecoderWorker {
@@ -455,6 +475,23 @@ impl StreamDecoderWorker {
         let curr = packet.seq;
         let counters = Arc::clone(&self.sink.counters);
         counters.received.fetch_add(1, Ordering::Relaxed);
+
+        // Muted: counted, and nothing more. It was decoded, downmixed
+        // and played as zeros, its output open all along (review
+        // 2026-10, P3-27). Unmuted, the decoder starts over from the
+        // packet in hand and the output opens again.
+        if self.sink.is_muted.load(Ordering::Relaxed) {
+            if !self.resting {
+                self.resting = true;
+                self.sink.rest();
+            }
+            self.last_seq = Some(curr);
+            return;
+        }
+        if self.resting {
+            self.resting = false;
+            self.reset_decoder();
+        }
 
         // ── Sequence gap detection & PLC recovery ───────────────────
         match self
@@ -537,10 +574,30 @@ pub struct StreamDecoder {
     counters: Arc<Counters>,
 }
 
+/// Where a stream's packets go, from any thread: the network thread
+/// hands them to the decoder itself instead of through the screen
+/// thread, a wake of that thread per 20 ms packet (review 2026-10,
+/// P2-45). Holding one does not keep the decoder running.
+#[derive(Clone)]
+pub struct StreamAudioSender(Sender<StreamAudioPacket>);
+
+impl StreamAudioSender {
+    /// Queue `packet` for the decoder; dropped when 16 already wait.
+    pub fn send(&self, packet: StreamAudioPacket) {
+        let _ = self.0.try_send(packet);
+    }
+}
+
 impl StreamDecoder {
     /// Send a raw Opus-encoded packet for decoding and playback.
     pub fn send(&self, packet: StreamAudioPacket) {
         let _ = self.packet_tx.try_send(packet);
+    }
+
+    /// A sender for another thread (see [`StreamAudioSender`]).
+    #[must_use]
+    pub fn sender(&self) -> StreamAudioSender {
+        StreamAudioSender(self.packet_tx.clone())
     }
 
     /// Set playback volume (0.0–2.0).
@@ -573,7 +630,13 @@ impl Drop for StreamDecoder {
         self.should_stop.store(true, Ordering::Relaxed);
         // Replacing the sender closes the channel, which ends the
         // thread's `recv`; the thread drops the sink (its own output,
-        // its source on the mix) on the way out.
+        // its source on the mix) on the way out. A `StreamAudioSender`
+        // still held elsewhere keeps the channel open: an empty packet
+        // wakes the thread to see the stop (a full queue wakes it too).
+        let _ = self.packet_tx.try_send(StreamAudioPacket {
+            data: Vec::new(),
+            seq: 0,
+        });
         let (dead_tx, _) = bounded::<StreamAudioPacket>(0);
         self.packet_tx = dead_tx;
         if let Some(thread) = self.decoder_thread.take() {
@@ -619,6 +682,7 @@ pub fn spawn(
             should_stop: stop,
             last_seq: None,
             frame_buffer: vec![0.0f32; DECODE_BUF_SIZE],
+            resting: false,
         }
         .run();
     });
@@ -671,6 +735,20 @@ mod tests {
         assert_eq!(wanted_output(&pick).1.as_deref(), Some("Headset"));
         VOICE_OUTPUT.set(None);
     }
+    /// A sender held by another thread (the network thread's route)
+    /// does not keep a dropped decoder's thread waiting.
+    #[test]
+    fn a_held_sender_does_not_stall_the_drop() {
+        let decoder = spawn(OutputSelection::default(), 1.0).unwrap();
+        let sender = decoder.sender();
+        drop(decoder);
+        // The thread is gone: what is sent now goes nowhere.
+        sender.send(StreamAudioPacket {
+            data: vec![0; 8],
+            seq: 1,
+        });
+    }
+
     /// The numbering of stream audio against the packet before: what is
     /// next, late, concealed, skipped — and a capture that restarted,
     /// which is none of those (review P2-22).

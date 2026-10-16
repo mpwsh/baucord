@@ -23,8 +23,9 @@ pub mod udp;
 
 pub use config::Budget;
 pub use driver::{
-    frame_media, DisconnectReason, Driver, DriverHost, Event, InboundDatagram, LinkStats, PeerId,
-    SendError, Shared, Track, TrackStats, Transmit, UploadId, VideoItem, WaitingRoom, OWN_TRACK,
+    frame_media, DisconnectReason, Driver, DriverHost, Event, InboundDatagram, LinkStats,
+    MediaStream, PeerId, SendError, Shared, Track, TrackStats, Transmit, UploadId, VideoItem,
+    WaitingRoom, OWN_TRACK,
 };
 #[cfg(any(test, feature = "server"))]
 pub use identity::ServerIdentity;

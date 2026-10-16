@@ -459,6 +459,13 @@ pub fn generate_invite_code() -> String {
     code
 }
 
+/// Most roles a server holds, built-in ones included. Every session
+/// gets the whole list as one `RoleList`, which a few hundred roles
+/// would push past the 17 KiB a message may be — and then nobody gets
+/// roles at all. A hundred at the longest names is under half of it
+/// (`server::admin`'s test). The panel and the CLI both keep to it.
+pub const MAX_ROLES: usize = 100;
+
 #[cfg(test)]
 mod tests {
     use protocol::permissions::{ROLE_ADMIN, ROLE_GUEST, ROLE_MEMBER, ROLE_ORGANIZER};

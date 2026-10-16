@@ -3,7 +3,7 @@
 > **Status (2026-10-09):** 1.2.0, Ad Hoc builds on users' iPhones
 > (from CI, D37, or `run.sh --device`). §0–§13 describe the client as
 > it is now; §14 holds every decision taken since the first draft
-> (D14…D56, in order), each with its reason. What is left:
+> (D14…D64, in order), each with its reason. What is left:
 > `PRODUCTION-PLAN.md` (MOB-2, 3, 5, 6, 9, 10, 19). Start from
 > `START-HERE.md`.
 
@@ -255,7 +255,8 @@ cpal's iOS host never touches the audio session, and the default
 category (`SoloAmbient`) has no microphone, so `session.rs` sets
 **`PlayAndRecord`** at startup with `DefaultToSpeaker` (otherwise
 `PlayAndRecord` plays to the earpiece and the app seems silent),
-`AllowBluetoothHFP` and `AllowBluetoothA2DP`.
+`AllowBluetoothHFP`, `AllowBluetoothA2DP` and — out of a call —
+`MixWithOthers` (D64).
 
 ### 6.2 The session in voice
 
@@ -267,9 +268,17 @@ If the mode change put the call on the earpiece, the speaker override
 brings back the loudspeaker. The volume buttons control the call
 volume in this mode.
 
-Not done (MOB-19): activating the session on joining a room and
-deactivating it with `notifyOthersOnDeactivation` on leaving, so a
-podcast paused by joining resumes after.
+The session is active from connect, not from a room's join: the
+lobby's plain output keeps a background app alive (D51). Out of a call
+it is mixed with other apps (`MixWithOthers`), so music or a podcast
+plays on beside it; a room's `voiceChat` mode drops the option and
+interrupts them as a call does, and leaving the room deactivates the
+session with `NotifyOthersOnDeactivation` (`avsession::end_call`) so a
+paused podcast may resume, before the lobby's output activates it
+again, mixed. Out of a room the output asks for 4096-frame buffers and
+the session's preferred IO buffer goes back to 0.1 s
+(`prefer_quiet_io`) (D64). MOB-19's "activate on joining" cannot hold
+with D51's lobby output.
 
 ### 6.3 Echo cancellation: the VPIO backend
 
@@ -335,8 +344,9 @@ buffer). RNNoise under VPIO: the open question of §1.
 - The transport is the transport: quinn over std UDP sockets; GSO is
   not offered on iOS and `quinn-udp`'s probe handles that.
 - **Wakes**: the network thread sleeps until a datagram, a command or
-  the transport's next deadline (D41, D57) — none in a quiet second
-  beyond the socket watcher's two.
+  the transport's next deadline (D41, D57, D64) — about one in a quiet
+  second (the 2 s link-stats sample and the keep-alives), and the
+  socket watcher two per arriving datagram, with a 30 s backstop.
 - **App Transport Security** governs `URLSession` only. The QUIC
   transport and `ureq` (rustls) — the link-image previews in
   `frontend/src/media.rs` — open their own sockets and are not
@@ -671,3 +681,5 @@ fix was installed, so still with portrait insets):
 | D60 | **Settings → Audio opens the microphone; the meters are eased** (2026-10-12, 1.2.1, shared; ANDROID-SPEC.md D70; amends D51; first iPhone look). *The microphone*: the Audio tab's capture bar was dead unless in a room — D51 closes the microphone everywhere else — so a microphone could not be set up before there was someone to talk to. While the tab is on screen (`settingsui.rs` `pace_meter_timer` → `AppState::set_audio_tab_open`; on the narrow page: the Audio section open, not the list with Audio selected behind it) the microphone is open. **Not connected**, an engine is started with no session (`VoiceControl::Start` with `our_client_id: None`): its link to the network thread is `local_only` for as long as it lives, so nothing it hears can be sent, and mute and push-to-talk do not hold it shut — there is no session to hold a key in. A session always brings a new engine. **Connected, in the lobby or the AFK room**, the session's engine is told it is in a room (the voice-processing unit, as a join would) and the link's `testing` flag keeps the packets and the speaking light here; mute rules as in a room. **In a room** nothing changes. It never outlives the screen: leaving the tab, closing Settings, or the app going to the background (`AppState::host_hidden`, from `set_host_visible(false)`) closes it at once — an open microphone would otherwise keep an unconnected app from being suspended. The first time, the tab is where iOS asks for the microphone. *The meters*: read 20 times a second while the tab shows (was 8) and held by `app_core::meter` — a rise taken at once, a fall over 300 ms — and a bar is set only when it moved 0.4% of its length, so silence draws nothing; the bar glides to each value over 80 ms (`animate width`, back in `widgets.slint`). The first cut — 30 readings, a 150 ms fall, no glide — read as jumping on the phone: it followed every syllable to the floor, and whatever rate the timer reached was the rate the bar was seen to step at. When the tab leaves the screen one line is logged — `settings: audio tab on screen T s: meters read N times and drawn M; an engine behind them …; microphone with no test running first heard …, peak …; during a test, peak …` (`app_core::meter::Run`) — which tells a slow timer, an engine that never started, a silent microphone and a late start apart from a pasted log; `microphone: …` lines say what the app did about the engine each time the tab or a test changed, and which engine (the session's from `Init`, or one for this device alone). *The test*: on a phone it plays the voice back half a second late (a second at first; `audio::LOOPBACK_DELAY`, `audio/src/loopback.rs`; the hint says so). Played at once through the loudspeaker it had the echo canceller removing the user's voice from the microphone while the user was still saying the same words, and sounded about to feed back. The desktop's test is live as before. Type-checked on Linux; the hold, the delay line and the engine's mute rule are unit-tested; **not run on a phone** | a meter is for setting the microphone up, which is done before a call, not in one |
 | D61 | **Settings and the admin panel are pages on every host; the admin panel on the iPhone** (2026-10-15, 1.2.1, shared; ANDROID-SPEC.md D71 for the whole of it; amends D29's toast). The desktop's Settings and admin windows became pages over its main window, as the phones' Settings already was; the admin panel is now a page on the iPhone too — the Admin chip opens a list of its nine tabs, a tab opens as a page, the top bar's arrow steps back out (there is no Back key, §9), and every tab is laid out for a phone's width. The `host-single-window` toast is gone. Driven headless on Linux at 390×844; **not run on an iPhone** | as Android's |
 | D62 | **Settings' Close puts back; a person's actions in one menu; the pages keep to a column** (2026-10-15, 1.2.1, shared; ANDROID-SPEC.md D72 for the whole of it). On the iPhone: Settings' footer is Close and Save and close, Reset to defaults the section list's last row; the admin panel's Users tab has one Actions button per person, opening the app's menu. Driven headless at 390×844; **not run on an iPhone** | as Android's |
+| D63 | **Leaving Settings keeps nothing but through Save and close; the tab lists scroll** (2026-10-16, 1.2.1, shared; ANDROID-SPEC.md D73 for the whole of it). On the iPhone: the top bar's arrow leaves Settings as its Close does (a section's arrow still goes to the list first); the Settings and admin tab lists scroll with a finger, so on an iPhone SE (667 pt) Close and Save and close stay on screen and Reset to defaults is at the end of the scroll. Driven headless at 375×647; **not run on an iPhone** | as Android's |
+| D64 | **The 2026-10 review under the iPhone: other apps' audio, the lobby's buffers, the background stops watching** (2026-10-16, after 1.2.1, shared; ANDROID-SPEC.md D74 for the shared part; amends D50, D51, D57, D58; review 2026-10 P1-2, P1-6, P1-7, P2-40, P2-41, P3-12, P3-15; MOB-19). *Other apps' audio* (P1-7): since D51 the session is active from connect, for the lobby's output; with no `MixWithOthers` that stopped music or a podcast at connect and kept it stopped in the lobby, and a user who started it again interrupted the output that keeps the app alive. Out of a call the options now carry `MixWithOthers` (`crates/ios/src/session.rs` at startup, `avsession::options` with each plan); a room's `voiceChat` drops it and interrupts other apps as a call does; leaving the room deactivates the session with `NotifyOthersOnDeactivation` (`avsession::end_call`) before the lobby's output activates it again, mixed (§6.2). *The lobby's buffers*: the plain output out of a room opens with 4096-frame buffers (`AudioOutput::set_quiet`) and the preferred IO buffer goes back to 0.1 s (`avsession::prefer_quiet_io`): the 10 ms a voice unit asked for had stayed, about 100 callbacks and worker passes a second for hours in the background. *Shared with Android (D74)*: the server's PING every 20 s (amends D58; the lobby's output keeps an iPhone's app running in the background, so its own 5 s keep-alive goes out and the ping changes little here — it was for Android's lobby, which holds no wake lock); a watched stream stops in the background — no picture, no sound — and is asked for again on return (amends D57: its sound no longer plays on); the inbound watcher's 30 s backstop and the voice thread's wait of up to an hour (amends D57's "the watcher's 2" and "once a second"); a mention's own chime — `Library/Sounds/baucord-mention.wav` beside `baucord-message.wav`, both from `frontend::host::chime_wav(tone)`, D50's `alert_sound_wav` (amends D50) — and a burst from one person quiet for 10 s. iOS not compiled here; **not run on an iPhone** | music stopped by connecting to a lobby the user only waits in is a bug, not a call; the rest as Android's |

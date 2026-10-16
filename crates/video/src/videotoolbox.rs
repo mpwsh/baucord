@@ -166,11 +166,7 @@ impl VideoToolboxDecoder {
     }
 
     /// Decode one sample with the current session.
-    fn decode_sample(
-        &mut self,
-        bound: (u32, u32),
-        timestamp_ms: u64,
-    ) -> Result<Option<DecodedFrame>, CodecError> {
+    fn decode_sample(&mut self, bound: (u32, u32)) -> Result<Option<DecodedFrame>, CodecError> {
         let session = self
             .session
             .as_ref()
@@ -216,7 +212,6 @@ impl VideoToolboxDecoder {
                     data: target.pixels,
                     width,
                     height,
-                    timestamp_ms,
                     format: crate::PictureFormat::Bgra,
                 }))
             }
@@ -251,6 +246,10 @@ impl Drop for VideoToolboxDecoder {
 }
 
 impl VideoDecoder for VideoToolboxDecoder {
+    fn needs_keyframe(&self) -> bool {
+        self.needs_reset
+    }
+
     fn decode(&mut self, encoded: &EncodedFrame) -> Result<Option<DecodedFrame>, CodecError> {
         let avcc = std::mem::take(&mut self.avcc);
         let split = annexb::split(&encoded.data, avcc);
@@ -291,7 +290,7 @@ impl VideoDecoder for VideoToolboxDecoder {
             return Ok(None);
         }
         let bound = (encoded.width, encoded.height);
-        self.decode_sample(bound, encoded.timestamp_ms)
+        self.decode_sample(bound)
     }
 
     fn flush(&mut self) {

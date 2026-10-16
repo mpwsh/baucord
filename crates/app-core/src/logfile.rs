@@ -2,12 +2,14 @@
 //! to show, the tail to send to the server, and clearing it.
 //!
 //! Each host opens `baucord.log` itself (the desktop's release build in
-//! its working folder, Android in the app's private folder, iOS in
+//! its config folder, Android in the app's private folder, iOS in
 //! Documents) and says where with [`set_path`]; a build that logs only
-//! to a terminal never does, and [`path`] stays `None`. The phone hosts
-//! write through a [`FileSink`], which rolls a log past 5 MB over to
-//! `baucord.log.1` — when it is opened and as it is written — so "the
-//! end of the log" reads across both files, the rolled-over one first.
+//! to a terminal never does, and [`path`] stays `None`. Every host
+//! writes through a [`FileSink`] (the desktop's logger through a
+//! [`SinkWriter`]), which rolls a log past 5 MB over to `baucord.log.1`
+//! — when it is opened and as it is written — so "the end of the log"
+//! reads across both files, the rolled-over one first. The desktop's
+//! grew without limit in its working folder (review 2026-10, P2-47).
 //!
 //! Clearing truncates the file in place: every host keeps it open in
 //! append mode, so its next line lands at the new end — the start.
@@ -38,16 +40,16 @@ pub fn path() -> Option<&'static Path> {
 
 /// The file a phone host rolls the log over to (`baucord.log.1`).
 #[must_use]
-pub fn rolled_path(path: &Path) -> PathBuf {
+pub(crate) fn rolled_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".1");
     path.with_file_name(name)
 }
 
-/// A phone's `baucord.log` is rolled over to `baucord.log.1` when it
-/// passes this. The desktop appends for ever; a phone's storage, and
-/// the user's patience when sending a log, justify the cut.
-pub const ROLL_OVER_BYTES: u64 = 5 * 1024 * 1024;
+/// `baucord.log` is rolled over to `baucord.log.1` when it passes this:
+/// a phone's storage, and the user's patience when sending a log,
+/// justify the cut — and a desktop left running for weeks.
+pub(crate) const ROLL_OVER_BYTES: u64 = 5 * 1024 * 1024;
 
 /// One log line as every host writes it — `env_logger`'s default,
 /// `[ts LEVEL target] message` — under the host's own clock.
@@ -105,7 +107,7 @@ impl FileSink {
     ///
     /// # Errors
     /// The file could not be opened.
-    pub fn with_limit(path: PathBuf, limit: u64) -> io::Result<Self> {
+    pub(crate) fn with_limit(path: PathBuf, limit: u64) -> io::Result<Self> {
         if fs::metadata(&path).is_ok_and(|meta| meta.len() > limit) {
             let _ = fs::rename(&path, rolled_path(&path));
         }
@@ -121,15 +123,19 @@ impl FileSink {
         })
     }
 
-    /// Where the sink writes.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     /// Append `line` and a newline. A failure is dropped: there is
     /// nowhere to report a log that cannot be written.
     pub fn write_line(&self, line: &str) {
+        let mut bytes = Vec::with_capacity(line.len() + 1);
+        bytes.extend_from_slice(line.as_bytes());
+        bytes.push(b'\n');
+        self.write_bytes(&bytes);
+    }
+
+    /// Append `bytes` as they are (whole lines, from a logger that
+    /// formats its own). A failure is dropped, as for
+    /// [`Self::write_line`].
+    pub(crate) fn write_bytes(&self, bytes: &[u8]) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if state.len > self.limit {
             self.roll(&mut state);
@@ -139,9 +145,9 @@ impl FileSink {
             state.len = 0;
         }
         if let Some(file) = state.file.as_mut()
-            && writeln!(file, "{line}").is_ok()
+            && file.write_all(bytes).is_ok()
         {
-            state.len += line.len() as u64 + 1;
+            state.len += bytes.len() as u64;
         }
     }
 
@@ -166,6 +172,22 @@ impl FileSink {
         if let Some(file) = state.file.as_mut() {
             let _ = file.flush();
         }
+    }
+}
+
+/// A [`FileSink`] as an [`io::Write`], for a logger that takes one
+/// (the desktop's `env_logger`, whose every record is one write).
+pub struct SinkWriter(pub std::sync::Arc<FileSink>);
+
+impl Write for SinkWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write_bytes(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush();
+        Ok(())
     }
 }
 
@@ -219,7 +241,7 @@ fn file_tail(path: &Path, max: u64) -> io::Result<Vec<u8>> {
 ///
 /// # Errors
 /// A file that exists but cannot be read.
-pub fn tail_bytes(path: &Path, max: usize) -> io::Result<Vec<u8>> {
+pub(crate) fn tail_bytes(path: &Path, max: usize) -> io::Result<Vec<u8>> {
     let max = max as u64;
     let current = file_tail(path, max)?;
     let room = max.saturating_sub(current.len() as u64);

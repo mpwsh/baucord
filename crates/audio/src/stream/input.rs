@@ -84,7 +84,7 @@ use rubato::{
 
 #[cfg(target_os = "windows")]
 use crate::latch::Ring;
-use crate::{latch::Wait, stats::AudioStats, OPUS_SAMPLE_RATE};
+use crate::{latch::Wait, OPUS_SAMPLE_RATE};
 
 /// Opus bitrate for system audio (bits/s).
 /// 128 kbps stereo gives excellent quality for music/game audio.
@@ -109,10 +109,11 @@ const SILENCE_THRESHOLD: f32 = 1e-4;
 const SILENCE_HANGOVER_FRAMES: u32 = 25;
 
 /// Cap on the worker's block while waiting for capture data. Wakes come
-/// from the backend's wake latch the moment samples land; this timeout
-/// only bounds `stop()` latency. This is an
-/// OS wait — zero CPU while blocked, ≤10 wakes/s during total silence.
-const WORKER_WAIT_CAP: Duration = Duration::from_millis(100);
+/// from the backend's wake latch the moment samples land, and from
+/// `stop()`, which rings it too; the cap is only a backstop. It was
+/// 100 ms, for `stop()` to be noticed: ten wakes a second all through
+/// a silent share (review 2026-10, P3-28).
+const WORKER_WAIT_CAP: Duration = Duration::from_mins(1);
 
 /// Where encoded packets go: called on the encoder worker as each one
 /// is made; `false` means its consumer is gone, and the worker stops.
@@ -137,47 +138,10 @@ pub struct SystemAudioPacket {
     pub channels: u8,
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Platform-specific capture backends
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Trait for platform-specific system audio capture.
-///
-/// Each platform implements this to provide raw audio samples from
-/// the system's audio output. The trait abstracts away WASAPI,
-/// `ScreenCaptureKit`, `PipeWire`, etc.
-///
-/// Implementations push captured samples into the provided ring buffer
-/// producer. The format contract:
-/// - Interleaved stereo f32 samples (L, R, L, R, ...)
-/// - If the device has more than 2 channels, the backend takes the first two
-/// - If the device is mono, the backend duplicates to both channels
-/// - At whatever sample rate the system gives us (we resample later)
-///
-/// The `sample_rate()` method tells us what rate to expect so we
-/// can configure the resampler.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-pub(crate) trait SystemAudioBackend {
-    /// Start capturing. Spawns platform callbacks that push into the ring buffer.
-    fn start(&mut self) -> Result<(), Box<dyn std::error::Error>>;
-
-    /// Stop capturing and release platform resources.
-    fn stop(&mut self);
-
-    /// The sample rate of captured audio (for resampler configuration).
-    fn sample_rate(&self) -> u32;
-
-    /// Human-readable name of the capture source.
-    fn device_name(&self) -> String;
-
-    /// The capture stopped by itself (its device went, the audio engine
-    /// kept failing) and will deliver nothing more.
-    fn failed(&self) -> bool;
-}
-
-/// A started backend paired with the ring consumer the worker drains.
-#[cfg(target_os = "windows")]
-type StartedBackend = (Box<dyn SystemAudioBackend>, Consumer<f32>);
+// A capture backend pushes into the worker's ring: interleaved stereo
+// f32 (L, R, L, R, …) at the rate it says, which the worker resamples
+// to 48 kHz if it must. The one there is, Windows' process loopback,
+// asks the engine for 48 kHz stereo itself.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public API
@@ -192,13 +156,11 @@ type StartedBackend = (Box<dyn SystemAudioBackend>, Consumer<f32>);
 ///
 /// ```rust,ignore
 /// use audio::stream::input::SystemAudioCapture;
-/// use audio::stats::AudioStats;
 /// use std::sync::Arc;
 ///
-/// let stats = Arc::new(AudioStats::new());
 /// // Each packet goes out as it is encoded.
 /// let sink: PacketSink = Arc::new(move |packet| network.send_system_audio(packet));
-/// let mut capture = SystemAudioCapture::new(stats, sink)?;
+/// let mut capture = SystemAudioCapture::new(sink);
 /// capture.start()?;
 ///
 /// // Stop when screen sharing ends
@@ -221,35 +183,33 @@ pub struct SystemAudioCapture {
     /// Whether capture is currently active.
     is_active: Arc<AtomicBool>,
 
-    /// Stats (shared with voice chat engine for unified reporting).
-    /// Only read by the Windows backend — dead weight elsewhere, kept
-    /// so the struct layout is identical everywhere.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    stats: Arc<AudioStats>,
-
     /// Platform backend handle — kept alive to maintain the capture
     /// stream. `SystemAudioCapture` lives and dies on the screen thread.
     #[cfg(target_os = "windows")]
-    backend: Option<Box<dyn SystemAudioBackend>>,
+    backend: Option<super::process_loopback::ProcessLoopback>,
+
+    /// Wakes the worker for `stop()` (the backend's rings wake it for
+    /// samples).
+    #[cfg(target_os = "windows")]
+    stop_ring: Option<Ring>,
 }
 
 impl SystemAudioCapture {
     /// Create a new system audio capturer.
     ///
     /// Does not start capturing — call `start()` when screen sharing begins.
-    pub fn new(
-        stats: Arc<AudioStats>,
-        sink: PacketSink,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(Self {
+    #[must_use]
+    pub fn new(sink: PacketSink) -> Self {
+        Self {
             worker_thread: None,
             sink,
             should_stop: Arc::new(AtomicBool::new(false)),
             is_active: Arc::new(AtomicBool::new(false)),
-            stats,
             #[cfg(target_os = "windows")]
             backend: None,
-        })
+            #[cfg(target_os = "windows")]
+            stop_ring: None,
+        }
     }
 
     /// Start capturing system audio.
@@ -277,10 +237,8 @@ impl SystemAudioCapture {
         // the worker has not seen yet collapse into one (`latch`).
         let (wake_tx, wake_rx) = crate::latch::latch();
 
-        let (backend, ring_consumer) = Self::create_started_backend(&self.stats, &wake_tx)?;
-
-        let device_sample_rate = backend.sample_rate();
-        let device_name = backend.device_name();
+        let (backend, ring_consumer) = Self::create_started_backend(&wake_tx)?;
+        let device_sample_rate = super::process_loopback::ProcessLoopback::SAMPLE_RATE;
 
         // Spawn the encoder worker thread
         let should_stop = self.should_stop.clone();
@@ -297,9 +255,12 @@ impl SystemAudioCapture {
 
         self.worker_thread = Some(worker);
         self.backend = Some(backend);
+        self.stop_ring = Some(wake_tx);
         self.is_active.store(true, Ordering::Relaxed);
 
-        info!("System audio capture ready: {device_name} @ {device_sample_rate}Hz");
+        info!(
+            "System audio capture ready: system mix (own process excluded) @ {device_sample_rate}Hz"
+        );
 
         Ok(())
     }
@@ -319,20 +280,16 @@ impl SystemAudioCapture {
     /// Windows 10 2004+; on an older build the share has no sound.
     #[cfg(target_os = "windows")]
     fn create_started_backend(
-        stats: &Arc<AudioStats>,
         wake_tx: &Ring,
-    ) -> Result<StartedBackend, Box<dyn std::error::Error>> {
+    ) -> Result<(super::process_loopback::ProcessLoopback, Consumer<f32>), Box<dyn std::error::Error>>
+    {
         let (ring_producer, ring_consumer) = Self::new_ring();
-        let mut backend = super::process_loopback::ProcessLoopback::new(
-            ring_producer,
-            wake_tx.clone(),
-            stats.clone(),
-        );
+        let mut backend =
+            super::process_loopback::ProcessLoopback::new(ring_producer, wake_tx.clone());
         backend.start().map_err(|e| {
             format!("process loopback unavailable ({e}); it needs Windows 10 version 2004 or later")
         })?;
         info!("System audio backend: process loopback (own audio excluded)");
-        let backend: Box<dyn SystemAudioBackend> = Box::new(backend);
         Ok((backend, ring_consumer))
     }
 
@@ -347,7 +304,7 @@ impl SystemAudioCapture {
         {
             self.backend
                 .as_ref()
-                .is_some_and(|backend| backend.failed())
+                .is_some_and(super::process_loopback::ProcessLoopback::failed)
         }
         // No backend elsewhere: nothing started, nothing to fail.
         #[cfg(not(target_os = "windows"))]
@@ -363,6 +320,11 @@ impl SystemAudioCapture {
         #[cfg(target_os = "windows")]
         if let Some(mut backend) = self.backend.take() {
             backend.stop();
+        }
+        // The worker is waiting on the latch: wake it to see the stop.
+        #[cfg(target_os = "windows")]
+        if let Some(ring) = self.stop_ring.take() {
+            ring.ring();
         }
 
         // Join the worker thread

@@ -45,12 +45,16 @@ pub fn configure() {
         log::warn!("audio session: the SDK's category or mode constant is missing");
         return;
     };
+    // Mixed with other apps until a call: the voice engine sets the
+    // session again with each plan (`audio::native::avsession`), and
+    // only a call stops other apps' audio (review 2026-10, P1-7).
     let options = AVAudioSessionCategoryOptions::DefaultToSpeaker
         | AVAudioSessionCategoryOptions::AllowBluetoothHFP
-        | AVAudioSessionCategoryOptions::AllowBluetoothA2DP;
+        | AVAudioSessionCategoryOptions::AllowBluetoothA2DP
+        | AVAudioSessionCategoryOptions::MixWithOthers;
     // SAFETY: valid category, mode and options for the shared session.
     match unsafe { session.setCategory_mode_options_error(category, mode, options) } {
-        Ok(()) => log::info!("audio session: play and record (loudspeaker, Bluetooth allowed)"),
+        Ok(()) => log::info!("audio session: play and record (loudspeaker, Bluetooth, mixed)"),
         Err(e) => log::warn!("audio session category: {}", e.localizedDescription()),
     }
     // A recording session silences system sounds and haptics by default;

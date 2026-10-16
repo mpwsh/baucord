@@ -189,6 +189,12 @@ enum Waiting {
     ReportList { client: ClientId, request_id: u32 },
     /// A file's bytes from disk; who wants them is in `pending_blobs`.
     Blob(protocol::BlobId),
+    /// A file's references counted on disk, and its count in memory
+    /// when that was asked (`dms::resolve_blob_recount`).
+    BlobRecount {
+        blob_id: protocol::BlobId,
+        refs_then: u32,
+    },
 }
 
 pub struct ChatServer {
@@ -284,6 +290,9 @@ pub struct ChatServer {
     /// pruned to the last minute — the sliding window behind
     /// `limits.max_transfer_kb_per_minute`.
     image_bytes: HashMap<ClientId, Vec<(Instant, usize)>>,
+    /// The same for stored files (`Transfer::File`): a bucket of their
+    /// own, so a large file does not hold up every picture.
+    file_bytes: HashMap<ClientId, Vec<(Instant, usize)>>,
     /// In-progress image uploads, at most one per client — a chunk
     /// with a fresh `upload_id` abandons the old partial.
     uploads: HashMap<ClientId, IncomingUpload>,
@@ -325,6 +334,8 @@ pub struct ChatServer {
     /// Server-wide window of accepted image bytes — the aggregate
     /// budget the per-client one can't provide.
     image_bytes_global: Vec<(Instant, usize)>,
+    /// …and for stored files.
+    file_bytes_global: Vec<(Instant, usize)>,
     /// Server-assigned chat message ids, unique for this run.
     next_message_id: u64,
     /// Per-client transport counters at the client's last `link:`
@@ -359,17 +370,22 @@ impl ChatServer {
     /// database that cannot be opened or migrated, or a TLS setup
     /// failure.
     pub fn new(
-        config: Config,
+        mut config: Config,
         identity: &ServerIdentity,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         config
             .validate_policy()
             .map_err(|e| format!("invalid server.yaml: {e}"))?;
-        if config.authentication.secure || config.authentication.password.is_some() {
+        // A message longer than a history page holds came back as an
+        // empty page that said "more", and "Load earlier" asked for it
+        // for ever (review 2026-10, P2-26).
+        if config.limits.max_chat_bytes > crate::config::MAX_CHAT_BYTES_LIMIT {
             warn!(
-                "server.yaml has an `authentication:` section; since 1.1 it is ignored — \
-                 invites are the only door (see the bootstrap invite below)"
+                "limits.max_chat_bytes {} is more than a history page holds; using {}",
+                config.limits.max_chat_bytes,
+                crate::config::MAX_CHAT_BYTES_LIMIT
             );
+            config.limits.max_chat_bytes = crate::config::MAX_CHAT_BYTES_LIMIT;
         }
 
         // ── Persistence and policy ──────────────────────────────────
@@ -464,6 +480,7 @@ impl ChatServer {
             config_mtime: None,
             last_config_check: now,
             image_bytes: HashMap::new(),
+            file_bytes: HashMap::new(),
             uploads: HashMap::new(),
             blob_uploads: HashMap::new(),
             announced_uploads: HashMap::new(),
@@ -481,6 +498,7 @@ impl ChatServer {
             log_uploads: HashMap::new(),
             last_log_upload: HashMap::new(),
             image_bytes_global: Vec::new(),
+            file_bytes_global: Vec::new(),
             next_message_id: startup.next_message_id,
             link_baseline: HashMap::new(),
             link_voice: HashMap::new(),
@@ -1665,6 +1683,9 @@ impl ChatServer {
                     self.resolve_report_list_answer(client, request_id, outcome);
                 }
                 Waiting::Blob(blob_id) => self.resolve_blob_answer(blob_id, outcome),
+                Waiting::BlobRecount { blob_id, refs_then } => {
+                    self.resolve_blob_recount(blob_id, refs_then, &outcome);
+                }
             }
         }
     }
@@ -1749,7 +1770,23 @@ impl ChatServer {
             );
             return;
         }
-        if !self.allow_image(client_id, image.len()) {
+        // Its size, from the header alone: every client refuses to
+        // decode a picture past `MAX_RECEIVED_PICTURE_SIDE` (a few KB
+        // can claim 16384² and freeze whoever shows it), so relaying one
+        // is bandwidth for nothing (review 2026-10, CLI-1).
+        match imagesize::blob_size(&image) {
+            Ok(size)
+                if size.width <= MAX_RECEIVED_PICTURE_SIDE
+                    && size.height <= MAX_RECEIVED_PICTURE_SIDE => {}
+            seen => {
+                warn!(
+                    "Dropping a chat image from {} that no client would show: {seen:?}",
+                    self.get_username(client_id),
+                );
+                return;
+            }
+        }
+        if !self.allow_transfer(client_id, image.len(), Transfer::Image) {
             return;
         }
         info!(
@@ -1812,33 +1849,59 @@ impl ChatServer {
         }
     }
 
-    /// Sliding-window *bandwidth* budget for chat images: admit the
-    /// image only if the last minute's accepted bytes plus this one
-    /// stay within both the per-client and server-wide budgets; bytes
-    /// are recorded only for accepted images. Dropped images cost the
-    /// sender nothing here (their upload already crossed the wire —
-    /// that part is physics), but they are never multiplied into
-    /// `clients ×` relay egress.
-    pub(crate) fn allow_image(&mut self, client_id: ClientId, len: usize) -> bool {
+    /// Sliding-window *bandwidth* budget for chat images and stored
+    /// files: admit the transfer only if the last minute's accepted
+    /// bytes plus this one stay within both the per-client and
+    /// server-wide budgets; bytes are recorded only for accepted ones.
+    /// Dropped images cost the sender nothing here (their upload already
+    /// crossed the wire — that part is physics), but they are never
+    /// multiplied into `clients ×` relay egress.
+    ///
+    /// Pictures and files keep a bucket each, and the server-wide one
+    /// has no empty-minute exception (the file one is at least the file
+    /// cap): one 20–50 MB file filled the shared minute, and every
+    /// picture and file after it was refused for 60 s (review 2026-10,
+    /// P1-11).
+    pub(crate) fn allow_transfer(
+        &mut self,
+        client_id: ClientId,
+        len: usize,
+        kind: Transfer,
+    ) -> bool {
         let per_client = self.config.limits.max_transfer_kb_per_minute * 1024;
-        let global = self.config.limits.max_transfer_kb_per_minute_global * 1024;
-        if per_client == 0 || global == 0 {
+        let configured = self.config.limits.max_transfer_kb_per_minute_global * 1024;
+        if per_client == 0 || configured == 0 {
             return false;
         }
+        // Pictures are relayed to the room: the operator's budget, as
+        // set. Files are stored and fetched one by one: at least one of
+        // the largest a minute, or one could never be sent.
+        let (global, client_windows, global_window) = match kind {
+            Transfer::Image => (
+                configured,
+                &mut self.image_bytes,
+                &mut self.image_bytes_global,
+            ),
+            Transfer::File => (
+                configured.max(protocol::MAX_BLOB_BYTES),
+                &mut self.file_bytes,
+                &mut self.file_bytes_global,
+            ),
+        };
         let now = self.now;
         let window = Duration::from_mins(1);
 
-        // A minute with nothing in it takes any one upload, however
-        // large: the bytes are charged in full, so the next one waits
-        // until they leave the window. Without this a file larger than
-        // the per-minute budget (4 MiB by default, under the 50 MB file
-        // cap) could never be sent at all.
-        let entries = self.image_bytes.entry(client_id).or_default();
+        // A minute with nothing in it takes any one upload of the
+        // client's, however large: the bytes are charged in full, so its
+        // next one waits until they leave the window. Without this a
+        // file larger than the per-minute budget (4 MiB by default,
+        // under the 50 MB file cap) could never be sent at all.
+        let entries = client_windows.entry(client_id).or_default();
         entries.retain(|(t, _)| now.duration_since(*t) < window);
         let client_used: usize = entries.iter().map(|(_, b)| b).sum();
         if client_used > 0 && client_used + len > per_client {
             warn!(
-                "Image bandwidth limit for {}: {} KB used of {} KB/min, dropping a {} KB image",
+                "Transfer limit for {} ({kind:?}): {} KB used of {} KB/min, dropping {} KB",
                 self.usernames
                     .get(&client_id)
                     .map_or("<unknown>", String::as_str),
@@ -1849,13 +1912,12 @@ impl ChatServer {
             return false;
         }
 
-        self.image_bytes_global
-            .retain(|(t, _)| now.duration_since(*t) < window);
-        let global_used: usize = self.image_bytes_global.iter().map(|(_, b)| b).sum();
-        if global_used > 0 && global_used + len > global {
+        global_window.retain(|(t, _)| now.duration_since(*t) < window);
+        let global_used: usize = global_window.iter().map(|(_, b)| b).sum();
+        if global_used + len > global {
             warn!(
-                "Server-wide image bandwidth limit: {} KB used of {} KB/min, \
-                 dropping a {} KB image from {}",
+                "Server-wide transfer limit ({kind:?}): {} KB used of {} KB/min, \
+                 dropping {} KB from {}",
                 global_used / 1024,
                 global / 1024,
                 len / 1024,
@@ -1866,11 +1928,11 @@ impl ChatServer {
             return false;
         }
 
-        self.image_bytes
+        client_windows
             .entry(client_id)
             .or_default()
             .push((now, len));
-        self.image_bytes_global.push((now, len));
+        global_window.push((now, len));
         true
     }
 
@@ -2210,6 +2272,7 @@ impl ChatServer {
             .is_some_and(|ch| ch != self.default_channel);
         self.index_rooms();
         self.image_bytes.remove(&client_id);
+        self.file_bytes.remove(&client_id);
         self.uploads.remove(&client_id);
         self.log_uploads.remove(&client_id);
         self.last_log_upload.remove(&client_id);
@@ -2636,7 +2699,6 @@ impl ChatServer {
                 if self.persist.is_persistent()
                     && let Some(user_id) = self.user_of.get(&client_id).copied()
                     && let Some(key_hash) = self.key_of.get(&client_id).copied()
-                    && let Some(encoded) = protocol::encode_telemetry_event(&event)
                 {
                     self.persist
                         .send(Command::TelemetryEvent(TelemetryEventRow {
@@ -2644,7 +2706,6 @@ impl ChatServer {
                             user_id,
                             key_hash,
                             kind: event_kind(&event).to_string(),
-                            event: encoded,
                         }));
                 }
             }
@@ -3892,4 +3953,17 @@ mod socket_tests {
         assert_eq!(send_buffer_target(12), 64 * 1024 * 1024);
         assert_eq!(send_buffer_target(64), 64 * 1024 * 1024);
     }
+}
+
+/// The longest edge of a chat picture any client decodes (app-core's
+/// `MAX_RECEIVED_DIM`): the relay drops bigger ones.
+const MAX_RECEIVED_PICTURE_SIDE: usize = 4096;
+
+/// What a transfer budget is asked about ([`Server::allow_transfer`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Transfer {
+    /// A chat picture, relayed to the room.
+    Image,
+    /// A file, stored and fetched on demand.
+    File,
 }

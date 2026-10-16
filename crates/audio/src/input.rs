@@ -59,14 +59,13 @@ use crate::{
 };
 
 pub struct AudioInput {
-    /// cpal's device and the config it opens at. Resolved in `new()`,
-    /// but on Windows, where the native backend finds its device by
-    /// itself and cpal — only its fallback — is asked in `start_cpal`
-    /// (see the same field in `output.rs`; PRODUCTION-PLAN.md CLI-12).
+    /// cpal's device and the config it opens at: asked in `start_cpal`,
+    /// only when the cpal path runs — a native backend finds its device
+    /// by itself (see the same field in `output.rs`; PRODUCTION-PLAN.md
+    /// CLI-12; review 2026-10 P2-49).
     cpal: Option<(Device, SupportedStreamConfig)>,
     /// The user's device selection (`None` = follow the OS default), for
     /// the native backend's own device lookup (and cpal's, late).
-    #[cfg(windows)]
     device_name: Option<String>,
     /// cpal stream, when the cpal backend is in use.
     stream: Option<Stream>,
@@ -128,8 +127,8 @@ pub struct AudioInput {
 }
 
 impl AudioInput {
-    // Windows opens nothing here (see the `cpal` field).
-    #[cfg_attr(windows, allow(clippy::unnecessary_wraps))]
+    // Opens nothing (see the `cpal` field): the `Result` is the callers'.
+    #[allow(clippy::unnecessary_wraps)]
     pub fn new(
         device_name: Option<&str>,
         encoder_tx: Sender<PcmFrame>,
@@ -139,13 +138,12 @@ impl AudioInput {
         is_speaking: Arc<SpeakingFlag>,
         voice: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        #[cfg(windows)]
+        // cpal is asked only by the cpal path (`start_cpal`): a phone on
+        // the call path, or Windows' native capture, never needs it, and
+        // asking was a device enumeration per open (review 2026-10,
+        // P2-49). The ring is made for 48 kHz, the native backends'
+        // rate; `start_cpal` grows it if cpal's rate needs more.
         let cpal: Option<(Device, SupportedStreamConfig)> = None;
-        #[cfg(not(windows))]
-        let cpal = Some(open_cpal(device_name)?);
-        // The native backend captures at 48 kHz (the engine converts);
-        // cpal at the rate it chose — `start_cpal` grows the ring on
-        // Windows if that one needs more.
         let (ring_producer, ring_consumer) = RingBuffer::new(ring_size_for(
             cpal.as_ref()
                 .map_or(OPUS_SAMPLE_RATE, |(_, config)| config.sample_rate()),
@@ -158,7 +156,6 @@ impl AudioInput {
 
         Ok(Self {
             cpal,
-            #[cfg(windows)]
             device_name: device_name.map(String::from),
             stream: None,
             #[cfg(windows)]
@@ -196,7 +193,17 @@ impl AudioInput {
         #[cfg(windows)]
         {
             match self.start_native() {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    CAPTURE_FALLBACK_SAID.store(false, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(());
+                }
+                // Once a streak: a device that is not there is tried
+                // again and again (review 2026-10, P2-38).
+                Err(e)
+                    if CAPTURE_FALLBACK_SAID.swap(true, std::sync::atomic::Ordering::Relaxed) =>
+                {
+                    log::debug!("Native WASAPI capture unavailable ({e}); using cpal");
+                }
                 Err(e) => log::warn!("Native WASAPI capture unavailable ({e}); using cpal"),
             }
         }
@@ -333,12 +340,28 @@ impl AudioInput {
     }
 
     fn start_cpal(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        // Windows asks cpal only now, the native backend having failed
-        // (see the `cpal` field) — and its rate can want a bigger ring
-        // than the 48 kHz one `new()` made. Nothing holds the ring yet.
-        #[cfg(windows)]
+        // cpal is asked only now (see `new`) — and its rate can want a
+        // bigger ring than the 48 kHz one `new()` made. Nothing holds the
+        // ring yet.
         if self.cpal.is_none() {
-            let (device, config) = open_cpal(self.device_name.as_deref())?;
+            // cpal's default is the console one; with "Default" meaning
+            // the communications device (`communications_default`) this
+            // fallback opened another device than voice follows, and the
+            // echo report described streams that were not there (review
+            // 2026-10, P3-31). That device, by name — cpal brings COM up
+            // on this thread before it is asked.
+            #[cfg(windows)]
+            let name = self.device_name.clone().or_else(|| {
+                self.communications_default
+                    .then(|| {
+                        let _ = cpal::default_host().default_input_device();
+                        crate::native::wasapi::communications_default_name(true)
+                    })
+                    .flatten()
+            });
+            #[cfg(not(windows))]
+            let name = self.device_name.clone();
+            let (device, config) = open_cpal(name.as_deref())?;
             let size = ring_size_for(config.sample_rate());
             let held = self.ring_producer.as_ref().map(|p| p.buffer().capacity());
             if held.is_some_and(|held| size > held) && self.ring_consumer.is_some() {
@@ -386,22 +409,20 @@ impl AudioInput {
             buffer_size: crate::device::capture_buffer_size(device, device_config),
         };
 
-        let mut ring_producer = self
-            .ring_producer
-            .take()
-            .ok_or("Ring producer already taken")?;
-        let wake_tx = self.wake_tx.take().ok_or("Wake sender already taken")?;
-        let config = self.config.clone();
-        let stats = self.stats.clone();
+        let mut pump = crate::native::pump::CapturePump {
+            producer: self
+                .ring_producer
+                .take()
+                .ok_or("Ring producer already taken")?,
+            wake_tx: self.wake_tx.take().ok_or("Wake sender already taken")?,
+            stats: self.stats.clone(),
+            config: self.config.clone(),
+        };
         let stats_err = self.stats.clone();
         let ch = channels as usize;
         // cpal's capture thread runs our callback; promote it on first
         // entry (see platform::promote_callback_thread).
         let mut promoted = false;
-        // The engine reports every capture gap through the error callback;
-        // under a starving game that is tens per second. Count all of them
-        // (stats), log at most one per second.
-        let mut last_err_log: Option<std::time::Instant> = None;
 
         let stream = device.build_input_stream(
             stream_config,
@@ -410,56 +431,27 @@ impl AudioInput {
                     promoted = true;
                     crate::platform::promote_callback_thread(FRAME_SIZE as u32, sample_rate);
                 }
-                if config.silenced() {
-                    return;
-                }
-
-                let mut overrun = false;
-
-                // Downmix into the ring in one chunked write per callback.
-                // `write_chunk_uninit` hands back exactly the free slots
-                // (capped at what we need); anything beyond is an overrun.
-                let frames = data.len() / ch;
-                let want = frames.min(ring_producer.slots());
-                if want < frames {
-                    overrun = true;
-                }
-                if want > 0 {
-                    if let Ok(chunk) = ring_producer.write_chunk_uninit(want) {
-                        // No clamp here: f32 has headroom and the
-                        // processing chain (gate → AGC → comp → clamp
-                        // stage) owns levels. Clipping at capture
-                        // destroyed the very peaks the compressor
-                        // exists to handle gracefully.
-                        #[allow(clippy::cast_precision_loss)]
-                        let mut it = data.chunks(ch).take(want).map(|frame| {
-                            let sum: f32 = frame.iter().map(|s| s.to_sample::<f32>()).sum();
-                            sum / ch as f32
-                        });
-                        chunk.fill_from_iter(&mut it);
-                    } else {
-                        overrun = true;
-                    }
-                }
-                if overrun {
-                    stats.input_overruns.fetch_add(1, Ordering::Relaxed);
-                }
-
-                // Data available — wake the worker (lock-free latch).
-                wake_tx.ring();
+                // Downmixed into the ring in one chunked write, and the
+                // worker woken (`pump`).
+                #[allow(clippy::cast_precision_loss)]
+                pump.push_mono(
+                    data.len() / ch,
+                    data.chunks_exact(ch).map(|frame| {
+                        frame.iter().map(|s| s.to_sample::<f32>()).sum::<f32>() / ch as f32
+                    }),
+                );
             },
+            // Counted, not logged: this runs on the stream's own thread,
+            // real-time on some hosts, where a log line is a file write;
+            // the stats line has the count, the engine's reopen line the
+            // loss. Nor counted as overruns, which the data path counts
+            // itself — AAudio's xruns were counted twice (review 2026-10,
+            // P3-33).
             move |err| {
                 if matches!(err.kind(), cpal::ErrorKind::DeviceNotAvailable) {
-                    stats_err.input_stream_failed.store(true, Ordering::Relaxed);
-                }
-                stats_err.input_overruns.fetch_add(1, Ordering::Relaxed);
-                let now = std::time::Instant::now();
-                if last_err_log.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
-                    last_err_log = Some(now);
-                    error!(
-                        "Input stream error: {err} (total {})",
-                        stats_err.input_overruns.load(Ordering::Relaxed)
-                    );
+                    stats_err.flag(crate::stats::Health::InputFailed);
+                } else {
+                    stats_err.input_errors.fetch_add(1, Ordering::Relaxed);
                 }
             },
             None,
@@ -526,8 +518,8 @@ impl AudioInput {
 fn build_chain(config: &InputConfig, is_speaking: Arc<SpeakingFlag>) -> InputChain {
     InputChain::new(
         NoiseGate::new(config.gate.clone(), 200),
-        AutoGainControl::new(config.agc.clone(), 30.0),
-        Compressor::with_defaults(config.compressor.clone()),
+        AutoGainControl::new(30.0),
+        Compressor::with_defaults(),
         SpeakingIndicator::with_flag(is_speaking),
     )
 }
@@ -606,10 +598,12 @@ fn worker_loop(
                 chunk.commit_all();
             }
             // The capture callback stops waking us while muted, so this
-            // waits out the safety timeout: five wakes a second, nothing
-            // processed. Unmuting costs nothing — the callback's next
-            // (unmuted) buffer rings at once — and a stop rings too.
-            if !wake_rx.wait(crate::platform::LATCH_SAFETY_WAIT) {
+            // waits out the timeout, nothing processed. Unmuting costs
+            // nothing — the callback's next (unmuted) buffer rings at
+            // once — and a stop rings too, so it is long: five wakes a
+            // second for as long as one stayed muted or in the lobby
+            // was the 200 ms safety wait (review 2026-10, P3-24).
+            if !wake_rx.wait(SILENCED_WAIT) {
                 break;
             }
             continue;
@@ -688,9 +682,6 @@ fn worker_loop(
             accumulator.drain(..FRAME_SIZE);
 
             let mut ctx = FrameContext {
-                denoise_enabled: config.denoise_enabled.load(Ordering::Relaxed),
-                compressor_enabled: config.compressor_enabled.load(Ordering::Relaxed),
-                agc_enabled: config.agc_enabled.load(Ordering::Relaxed),
                 input_gain: f32::from_bits(config.input_gain.load(Ordering::Relaxed)),
                 ..FrameContext::default()
             };
@@ -710,6 +701,9 @@ fn worker_loop(
                 // Frames are `Copy`: no clone, no allocation.
                 let _ = loopback_tx.try_send(frame);
             }
+            if !config.transmit.load(Ordering::Relaxed) {
+                continue;
+            }
 
             // Every frame goes to the encoder: the gate has already
             // zeroed non-speech, and Opus DTX (in the encoder thread)
@@ -728,6 +722,10 @@ fn worker_loop(
         }
     }
 }
+
+/// The capture worker's wait while silenced: only a backstop, since
+/// unmuting and stopping both ring it.
+const SILENCED_WAIT: Duration = Duration::from_secs(5);
 
 /// The ring between the device and the worker: 200 ms at the device
 /// rate, never under 9600 samples.
@@ -781,6 +779,12 @@ impl Drop for AudioInput {
         }
     }
 }
+
+/// The native capture stream would not open and the warning was given;
+/// it is said again once one has opened.
+#[cfg(windows)]
+static CAPTURE_FALLBACK_SAID: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
 mod tests {

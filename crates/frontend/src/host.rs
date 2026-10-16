@@ -21,7 +21,7 @@ use std::{
 
 use i18n::t;
 
-pub use crate::notice::{ChimeRoute, Notice, NoticeKind};
+pub use crate::notice::{ChimeRoute, Notice, NoticeKind, Tone};
 
 pub type Filter = (String, Vec<String>);
 
@@ -98,10 +98,10 @@ pub trait Hooks: Send + Sync {
     fn chime_route(&self) -> ChimeRoute {
         ChimeRoute::App
     }
-    /// Play the message chime (`wav`) itself, for when the voice engine
-    /// has no playback open (Android out of a voice room). `false`: the
-    /// host cannot, and the engine is asked as before.
-    fn play_chime(&self, _wav: &[u8]) -> bool {
+    /// Play chime `tone` (its sound: `wav`) itself, for when the voice
+    /// engine has no playback open (Android out of a voice room).
+    /// `false`: the host cannot, and the engine is asked as before.
+    fn play_chime(&self, _tone: Tone, _wav: &[u8]) -> bool {
         false
     }
     /// Ask the user for one existing file, through a dialog that takes
@@ -257,19 +257,24 @@ pub fn open_conversation(dm: String) {
 /// Have the host play the message chime itself (`Hooks::play_chime`);
 /// `false` when it cannot.
 #[must_use]
-pub fn play_chime() -> bool {
-    hooks().is_some_and(|h| h.play_chime(alert_sound_wav()))
+pub fn play_chime(tone: Tone) -> bool {
+    hooks().is_some_and(|h| h.play_chime(tone, chime_wav(tone)))
 }
 
-/// The DM chime as a WAV file, for a host that plays it through the
+/// Chime `tone` as a WAV file, for a host that plays it through the
 /// system (iOS writes it where notifications find their sounds). Made
-/// once; every chime borrows it.
+/// once a run; every chime borrows it.
 #[must_use]
-pub fn alert_sound_wav() -> &'static [u8] {
-    static WAV: OnceLock<Vec<u8>> = OnceLock::new();
-    WAV.get_or_init(|| {
+pub fn chime_wav(tone: Tone) -> &'static [u8] {
+    static MESSAGE: OnceLock<Vec<u8>> = OnceLock::new();
+    static MENTION: OnceLock<Vec<u8>> = OnceLock::new();
+    let (cell, sound) = match tone {
+        Tone::DirectMessage => (&MESSAGE, audio::SoundType::DirectMessage),
+        Tone::Mention => (&MENTION, audio::SoundType::Mention),
+    };
+    cell.get_or_init(|| {
         let bank = audio::sounds::SoundBank::new();
-        audio::sounds::wav_bytes(bank.get(audio::SoundType::DirectMessage))
+        audio::sounds::wav_bytes(bank.get(sound))
     })
 }
 

@@ -606,8 +606,6 @@ export component StreamViewerWindow inherits Window {
     in property <image> frame;
     in property <string> stats: "--";
     in-out property <bool> stream-muted <=> panel.stream-muted;
-    in-out property <float> volume <=> panel.volume;
-    in-out property <bool> fullscreen <=> panel.fullscreen;
     /// The session's mute and deafen, pushed by the app (D43).
     in property <bool> self-muted;
     in property <bool> self-deafened;
@@ -623,7 +621,7 @@ export component StreamViewerWindow inherits Window {
 
     title: peer-name;
     background: black;
-    full-screen: root.fullscreen;
+    full-screen: panel.fullscreen;
     preferred-width: 1280px;
     preferred-height: 752px;
     min-width: 320px;

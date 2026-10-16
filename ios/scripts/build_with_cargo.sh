@@ -64,10 +64,13 @@ fi
 
 if [ "${CONFIGURATION:-Debug}" = "Release" ]; then
   PROFILE=release
-  PROFILE_FLAG=--release
+  # A release build takes Cargo.lock as written, like the desktop's and
+  # the server's (review 2026-10, P2-29); a debug build may still update
+  # it after a manifest edit.
+  PROFILE_FLAGS=(--release --locked)
 else
   PROFILE=debug
-  PROFILE_FLAG=
+  PROFILE_FLAGS=()
 fi
 
 # Debug info in release builds too, so the archive gets a dSYM.
@@ -85,8 +88,8 @@ fi
 # `-p ios`, never the workspace: a workspace-wide build would unify the
 # desktop's features into frontend (IOS-SPEC.md §2.1). The array idiom
 # keeps an empty FEATURES legal under `set -u` in macOS's bash 3.2.
-echo "cargo build -p ios --bin baucord --target $TRIPLE ${PROFILE_FLAG} ${FEATURES[*]:-}"
-cargo build -p ios --bin baucord --target "$TRIPLE" $PROFILE_FLAG ${FEATURES[@]+"${FEATURES[@]}"}
+echo "cargo build -p ios --bin baucord --target $TRIPLE ${PROFILE_FLAGS[*]:-} ${FEATURES[*]:-}"
+cargo build -p ios --bin baucord --target "$TRIPLE" ${PROFILE_FLAGS[@]+"${PROFILE_FLAGS[@]}"} ${FEATURES[@]+"${FEATURES[@]}"}
 
 BIN="$CARGO_TARGET_DIR/$TRIPLE/$PROFILE/baucord"
 DEST="$TARGET_BUILD_DIR/$EXECUTABLE_PATH"

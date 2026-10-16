@@ -19,15 +19,15 @@ enum Action {
 }
 
 /// What happens while the watcher sleeps once: the keys that are down
-/// when it reads next, and whether a key event woke it.
+/// when it reads next, and what woke it.
 struct Step {
-    event: bool,
+    woke: Woke,
     down: Vec<u16>,
 }
 
 fn event(down: &[u16]) -> Step {
     Step {
-        event: true,
+        woke: Woke::Key,
         down: down.to_vec(),
     }
 }
@@ -35,7 +35,16 @@ fn event(down: &[u16]) -> Step {
 /// Time passed, or the keys changed with no event to say so.
 fn quiet(down: &[u16]) -> Step {
     Step {
-        event: false,
+        woke: Woke::TimedOut,
+        down: down.to_vec(),
+    }
+}
+
+/// Something that is not a key of interest woke it (a message for a
+/// window on Windows, a kick).
+fn other(down: &[u16]) -> Step {
+    Step {
+        woke: Woke::Other,
         down: down.to_vec(),
     }
 }
@@ -70,18 +79,18 @@ impl Source for Scripted<'_> {
         self.events
     }
 
-    fn wait(&mut self, timeout: Option<Duration>) -> bool {
+    fn wait(&mut self, timeout: Option<Duration>) -> Woke {
         self.waits.push(timeout);
         let Some(step) = self.steps.pop_front() else {
             self.stop.store(true, Ordering::Release);
-            return false;
+            return Woke::Other;
         };
         assert!(
-            step.event || timeout.is_some(),
-            "a sleep with no timeout ends only on an event"
+            step.woke != Woke::TimedOut || timeout.is_some(),
+            "a sleep with no timeout does not time out"
         );
         self.down = step.down;
-        step.event
+        step.woke
     }
 }
 
@@ -110,6 +119,16 @@ fn run(
     bindings: &[Binding<Action>],
     steps: Vec<Step>,
 ) -> (Vec<(Action, bool)>, Vec<Option<Duration>>) {
+    run_after(&AtomicU8::new(0), events, bindings, steps)
+}
+
+/// [`run`], in a process whose events announced `announced` presses.
+fn run_after(
+    announced: &AtomicU8,
+    events: bool,
+    bindings: &[Binding<Action>],
+    steps: Vec<Step>,
+) -> (Vec<(Action, bool)>, Vec<Option<Duration>>) {
     let stop = AtomicBool::new(false);
     let mut source = Scripted {
         events,
@@ -119,10 +138,16 @@ fn run(
         waits: Vec::new(),
     };
     let reported = RefCell::new(Vec::new());
-    watch(&mut source, bindings, &stop, &|action, pressed| {
-        reported.borrow_mut().push((action, pressed));
-        true
-    });
+    watch(
+        &mut source,
+        bindings,
+        &stop,
+        announced,
+        &|action, pressed| {
+            reported.borrow_mut().push((action, pressed));
+            true
+        },
+    );
     (reported.into_inner(), source.waits)
 }
 
@@ -321,8 +346,81 @@ fn a_press_found_by_the_first_reads_or_during_a_hold_decides_nothing() {
             (Action::Talk, false)
         ]
     );
-    assert_eq!(waits.last(), Some(&BEAT), "{waits:?}");
-    assert_eq!(waits.iter().filter(|w| **w == BEAT).count(), 2);
+    assert!(
+        matches!(waits.last(), Some(Some(beat)) if *beat >= HEARTBEAT),
+        "{waits:?}"
+    );
+    assert_eq!(
+        waits
+            .iter()
+            .filter(|w| w.is_some_and(|d| d >= HEARTBEAT))
+            .count(),
+        2
+    );
+}
+
+/// At rest on probation, each quiet beat doubles the next, up to
+/// [`HEARTBEAT_MAX`]; a key event starts it over.
+#[test]
+fn the_heartbeat_backs_off_while_nothing_happens() {
+    let mut steps = vec![quiet(&[]), quiet(&[]), quiet(&[])];
+    steps.extend((0..6).map(|_| quiet(&[])));
+    steps.extend([event(&[F7]), event(&[]), quiet(&[]), quiet(&[]), quiet(&[])]);
+    let (_, waits) = run(true, &[toggle(F7)], steps);
+    let beats: Vec<_> = waits
+        .iter()
+        .filter_map(|w| w.filter(|d| *d != POLL))
+        .map(|d| d.as_millis())
+        .collect();
+    assert_eq!(
+        beats,
+        [250, 500, 1000, 2000, 4000, 4000, 4000, 250],
+        "{waits:?}"
+    );
+}
+
+/// Woken by something that is not the time running out — Windows
+/// wakes for any message — a press read then is no proof the events
+/// failed: its own event may be on the way.
+#[test]
+fn a_press_read_after_some_other_wake_decides_nothing() {
+    let (reported, waits) = run(
+        true,
+        &[toggle(F7)],
+        vec![
+            quiet(&[]),
+            quiet(&[]),
+            quiet(&[]),
+            other(&[F7]),
+            event(&[F7]),
+            event(&[]),
+            quiet(&[]),
+            quiet(&[]),
+            quiet(&[]),
+        ],
+    );
+    assert_eq!(reported, [(Action::Mute, true)]);
+    assert_eq!(waits.last(), Some(&BEAT), "still on probation: {waits:?}");
+}
+
+/// Proven once, proven for the process: the next watcher (a rebind, a
+/// reconnect) sleeps on events alone from the start.
+#[test]
+fn a_later_watcher_trusts_events_already_proven() {
+    let announced = AtomicU8::new(0);
+    let mut steps = vec![quiet(&[]), quiet(&[]), quiet(&[])];
+    for _ in 0..PROVEN_PRESSES {
+        steps.extend([event(&[F7]), event(&[]), quiet(&[]), quiet(&[]), quiet(&[])]);
+    }
+    run_after(&announced, true, &[toggle(F7)], steps);
+    assert_eq!(announced.load(Ordering::Relaxed), PROVEN_PRESSES);
+    let (_, waits) = run_after(
+        &announced,
+        true,
+        &[toggle(F7)],
+        vec![quiet(&[]), quiet(&[]), quiet(&[])],
+    );
+    assert_eq!(waits, [TICK, TICK, TICK, None]);
 }
 
 #[test]
@@ -353,10 +451,16 @@ fn the_watch_ends_when_nobody_listens() {
         waits: Vec::new(),
     };
     let calls = RefCell::new(0);
-    watch(&mut source, &[toggle(F7)], &stop, &|_, _| {
-        *calls.borrow_mut() += 1;
-        false
-    });
+    watch(
+        &mut source,
+        &[toggle(F7)],
+        &stop,
+        &AtomicU8::new(0),
+        &|_, _| {
+            *calls.borrow_mut() += 1;
+            false
+        },
+    );
     assert_eq!(*calls.borrow(), 1);
     assert_eq!(source.waits.len(), 1, "it stopped at the first refusal");
 }

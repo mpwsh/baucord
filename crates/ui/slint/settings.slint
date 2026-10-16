@@ -16,7 +16,7 @@
 // optional hint — with one spacing token between groups and a smaller
 // one inside them, so the eye reads label→control→hint as one unit.
 
-import { ScrollView, ListView, AboutSlint, Palette } from "std-widgets.slint";
+import { ScrollView, ListView, AboutSlint } from "std-widgets.slint";
 import { Icon, IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
@@ -244,11 +244,9 @@ export global SettingsLogic {
 
     callback save-and-close();
     /// The footer's Close: put back what was changed since the page
-    /// opened, then close. (Escape, Back and the arrow save, as Save
-    /// and close does.)
+    /// opened, then close. Escape, Back and the arrow do the same.
     callback discard-and-close();
     callback reset-defaults();
-    callback closed();
     // Another tab is showing: the meters run on Audio only.
     callback tab-shown();
     /// Licenses: a component or license group opened or
@@ -1531,6 +1529,23 @@ component SettingsNav inherits VerticalLayout {
     if root.narrow : Rectangle { }
 }
 
+/// A tab list (Settings', the admin panel's) that scrolls when the
+/// page is shorter than it — upright on an iPhone SE the phone's list
+/// is 584 px between a 52 px bar and the footer, 49 px too many; on its
+/// side a phone has 375 px for the wide column's 384 — and pans under a
+/// finger (ANDROID-SPEC.md D27). With room to spare it is the page's
+/// height, so a stretch in the list still pushes its last group down.
+component NavScroll inherits ScrollView {
+    mouse-drag-pan-enabled: State.touch-host;
+    // The list sits in a layout of this component's own: Slint sizes a
+    // scroll view's content from the layouts it finds where the scroll
+    // view is defined, and a list passed in from outside counted as
+    // nothing — it never scrolled.
+    VerticalLayout {
+        @children
+    }
+}
+
 /// The selected section, scrolling: the wide layout's right column,
 /// the narrow layout's second page.
 component SettingsContent inherits ScrollView {
@@ -1644,14 +1659,17 @@ export component SettingsPanel inherits FocusScope {
         if (self.recording) { root.focus(); }
     }
 
-    /// One step back: from a section to the list (narrow), else out
-    /// of Settings — saved, as the button does. The top bar's arrow
-    /// and Android's Back.
+    /// One step back: out of the footer's question, from a section to
+    /// the list (narrow), else out of Settings without keeping what
+    /// changed — the footer's Close; only Save and close keeps it. The
+    /// top bar's arrow, Escape and Android's Back.
     public function back() {
-        if (root.narrow && root.section-open) {
+        if (root.reset-asking) {
+            root.reset-asking = false;
+        } else if (root.narrow && root.section-open) {
             root.section-open = false;
         } else {
-            SettingsLogic.save-and-close();
+            SettingsLogic.discard-and-close();
         }
     }
 
@@ -1681,9 +1699,13 @@ export component SettingsPanel inherits FocusScope {
         Rectangle {
             width: 188px;
             background: Theme.surface;
-            SettingsNav {
-                tab: root.tab;
-                picked(i) => { root.tab = i; }
+            NavScroll {
+                width: 100%;
+                height: 100%;
+                SettingsNav {
+                    tab: root.tab;
+                    picked(i) => { root.tab = i; }
+                }
             }
         }
         VerticalLayout {
@@ -1728,15 +1750,17 @@ export component SettingsPanel inherits FocusScope {
                 }
             }
         }
-        if !root.section-open : SettingsNav {
+        if !root.section-open : NavScroll {
             vertical-stretch: 1;
-            narrow: true;
-            tab: root.tab;
-            picked(i) => {
-                root.tab = i;
-                root.section-open = true;
+            SettingsNav {
+                narrow: true;
+                tab: root.tab;
+                picked(i) => {
+                    root.tab = i;
+                    root.section-open = true;
+                }
+                reset-asked => { root.reset-asking = true; }
             }
-            reset-asked => { root.reset-asking = true; }
         }
         if root.section-open && root.tab != 9 : SettingsContent {
             tab: root.tab;
@@ -1751,4 +1775,4 @@ export component SettingsPanel inherits FocusScope {
 }
 
 // Shared with the admin panel (admin.slint).
-export { NavItem, PanelHeader }
+export { NavItem, NavScroll, PanelHeader }

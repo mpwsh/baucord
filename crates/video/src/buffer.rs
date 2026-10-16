@@ -127,8 +127,6 @@ pub struct BufferedPacket {
 pub struct JitterBufferStats {
     /// Packets pushed into the buffer.
     pub packets_received: u64,
-    /// Packets released to the decoder.
-    pub packets_delivered: u64,
     /// Packets passed over for a newer keyframe: the backlog hit its cap,
     /// or the next frame was too far behind live.
     pub packets_dropped_overflow: u64,
@@ -278,7 +276,6 @@ impl VideoJitterBuffer {
             }
             let packet = self.pending.pop_front()?;
             self.next_seq = Some(next.wrapping_add(1));
-            self.stats.packets_delivered += 1;
             self.stats.current_depth = self.pending.len();
             return Some(packet);
         }
@@ -340,6 +337,16 @@ impl VideoJitterBuffer {
         self.next_seq = None;
         self.unprimed_since = Some(now);
         self.want_keyframe = true;
+    }
+
+    /// Let go of what is buffered for a stream nobody sees any more:
+    /// nothing was lost, so none of it counts as dropped (the viewing
+    /// telemetry reports drops, review 2026-10 P3-36), and no keyframe
+    /// is asked for until it is seen again ([`Self::wait_for_keyframe`]).
+    pub fn set_aside(&mut self) {
+        self.pending.clear();
+        self.stats.current_depth = 0;
+        self.next_seq = None;
     }
 
     /// Number of packets currently buffered.

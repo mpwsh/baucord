@@ -8,9 +8,9 @@
 //! no public API reads the switch, so an on-screen chime is posted as a
 //! notification the delegate presents with its sound only — and iOS
 //! applies the switch and Focus to it as to any notification. Such a
-//! notice's identifier starts with [`ON_SCREEN`]. The sound is the app's
-//! own DM chime, written once per launch into `Library/Sounds`, where
-//! notification sounds are looked up.
+//! notice's identifier starts with [`ON_SCREEN`]. The sounds are the
+//! app's own chimes (a DM's, a mention's), written once per launch into
+//! `Library/Sounds`, where notification sounds are looked up.
 //!
 //! The permission is asked on the first connect (`keep_alive`), not at
 //! launch: by then the user knows what the app is for. What the user
@@ -45,10 +45,13 @@ use objc2_user_notifications::{
 /// The identifier prefix of a sound-only notice (the app is on screen).
 const ON_SCREEN: &str = "fg:";
 
-/// The chime's file in `Library/Sounds`.
-const SOUND_FILE: &str = "baucord-message.wav";
+/// The chimes' files in `Library/Sounds`, by tone: a mention rang
+/// with the DM's chime (review 2026-10, P3-12).
+fn sound_file(tone: frontend::host::Tone) -> String {
+    format!("baucord-{}.wav", tone.name())
+}
 
-/// Whether [`SOUND_FILE`] was written this launch (else the system's
+/// Whether the [`sound_file`]s were written this launch (else the system's
 /// default sound plays).
 static OWN_SOUND: AtomicBool = AtomicBool::new(false);
 
@@ -137,10 +140,16 @@ pub fn install(config: Option<&Path>) {
         return;
     };
     refresh();
-    let wav = frontend::host::alert_sound_wav();
-    let written = !wav.is_empty()
-        && std::fs::create_dir_all(&sounds).is_ok()
-        && std::fs::write(sounds.join(SOUND_FILE), wav).is_ok();
+    let written = std::fs::create_dir_all(&sounds).is_ok()
+        && [
+            frontend::host::Tone::DirectMessage,
+            frontend::host::Tone::Mention,
+        ]
+        .into_iter()
+        .all(|tone| {
+            let wav = frontend::host::chime_wav(tone);
+            !wav.is_empty() && std::fs::write(sounds.join(sound_file(tone)), wav).is_ok()
+        });
     OWN_SOUND.store(written, Ordering::Relaxed);
     if !written {
         log::warn!(
@@ -225,7 +234,7 @@ pub fn post(notice: &Notice) {
     content.setThreadIdentifier(&NSString::from_str(&notice.key));
     if notice.sound {
         let sound = if OWN_SOUND.load(Ordering::Relaxed) {
-            UNNotificationSound::soundNamed(&NSString::from_str(SOUND_FILE))
+            UNNotificationSound::soundNamed(&NSString::from_str(&sound_file(notice.tone)))
         } else {
             UNNotificationSound::defaultSound()
         };

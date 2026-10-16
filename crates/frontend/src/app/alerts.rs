@@ -14,7 +14,7 @@
 // its own, which is the whole point of the file split.
 #[allow(clippy::wildcard_imports)]
 use super::*;
-use crate::notice::{ChimeRoute, Notice, NoticeKind};
+use crate::notice::{ChimeRoute, Notice, NoticeKind, Tone};
 
 /// The notification key of the call starting.
 const JOIN_KEY: &str = "join";
@@ -54,7 +54,7 @@ impl AppState {
         match crate::host::chime_route() {
             // Out of a voice room an Android engine plays nothing (no
             // stream is open, D53): the host plays the chime itself.
-            ChimeRoute::App if !self.voice_in_room && crate::host::play_chime() => {}
+            ChimeRoute::App if !self.voice_in_room && crate::host::play_chime(notice.tone) => {}
             ChimeRoute::App => {
                 self.voice.tx.send(VoiceControl::PlaySound(sound)).ok();
             }
@@ -74,8 +74,20 @@ impl AppState {
     /// screen on a phone it becomes a notification whose tap opens the
     /// conversation — the notification makes the sound then, so the
     /// engine does not chime under it.
-    pub(super) fn alert_direct_message(&self, from: client::UserId, sender: &str, text: &str) {
-        let sound = self.settings.sounds.direct_message_on();
+    pub(super) fn alert_direct_message(&mut self, from: client::UserId, sender: &str, text: &str) {
+        // A burst from one person sounds once: the next alert within
+        // 10 s of the last one that sounded is posted (and shown)
+        // silently — each DM of a burst rang and bannered (review
+        // 2026-10, P3-15).
+        let recent = self
+            .session
+            .dm_sounded
+            .get(&from)
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(10));
+        let sound = self.settings.sounds.direct_message_on() && !recent;
+        if sound {
+            self.session.dm_sounded.insert(from, Instant::now());
+        }
         let notice = Notice {
             kind: NoticeKind::Message,
             key: dm_key(&from),
@@ -85,6 +97,7 @@ impl AppState {
             open_dm: Some(hex(&from)),
             sound,
             on_screen: false,
+            tone: Tone::DirectMessage,
         };
         let notify = crate::host::notifies()
             && !host_visible()
@@ -112,6 +125,7 @@ impl AppState {
                 open_dm: None,
                 sound: true,
                 on_screen: true,
+                tone: Tone::Mention,
             },
         );
     }
@@ -154,6 +168,7 @@ impl AppState {
             open_dm: None,
             sound: true,
             on_screen: false,
+            tone: Tone::DirectMessage,
         });
     }
 
@@ -219,13 +234,20 @@ impl AppState {
             .map(|m| m.name.clone())
             .filter(|n| !n.is_empty())
             .or_else(|| {
-                self.session
-                    .details
-                    .iter()
-                    .find(|(_, (id, _))| *id == user)
-                    .map(|(client, _)| self.username_of(*client))
+                self.session_of(&user)
+                    .map(|client| self.username_of(client))
             })
             .unwrap_or_default();
+        // A page over the chat goes first: the conversation used to
+        // open hidden under Settings, the admin panel or a stream, and
+        // the next Back ended the app (review 2026-10, P3-19). Settings
+        // closes as its Close does.
+        crate::settingsui::close_if_open(self);
+        crate::adminui::close(self);
+        crate::viewers::close_gallery(self);
+        if let Some(id) = self.page_viewer_id() {
+            self.handle_unwatch_peer(id);
+        }
         self.open_dm(user, &name);
     }
 }

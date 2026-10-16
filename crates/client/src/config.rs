@@ -129,12 +129,18 @@ pub fn build_bind_string(ctrl: bool, alt: bool, shift: bool, code: &str) -> Stri
 // ── Settings sub-sections ───────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+// A key missing from the file takes its default, not the whole file
+// with it (review 2026-10, P3-43).
+#[serde(default)]
 pub struct UserSettings {
     pub nickname: String,
 }
 
 /// How the app itself reads and sounds — nothing a server sees.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+// A key missing from the file takes its default, not the whole file
+// with it (review 2026-10, P3-43).
+#[serde(default)]
 pub struct UiSettings {
     /// Multiplier on every font size in the UI (1.0 = the design size).
     #[serde(default = "default_text_scale")]
@@ -208,6 +214,9 @@ fn default_image_max_kb() -> u32 {
 // `settings.json`; the file format is the reason, not a state machine.
 #[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+// A key missing from the file takes its default, not the whole file
+// with it (review 2026-10, P3-43).
+#[serde(default)]
 pub struct SoundSettings {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -286,6 +295,9 @@ impl SoundSettings {
 /// follow the phone's own silent, vibrate and Do Not Disturb modes.
 /// The desktop has none yet; the fields are kept there all the same.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+// A key missing from the file takes its default, not the whole file
+// with it (review 2026-10, P3-43).
+#[serde(default)]
 pub struct NotificationSettings {
     /// A direct message arrives while the app is in the background.
     #[serde(default = "default_true")]
@@ -307,6 +319,9 @@ impl Default for NotificationSettings {
 
 /// What happens when the app launches.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+// A key missing from the file takes its default, not the whole file
+// with it (review 2026-10, P3-43).
+#[serde(default)]
 pub struct StartupSettings {
     /// Connect to the default server as soon as the connect screen
     /// would appear (needs a nickname).
@@ -345,6 +360,9 @@ pub enum NameStyle {
 /// The client-held profile (spec §7.1): name color, name style, and
 /// whether an avatar file sits next to the settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+// A key missing from the file takes its default, not the whole file
+// with it (review 2026-10, P3-43).
+#[serde(default)]
 pub struct ProfileSettings {
     /// `0xRRGGBB`; `None` = the theme's default name color.
     #[serde(default)]
@@ -429,6 +447,9 @@ const OFFICIAL_ADDRESS: &str = "216.238.121.18:51000";
 const OFFICIAL_ADDRESS_OLD_PORT: &str = "216.238.121.18:5000";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// A key missing from the file takes its default, not the whole file
+// with it (review 2026-10, P3-43).
+#[serde(default)]
 pub struct AudioInputSettings {
     pub device: Option<String>,
     pub gain: f32,
@@ -444,6 +465,9 @@ impl Default for AudioInputSettings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// A key missing from the file takes its default, not the whole file
+// with it (review 2026-10, P3-43).
+#[serde(default)]
 pub struct AudioOutputSettings {
     pub device: Option<String>,
     pub gain: f32,
@@ -459,6 +483,9 @@ impl Default for AudioOutputSettings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// A key missing from the file takes its default, not the whole file
+// with it (review 2026-10, P3-43).
+#[serde(default)]
 pub struct AudioSettings {
     pub input: AudioInputSettings,
     pub output: AudioOutputSettings,
@@ -495,6 +522,9 @@ impl Default for AudioSettings {
 /// window, so every launch centres it on the monitor it opens on.
 /// Older files still carry `x`/`y`; serde ignores them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// A key missing from the file takes its default, not the whole file
+// with it (review 2026-10, P3-43).
+#[serde(default)]
 pub struct WindowSettings {
     pub width: i32,
     pub height: i32,
@@ -513,6 +543,9 @@ impl Default for WindowSettings {
 /// with these, and the global share hotkey starts a stream with them
 /// directly when Baucord is not the focused window.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+// A key missing from the file takes its default, not the whole file
+// with it (review 2026-10, P3-43).
+#[serde(default)]
 pub struct ShareSettings {
     /// Quality preset key (`video::Quality::key()`, e.g. "fhd30").
     /// Stored as a string so settings files survive preset reordering
@@ -603,6 +636,9 @@ pub struct Settings {
 /// How much `baucord.log` records (1.1.5). `RUST_LOG` in the
 /// environment still wins when set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// A key missing from the file takes its default, not the whole file
+// with it (review 2026-10, P3-43).
+#[serde(default)]
 pub struct LoggingSettings {
     /// One of `error`, `warn`, `info`, `debug`, `trace`.
     #[serde(default = "default_log_level")]
@@ -807,6 +843,9 @@ impl Settings {
                     path.display()
                 );
                 settings.save_at(path);
+                if let (Some(from), Some(to)) = (old.parent(), path.parent()) {
+                    migrate_neighbours(from, to);
+                }
                 return *settings;
             }
         }
@@ -850,8 +889,22 @@ impl Settings {
                 return;
             }
         };
+        // The file already says this: nothing to write. Every save
+        // rewrote it — and its backup — whatever changed (review
+        // 2026-10, P3-43).
+        if fs::read_to_string(path).is_ok_and(|on_disk| on_disk == contents) {
+            return;
+        }
         let staged = with_suffix(path, ".tmp");
-        let written = fs::write(&staged, &contents).and_then(|()| {
+        // On the disk before it replaces the old file: a power cut after
+        // the rename must not leave an empty one.
+        let write_synced = |at: &Path| -> std::io::Result<()> {
+            use std::io::Write as _;
+            let mut file = fs::File::create(at)?;
+            file.write_all(contents.as_bytes())?;
+            file.sync_all()
+        };
+        let written = write_synced(&staged).and_then(|()| {
             if path.exists() {
                 // Best effort: without a backup the save still stands.
                 let _ = fs::rename(path, with_suffix(path, ".bak"));
@@ -863,7 +916,7 @@ impl Settings {
         let written = written.or_else(|e| {
             let _ = fs::remove_file(&staged);
             log::debug!("settings not replaced by rename ({e}); writing in place");
-            fs::write(path, &contents)
+            write_synced(path)
         });
         match written {
             Ok(()) => info!("Settings saved to {}", path.display()),
@@ -1055,10 +1108,31 @@ pub fn avatar_path() -> PathBuf {
 }
 
 /// Where other people's avatars are cached by hash (spec §7.1: one
-/// transfer per client per change): `avatars/<hex>` next to settings.
+/// transfer per client per change): `avatar-cache/<hex>` next to
+/// settings. Only a picture some look names as its avatar is written
+/// here.
 #[must_use]
 pub fn avatar_cache_dir() -> PathBuf {
-    config_base_dir().join("avatars")
+    config_base_dir().join("avatar-cache")
+}
+
+/// Delete the avatar cache's folder up to 1.2.1, `avatars/`: every
+/// received chat picture went into it too, DM pictures included, and
+/// nothing ever emptied it (review 2026-10, P0-1). The avatars in it
+/// are fetched again, one transfer each. Slow on a big folder: call it
+/// off the UI thread.
+pub fn remove_old_avatar_cache() {
+    let old = config_base_dir().join("avatars");
+    if !old.is_dir() {
+        return;
+    }
+    match std::fs::remove_dir_all(&old) {
+        Ok(()) => log::info!("removed the old picture cache {}", old.display()),
+        Err(e) => log::warn!(
+            "could not remove the old picture cache {}: {e}",
+            old.display()
+        ),
+    }
 }
 
 /// Whether settings live next to the executable (a portable install),
@@ -1174,6 +1248,25 @@ pub fn regenerate_client_key() -> Result<std::sync::Arc<transport::ClientKey>, S
         .map_err(|e| e.to_string())
 }
 
+/// The files that live beside settings.json and belong with it: the
+/// identity (who the user is to every server) and their own avatar.
+/// Settings moving to a new folder left them behind, and the user was
+/// silently someone new (review 2026-10, P2-17; plan CLI-7). Copied, not
+/// moved — the old folder stays as it was — and only where the new one
+/// has none.
+fn migrate_neighbours(from: &Path, to: &Path) {
+    for name in ["identity.key", "avatar.png"] {
+        let (old, new) = (from.join(name), to.join(name));
+        if new.exists() || !old.is_file() {
+            continue;
+        }
+        match fs::copy(&old, &new) {
+            Ok(_) => info!("Migrated {} to {}", old.display(), new.display()),
+            Err(e) => warn!("Could not migrate {}: {e}", old.display()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1220,6 +1313,61 @@ mod tests {
         assert_eq!(migrated.user.nickname, "from an old install");
         assert!(path.exists(), "saved at the new place");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A section missing one key keeps the rest of the file; a save
+    /// that changes nothing writes nothing (review 2026-10, P3-43).
+    #[test]
+    fn a_missing_key_takes_its_default_and_an_unchanged_save_writes_nothing() {
+        let dir = scratch("serde-default");
+        let path = dir.join("settings.json");
+        // `audio.gate_threshold` and `window.height` left out.
+        fs::write(
+            &path,
+            r#"{"user":{"nickname":"kept"},"audio":{"input":{"device":null,"gain":1.0},"output":{"device":null,"gain":0.5}},"window":{"width":800}}"#,
+        )
+        .expect("write");
+        let loaded = Settings::load_at(&path, &[]);
+        assert_eq!(loaded.user.nickname, "kept");
+        assert!((loaded.audio.output.gain - 0.5).abs() < f32::EPSILON);
+        assert_eq!(loaded.window.width, 800);
+        assert_eq!(loaded.window.height, WindowSettings::default().height);
+        loaded.save_at(&path);
+        let backup = dir.join("settings.json.bak");
+        let _ = fs::remove_file(&backup);
+        loaded.save_at(&path);
+        assert!(!backup.exists(), "nothing changed: nothing rewritten");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The identity and the avatar move with the settings: the user is
+    /// not someone new in the new folder (review 2026-10, P2-17).
+    #[test]
+    fn a_migration_brings_the_identity_and_avatar_along() {
+        let old_dir = scratch("migrate-old");
+        let new_dir = scratch("migrate-new");
+        let old = old_dir.join("settings.json");
+        named("moved").save_at(&old);
+        fs::write(old_dir.join("identity.key"), b"key bytes").expect("write");
+        fs::write(old_dir.join("avatar.png"), b"png bytes").expect("write");
+        let path = new_dir.join("settings.json");
+        assert_eq!(
+            Settings::load_at(&path, std::slice::from_ref(&old))
+                .user
+                .nickname,
+            "moved"
+        );
+        assert_eq!(
+            fs::read(new_dir.join("identity.key")).expect("copied"),
+            b"key bytes"
+        );
+        assert_eq!(
+            fs::read(new_dir.join("avatar.png")).expect("copied"),
+            b"png bytes"
+        );
+        assert!(old_dir.join("identity.key").exists(), "copied, not moved");
+        let _ = fs::remove_dir_all(&old_dir);
+        let _ = fs::remove_dir_all(&new_dir);
     }
 
     /// Each save keeps the one before it, and that is what loads when

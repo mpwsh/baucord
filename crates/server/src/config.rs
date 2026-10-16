@@ -16,9 +16,6 @@ pub struct Config {
     pub server: ServerSettings,
     pub network: NetworkSettings,
     pub limits: LimitSettings,
-    /// Legacy (1.0). Still parsed so old files load; never written.
-    #[serde(skip_serializing)]
-    pub authentication: AuthSettings,
     pub identity: IdentitySettings,
     pub persistence: PersistenceSettings,
     pub logging: LoggingSettings,
@@ -112,6 +109,11 @@ pub struct NetworkSettings {
     pub max_clients: usize,
 }
 
+/// The most `limits.max_chat_bytes` may be: a quarter of a history
+/// page's budget, so one message with its author and ids always fits a
+/// page (review 2026-10, P2-26).
+pub const MAX_CHAT_BYTES_LIMIT: usize = protocol::LIST_ITEMS_BUDGET / 4;
+
 /// Admission control. These are the real bandwidth ceiling: worst-case
 /// server egress ≈ `max_sharers × max_viewers_per_stream × stream bitrate`
 /// (plus voice, which is negligible). Defaults: 8 × 16 × ~4 Mbit/s ≈
@@ -125,7 +127,8 @@ pub struct LimitSettings {
     pub max_sharers: usize,
     /// Viewers allowed per stream.
     pub max_viewers_per_stream: usize,
-    /// Chat messages longer than this (bytes) are truncated.
+    /// Chat messages longer than this (bytes) are truncated. At most
+    /// [`MAX_CHAT_BYTES_LIMIT`]: one message must fit a history page.
     pub max_chat_bytes: usize,
     /// Per-client *transfer* budget: KiB of accepted uploads — files,
     /// pictures, and the legacy chat-image relay — per sliding minute.
@@ -136,7 +139,9 @@ pub struct LimitSettings {
     #[serde(alias = "max_image_kb_per_minute")]
     pub max_transfer_kb_per_minute: usize,
     /// Server-wide transfer budget, KiB per sliding minute, over all
-    /// clients; `0` disables uploads entirely. (Was
+    /// clients; `0` disables uploads entirely. Chat pictures and stored
+    /// files are counted apart, and the files' never under the file cap
+    /// (50 MB), or the largest file could never be sent. (Was
     /// `max_image_kb_per_minute_global`.)
     #[serde(alias = "max_image_kb_per_minute_global")]
     pub max_transfer_kb_per_minute_global: usize,
@@ -168,18 +173,6 @@ impl Default for ChatLimit {
             per_secs: 5,
         }
     }
-}
-
-/// The 1.0 password door. Admission is by invite and device key
-/// since 1.1 (spec §3); this section is read for compatibility and
-/// warned about.
-#[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AuthSettings {
-    /// 1.0: clients had to send this shared password. Ignored since
-    /// 1.1 (with a warning at startup) — invites are the only door.
-    pub secure: bool,
-    pub password: Option<String>,
 }
 
 /// Where the server keeps its Ed25519 identity key and certificate.
@@ -298,12 +291,41 @@ pub struct LoggingSettings {
     pub file: String,
 }
 
+/// The top-level keys of a config file the server does not read. Serde
+/// skips them without a word, so a misspelt section, or one a version
+/// dropped (1.0's `authentication`), would
+/// go unnoticed.
+fn unknown_sections(contents: &str) -> Vec<String> {
+    let Ok(serde_yaml::Value::Mapping(file)) = serde_yaml::from_str(contents) else {
+        return Vec::new();
+    };
+    let Ok(serde_yaml::Value::Mapping(known)) = serde_yaml::to_value(Config::default()) else {
+        return Vec::new();
+    };
+    file.keys()
+        .filter_map(serde_yaml::Value::as_str)
+        .filter(|key| !known.contains_key(*key))
+        .map(str::to_owned)
+        .collect()
+}
+
 impl Config {
     /// # Errors
     /// Unreadable file or invalid YAML.
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
         let contents = fs::read_to_string(path)?;
-        Ok(serde_yaml::from_str(&contents)?)
+        let config = serde_yaml::from_str(&contents)?;
+        for key in unknown_sections(&contents) {
+            if key == "authentication" {
+                log::warn!(
+                    "server.yaml has an `authentication:` section; since 1.1 it is ignored — \
+                     invites are the only door"
+                );
+            } else {
+                log::warn!("server.yaml: `{key}:` is not a section this server reads; ignored");
+            }
+        }
+        Ok(config)
     }
 
     /// Write this config to a YAML file.
@@ -468,7 +490,6 @@ impl Default for Config {
             server: ServerSettings::default(),
             network: NetworkSettings::default(),
             limits: LimitSettings::default(),
-            authentication: AuthSettings::default(),
             identity: IdentitySettings::default(),
             persistence: PersistenceSettings::default(),
             logging: LoggingSettings::default(),
@@ -663,15 +684,23 @@ mod tests {
         assert_eq!(config.logging.link_stats_interval_secs, 0);
         assert_eq!(config.identity.dir, "/app/data");
         assert!(config.persistence.enabled);
+        // Where the relative default put it in the container (WORKDIR
+        // /app), now independent of it.
+        assert_eq!(config.persistence.path, "/app/data/baucord/baucord.db");
         assert_eq!(config.persistence.history.retain_days, 90);
         assert_eq!(config.persistence.files.retain_days, 30);
         assert_eq!(config.persistence.telemetry.retain_days, 30);
         let names: Vec<&str> = config.channels.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["General", "Gaming"]);
-        assert!(
-            config.authentication.password.is_none(),
-            "no 1.0 room password"
-        );
+    }
+
+    #[test]
+    fn sections_the_server_does_not_read_are_named() {
+        let yaml = "server:\n  port: 1\nauthentication:\n  secure: true\nchanels: []\n";
+        assert_eq!(unknown_sections(yaml), ["authentication", "chanels"]);
+        let example = include_str!("../../../config/baucord.example.yaml");
+        assert!(unknown_sections(example).is_empty());
+        assert!(unknown_sections("not: [valid").is_empty());
     }
 
     #[test]

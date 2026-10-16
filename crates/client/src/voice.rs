@@ -22,7 +22,7 @@ use std::{
 use audio::{
     AecMode, AecReport, AudioStats, PeerAudioSettings, SoundType, VoiceChat, VoiceChatConfig,
 };
-use crossbeam_channel::{bounded, select, Receiver, Sender};
+use crossbeam_channel::{select, unbounded, Receiver, Sender};
 use log::info;
 
 use crate::{
@@ -35,10 +35,11 @@ use crate::{
 
 #[derive(Debug)]
 pub enum VoiceControl {
-    /// Boxed: `Settings` is by far the largest payload on this channel
-    /// and every other message would pay for it otherwise.
+    /// The engine's configuration only ([`engine_config`]): the whole
+    /// `Settings` was cloned for it, servers and keybinds and all
+    /// (review 2026-10, P3-41). Boxed: the largest payload here.
     Start {
-        settings: Box<Settings>,
+        config: Box<VoiceChatConfig>,
         /// The session's client id. `None` is an engine with no session
         /// behind it — Settings' meter or a microphone test while not
         /// connected: nothing it hears can leave the device for as long
@@ -58,6 +59,11 @@ pub enum VoiceControl {
     /// room; on the desktop the streams stay open and capture drops its
     /// samples (`VoiceChat::set_presence`).
     SetInRoom(bool),
+    /// Whether anyone can hear what is sent: off for a microphone test,
+    /// the Settings meter and a room with nobody else in it, when the
+    /// encoder gets nothing (`VoiceChat::set_transmit`, review 2026-10
+    /// P2-37).
+    SetTransmit(bool),
     SetMuted(bool),
     /// Transmit only while the key is held (the gate still applies).
     SetPushToTalk(bool),
@@ -156,17 +162,16 @@ impl SharedAudioState {
 
 // ── Config conversion ───────────────────────────────────────────────────
 
-fn settings_to_config(s: &Settings) -> VoiceChatConfig {
+/// The voice engine's configuration from the user's settings: what
+/// `VoiceControl::Start` carries.
+#[must_use]
+pub fn engine_config(s: &Settings) -> VoiceChatConfig {
     VoiceChatConfig {
         input_device: s.audio.input.device.clone(),
         output_device: s.audio.output.device.clone(),
         gate_threshold: s.audio.gate_threshold,
-        noise_suppression: true,
         input_gain: s.audio.input.gain,
         output_gain: s.audio.output.gain,
-        agc_enabled: true,
-        agc_target_rms: 0.10,
-        compressor_enabled: true,
         echo_cancellation: s.audio.echo_cancellation,
     }
 }
@@ -189,8 +194,15 @@ impl VoiceThreadHandle {
         is_testing_mic: Arc<AtomicBool>,
         wake: WakeFn,
     ) -> Self {
-        let (tx, control_rx) = bounded::<VoiceControl>(64);
-        let (event_tx, event_rx) = bounded::<VoiceEvent>(32);
+        // Unbounded both ways (ARCHITECTURE.md §6's rule for channels
+        // between two threads that each send to the other): joining a
+        // server with 31+ people online queued more AddPeer and
+        // SetPeerAudio commands than the 64 slots while the engine was
+        // opening its devices, and the UI blocked on the send until they
+        // opened (review 2026-10, P2-15). Both are a few small commands
+        // a second at most.
+        let (tx, control_rx) = unbounded::<VoiceControl>();
+        let (event_tx, event_rx) = unbounded::<VoiceEvent>();
         let shared = SharedAudioState::new();
 
         let shared_clone = shared.clone();
@@ -238,15 +250,14 @@ impl Drop for VoiceThreadHandle {
 /// hint and jitter depth are recorded for after-the-fact diagnosis.
 const STATS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
-/// The voice loop's longest sleep while an engine runs: device
-/// supervision (`VoiceChat::service`) and the stats line. Commands and
-/// the speaking light's edges wake it at once, and packets never pass
-/// through it, so nothing else waits on this (review P1-5). It ticked
-/// every 20 ms in a room — fifty wakes a second to copy meters nobody
-/// read between redraws and to poll the speaking light. A second also
-/// bounds how long a stream that failed (a device unplugged) waits for
-/// its reopen.
-const SERVICE_TICK: Duration = Duration::from_secs(1);
+/// The voice loop's sleep when nothing is due: commands, the speaking
+/// light's edges and the engine's trouble (a failed stream, a moved
+/// default) wake it, and the engine says when its supervision is next
+/// due (`VoiceChat::next_service`); packets never pass through it
+/// (review P1-5). It ticked every second whenever an engine existed —
+/// a phone's lobby with nothing open included — and before that every
+/// 20 ms (review 2026-10, P2-41).
+const IDLE_WAIT: Duration = Duration::from_hours(1);
 
 // Mute, deafen, push-to-talk and the rest are independent switches
 // the loop reads every packet; their combinations are all valid.
@@ -262,6 +273,8 @@ struct VoiceLoopState {
     /// In a voice room (`SetInRoom`); out of one a phone keeps its
     /// microphone closed and the desktop drops the samples.
     in_room: bool,
+    /// `SetTransmit`, kept for the next engine.
+    transmit: bool,
     /// The engine has no session behind it (`Start` without a client
     /// id): what it hears stays here, and mute and push-to-talk wait.
     sessionless: bool,
@@ -270,6 +283,9 @@ struct VoiceLoopState {
     /// and the UI are told after this pass's commands.
     relink: bool,
     last_stats_log: Instant,
+    /// Packets sent and received and restarts at the last stats line:
+    /// an engine that moved none is not logged again.
+    stats_logged: (u64, u64, u64),
     /// `aec_generation` of the engine whose report `shared.aec` holds
     /// (`None` = no engine).
     aec_published: Option<u64>,
@@ -284,19 +300,35 @@ impl VoiceLoopState {
             ptt_mode: false,
             ptt_held: false,
             in_room: true,
+            transmit: true,
             sessionless: false,
             running: true,
             relink: false,
             last_stats_log: Instant::now(),
+            stats_logged: (0, 0, 0),
             aec_published: None,
         }
     }
 
+    /// When the loop must wake without being rung: the engine's next
+    /// supervision, and in a voice room the next stats line.
+    fn next_wake(&self, voice: &VoiceChat) -> Option<Instant> {
+        let stats = self
+            .in_room
+            .then(|| self.last_stats_log + STATS_LOG_INTERVAL);
+        match (voice.next_service(), stats) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
     /// Write the audio engine's counters to the log every
-    /// [`STATS_LOG_INTERVAL`] while an engine is running, and hand the
-    /// same numbers to the network thread for the telemetry sample
-    /// (spec §9.1) — packets sent, ladder state, overruns, devices: what
-    /// tells "his network" from "his machine" in the server log.
+    /// [`STATS_LOG_INTERVAL`] in a voice room, and hand the same numbers
+    /// to the network thread for the telemetry sample (spec §9.1) —
+    /// packets sent, ladder state, overruns, devices: what tells "his
+    /// network" from "his machine" in the server log. Only when a packet
+    /// moved since the last: the same line every 10 s for an idle
+    /// engine said nothing (review 2026-10, P2-41).
     fn maybe_log_stats(&mut self, network_tx: &Sender<NetworkControl>) {
         let Some(voice) = self.vc.as_ref() else {
             return;
@@ -305,8 +337,17 @@ impl VoiceLoopState {
             return;
         }
         self.last_stats_log = Instant::now();
-        info!("audio stats: {}", voice.stats_summary());
         let s = voice.stats();
+        let moved = (
+            s.packets_sent.load(Relaxed),
+            s.packets_received.load(Relaxed),
+            s.stream_restarts.load(Relaxed),
+        );
+        if moved == self.stats_logged {
+            return;
+        }
+        self.stats_logged = moved;
+        info!("audio stats: {}", voice.stats_summary());
         let (input_device, output_device) = voice.opened_devices();
         let report_age_ms = s.uplink_report_age_ms();
         #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
@@ -369,11 +410,11 @@ impl VoiceLoopState {
     fn handle_control(&mut self, ctrl: VoiceControl, event_tx: &Sender<VoiceEvent>, wake: &WakeFn) {
         match ctrl {
             VoiceControl::Start {
-                settings,
+                config,
                 our_client_id: id,
                 in_room,
             } => {
-                let config = settings_to_config(&settings);
+                let config = *config;
                 // The old engine goes first: its device state (Android's
                 // communication mode, iOS's voice-processing unit and
                 // session mode) is process-wide, and leaving it after the
@@ -388,6 +429,7 @@ impl VoiceLoopState {
                 self.in_room = in_room;
                 self.sessionless = id.is_none();
                 let mut voice = VoiceChat::new(config);
+                voice.set_transmit(self.transmit);
                 voice.set_presence(in_room, !self.effective_mute());
                 match voice.start() {
                     audio::StartOutcome::Started => {}
@@ -430,6 +472,12 @@ impl VoiceLoopState {
             VoiceControl::SetInRoom(in_room) => {
                 self.in_room = in_room;
                 self.apply_mute();
+            }
+            VoiceControl::SetTransmit(on) => {
+                self.transmit = on;
+                if let Some(v) = &self.vc {
+                    v.set_transmit(on);
+                }
             }
             VoiceControl::SetMuted(muted) => {
                 self.user_muted = muted;
@@ -547,22 +595,31 @@ fn run_voice_loop(
     let mut state = VoiceLoopState::new();
 
     while state.running {
-        match state.vc.as_ref().map(VoiceChat::speaking_edges) {
+        let engine = state
+            .vc
+            .as_ref()
+            .map(|v| (v.speaking_edges(), v.trouble(), state.next_wake(v)));
+        match engine {
             // Idle: no engine, nothing to supervise — block until a
             // command arrives.
             None => match control_rx.recv() {
                 Ok(ctrl) => state.handle_control(ctrl, &event_tx, &wake),
                 Err(_) => state.running = false,
             },
-            Some(edges) => select! {
-                recv(control_rx) -> msg => match msg {
-                    Ok(ctrl) => state.handle_control(ctrl, &event_tx, &wake),
-                    Err(_) => state.running = false,
-                },
-                // The speaking light changed: compared below.
-                recv(edges) -> _ => {},
-                default(SERVICE_TICK) => {},
-            },
+            Some((edges, trouble, due)) => {
+                let wait = due.map_or(IDLE_WAIT, |at| at.saturating_duration_since(Instant::now()));
+                select! {
+                    recv(control_rx) -> msg => match msg {
+                        Ok(ctrl) => state.handle_control(ctrl, &event_tx, &wake),
+                        Err(_) => state.running = false,
+                    },
+                    // The speaking light changed: compared below.
+                    recv(edges) -> _ => {},
+                    // A stream failed or a default moved: serviced below.
+                    recv(trouble) -> _ => {},
+                    default(wait) => {},
+                }
+            }
         }
 
         // Drain any queued control messages
@@ -642,7 +699,7 @@ mod tests {
     use super::*;
 
     fn tell(state: &mut VoiceLoopState, ctrl: VoiceControl) {
-        let (event_tx, _event_rx) = bounded::<VoiceEvent>(4);
+        let (event_tx, _event_rx) = crossbeam_channel::bounded::<VoiceEvent>(4);
         let wake: WakeFn = Arc::new(|| {});
         state.handle_control(ctrl, &event_tx, &wake);
     }

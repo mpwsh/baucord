@@ -49,6 +49,8 @@ jobs:
 
       - name: Resolve image tags
         id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           SHA=$(git rev-parse --short=7 HEAD)
@@ -68,8 +70,17 @@ jobs:
             echo "::error::$TAG does not match the version in Cargo.toml ($CRATE)"
             exit 1
           fi
+          # `latest` only for the newest release: rebuilding an older
+          # tag, or a backport, moved it backwards, and a host pulling
+          # it met a database newer than its server and restart-looped
+          # (review 2026-10, P2-27).
+          NEWEST=$(gh api "repos/$GITHUB_REPOSITORY/tags" --paginate --jq '.[].name' \
+            | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V | tail -1)
           LATEST=true
           if [ "$PRERELEASE" = "true" ] || [[ "$VERSION" == *-* ]]; then
+            LATEST=false
+          elif [ "$TAG" != "$NEWEST" ]; then
+            echo "::notice::$TAG is not the newest release ($NEWEST): latest stays where it is"
             LATEST=false
           fi
           {
@@ -90,13 +101,32 @@ jobs:
           username: ${{ vars.DOCKERHUB_USER }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push image
+      # Built and started here before anything is pushed: a binary the
+      # runtime image cannot run (a newer glibc in the builder than in
+      # distroless, review 2026-10 P2-28) fails this step, not a host.
+      # The cache lives in the registry: a release's GitHub cache is
+      # scoped to its tag, and no later run could read it (P2-48).
+      - name: Build image
         uses: docker/build-push-action@v7
         with:
           context: .
           file: ${{ inputs.tag != '' && '.ci/Dockerfile' || 'Dockerfile' }}
           platforms: linux/amd64
-          push: ${{ steps.plan.outputs.push == 'true' }}
+          load: true
+          tags: baucord:smoke
+          cache-from: type=registry,ref=${{ env.DOCKERHUB_REPO }}:buildcache
+          cache-to: type=registry,ref=${{ env.DOCKERHUB_REPO }}:buildcache,mode=max
+
+      - name: Start the image once
+        run: docker run --rm baucord:smoke --help
+
+      - name: Push image
+        if: steps.plan.outputs.push == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ inputs.tag != '' && '.ci/Dockerfile' || 'Dockerfile' }}
+          platforms: linux/amd64
+          push: true
           tags: ${{ steps.plan.outputs.tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=registry,ref=${{ env.DOCKERHUB_REPO }}:buildcache

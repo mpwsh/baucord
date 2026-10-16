@@ -20,12 +20,8 @@
 use std::fmt;
 
 /// The user's setting, `audio.echo_cancellation` in `settings.json`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Serialize, serde::Deserialize),
-    serde(rename_all = "lowercase")
-)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum AecMode {
     /// Only when the sound comes out of speakers (the default): nobody
     /// on headphones gets the call path's side effects (Windows ducking

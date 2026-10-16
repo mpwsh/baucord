@@ -149,7 +149,7 @@
 
     <main class="wrap">
       <h1>Privacy policy</h1>
-      <p class="updated">Last updated 9 October 2026</p>
+      <p class="updated">Last updated 16 October 2026</p>
 
       <p>
         baucord is a free, open-source app for voice chat, text chat and
@@ -242,10 +242,10 @@
         <strong>90 days</strong> after they were sent. You can delete
         your own recent chat messages; deleted messages are hidden at
         once and erased with the 90-day clean-up. Files attached to
-        messages are not yet removed by that clean-up: they are kept
-        until you or a moderator delete the message they came with (then
-        erased within 30 days), or your account is deleted (then erased
-        at once).
+        messages go with them: once no message uses a file any more
+        (its messages reached 90 days, or you or a moderator deleted
+        them), it is erased within 30 days; when your account is
+        deleted, at once.
       </p>
 
       <h3>Voice, screen sharing and shared audio</h3>
@@ -257,14 +257,19 @@
       <h3>Call-quality data</h3>
       <p>
         While you are connected, the app sends a short report every 10
-        seconds so problems with calls and screen sharing can be found
+        seconds (once a minute while the connection is idle) so
+        problems with calls and screen sharing can be found
         and fixed. It contains the app version, the type of operating
         system and processor (for example "android, aarch64"), connection
         quality (delay, packet loss, speed), the audio and video settings
         in use, the names of your audio input and output devices, and
         which stream you are watching. It does not contain your
         location, contacts, phone model or any message content. The
-        official server keeps these reports for <strong>30 days</strong>.
+        official server keeps the delay, packet loss, sharing figures
+        and audio device names from these reports, and a note of
+        moments such as a device change or a share starting, for
+        <strong>30 days</strong>; the whole report goes into the
+        server's own log (below).
       </p>
 
       <h3>Logs you send</h3>
@@ -313,7 +318,8 @@
         connections (with names and IP addresses), invite codes used,
         moderation actions, the text of messages posted in the server's
         chat, the names of files posted, who sent a direct message to
-        whom (not its text), and who blocked or reported whom. Only we can read it, and it is replaced
+        whom (not its text), who blocked or reported whom, and the
+        call-quality reports. Only we can read it, and it is replaced
         as it grows rather than deleted on a fixed schedule.
       </p>
 
@@ -385,8 +391,9 @@
             <tr>
               <td>Files attached to messages</td>
               <td>
-                Until their message is deleted by you or a moderator, or
-                your account is deleted; then erased within 30 days
+                As long as a message uses them (a message is kept 90
+                days), then erased within 30 days; at once when your
+                account is deleted
               </td>
             </tr>
             <tr>

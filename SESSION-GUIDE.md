@@ -206,9 +206,12 @@ details). Its renders cannot show `transform-rotation` (the software
 renderer ignores it; the phones use Skia, which does not). Read PNGs
 back cropped to the region of interest — a full frame costs tokens.
 One such harness lives in the repository: `tools/chat-scroll-sim`
-(its own workspace; `CARGO_TARGET_DIR` outside the tree), which drives
-the real chat pane through the scrolling cases and writes screenshots
-with `SHOT=<dir>`.
+(its own workspace and lock file; `CARGO_TARGET_DIR` outside the tree),
+which drives the real chat pane through the scrolling cases and writes
+screenshots with `SHOT=<dir>`. It takes the row caps from
+`app_core::chat` (a path dependency: a change there updates its
+`Cargo.lock`, which CI runs `--locked`), and CI runs it on every pull
+request (`pr-check.yaml`, review 2026-10 P3-59).
 
 ### Handing over
 
@@ -267,24 +270,36 @@ otherwise).
   (block, report, erase); `relay.rs` (voice and video fan-out); the
   persistence thread in `persistence/` (`store.rs` is SQLite, the CLI
   helpers `cli_*` live there too); `main.rs` is the CLI; migrations
-  in `persistence/migrations/`. The CLI is `server rotate-key`,
+  in `persistence/migrations/` (`0001`…`0007`; `0007_drop_unused.sql`
+  drops the columns nothing read and the stored telemetry blobs — a
+  server older than schema 7 refuses the database, so going back means
+  restoring a backup). The CLI is `server rotate-key`,
   `server user|role|invite|restriction|key|telemetry|backup|restore`,
   `server db check|db prune`, `server user purge` (`server role --help`
   etc.); the config keys are PERSISTENCE-SPEC §1.
 - `client` — the network thread (`network.rs`), the voice and screen
-  threads, `config.rs` (settings, identity key), `inbound_wake.rs`,
+  threads (`voice.rs`; `screen.rs`: `screen-share` and `screen-watch`),
+  `config.rs` (settings, identity key), `inbound_wake.rs` (the socket
+  watcher), `upload_turns.rs` (blob uploads one at a time),
   `viewlog.rs` (the viewer's 5 s summary lines).
 - `audio`, `video` — devices, codecs, the jitter buffers, echo
   cancellation (`aec.rs`), the platform backends (`audio/src/native/`:
-  AAudio, VPIO, WASAPI; cpal elsewhere; `video`: FFmpeg on the desktop,
-  `mediacodec.rs` on Android, `videotoolbox.rs` on iOS).
+  AAudio, VPIO, WASAPI, and `pump.rs`, the real-time halves all of them
+  and the cpal fallbacks share; cpal elsewhere; `route.rs`, where
+  Android's call audio plays; `video`: FFmpeg on the desktop, `mediacodec.rs` on
+  Android, `videotoolbox.rs` on iOS; capture in `capture.rs` with
+  `dxgi.rs` and `pointer.rs` on Windows, `x11.rs` under X11, xcap
+  screenshots elsewhere; `yuv.rs`, `annexb.rs`, `held.rs` for the
+  phones' decoders, `pool.rs` for frame buffers).
 - `app-core` — pure view models with unit tests: `chat.rs`
   (`ChatHistory`, `ChatItem`, `FileMeta`), `roster.rs`, `menu.rs`,
   `markdown.rs`, `images.rs`, `gif.rs` (the streaming player),
   `emoji.rs`, `composer.rs`, `devices.rs`, `update.rs`, `stats.rs`,
   `fps.rs`, `logfile.rs` (also the hosts' log writer and panic hook),
-  `files.rs` (safe names, the pick slot), `usage.rs` (the phones' own
-  CPU and memory), `meter.rs` (how a level bar moves). What two hosts
+  `files.rs` (safe names, the pick slot), `usage.rs` (the app's own
+  CPU and memory on every platform — the desktop's `resources.rs` and
+  its `sysinfo` are gone, review 2026-10 P3-53), `meter.rs` (how a
+  level bar moves). What two hosts
   need and no UI does goes here: it is the one crate that type-checks
   for every target from the sandbox.
 - `keywatch` — the keybind watcher: key state and key events per
@@ -302,8 +317,10 @@ otherwise).
   methods filed by concern under `src/app/` (`events`, `commands`,
   `presence`, `session`, `menus`, `devices`, `conversations`, `chat`,
   `profiles`, `stats`, `alerts`, `activity`, `safety`), `settingsui`,
-  `adminui`, `media`,
-  `viewers`, `present`, `resources`, `notice` (what a phone's
+  `adminui`, `media` (attach, paste, drop, GIFs, files), `pictures`
+  (the chat pictures' bytes and on-screen previews), `avatars` (the
+  avatar decode worker),
+  `viewers`, `present`, `notice` (what a phone's
   notification is), `host` (one module: a `Hooks` object answers —
   the desktop's own `DesktopHooks`, or what a phone's crate installs:
   files, links, the keep-alive, notifications), and the host seams
@@ -508,8 +525,15 @@ Memory-mode servers (persistence off) still use the legacy
   add a nested one per row). The owed follow is now a bounded 16 ms
   `Timer` (at most 90 ticks; it stops after 8 frames at the end,
   ANDROID-SPEC D66) instead. Rule: never scroll from a `changed`
-  handler (D66's own `changed content-y` only records where the reader
-  is; it does not move the list).
+  handler on something the list itself re-estimates (`content-height`,
+  `viewport-height`, `content-y`): D66's `changed content-y` only
+  records where the reader is, and `changed content-height` only sets
+  `follow-pending` for the timer. The one exception is `changed
+  visible-height` (`chat.slint`, ChatPane): when the list's own window
+  shrinks or grows — the window resized, a phone's keyboard — and the
+  pane holds the bottom, it calls `scroll-to-end()` at once and leaves
+  the rest to the timer. A resize is the user's, once per change, not
+  a virtualization round; anything else goes through `follow-pending`.
 - **The horizontal scroll, found by bisecting renders:** a
   `ListView` sets its `viewport-width` to the max of its rows'
   *minimum* widths (`listview_layout` returns
@@ -559,12 +583,25 @@ Memory-mode servers (persistence off) still use the legacy
   is open, so a main-window dialog closed over it hands the keyboard
   back. Only one page at a time (`adminui::open` saves and closes
   Settings, `settingsui::open_on` closes the panel). Settings' Close
-  puts back what the page changed (ANDROID-SPEC D72): **a setting the
+  — and Escape, Back and the arrow, which do the same — puts back
+  what the page changed (ANDROID-SPEC D72, D73): **a setting the
   page applies live must also be pushed by
   `AppState::apply_settings_live`** (devices.rs), which Close and
   Reset to defaults both end with, and a field of `Settings` the page
   does not own must be carried over in `OpenedWith::restored_onto`, or
-  Close will undo it too. The stream viewer
+  Close will undo it too. **Every write of the settings file goes
+  through `AppState::save_settings`** (`app/stats.rs`), which writes
+  it without what the open page changed (`settingsui::
+  settings_to_write`): only Save and close keeps that (D73). A
+  `settings.save()` called anywhere else would write the page's
+  unsaved changes behind the user's back. A quit the user starts
+  (tray Quit, `/quit`, a window close without the tray, the update's
+  restart) with the page holding changes brings the window up and asks
+  — Save and quit, Quit without saving, Cancel (`leave_app`,
+  `State.quit-ask-open`); when the OS ends the app nobody is asked and
+  nothing unsaved is kept. Underneath, `Settings::save` writes nothing
+  when the file already says the same, and syncs the new file before
+  the rename (review 2026-10, P3-43). The stream viewer
   is the one window left on the desktop: `viewers::Viewer` owns a
   private `Surface::{Window, Page}` and the rest of the app only calls
   its methods (`raise`, `update_frame`, `close`, `apply_text_scale`) —
@@ -703,6 +740,16 @@ Memory-mode servers (persistence off) still use the legacy
   cuts to the first page for a session without `ADMIN_PAGES`. A new
   listing gets its arm in `AdminOutcome::into_pages`, `rows` and
   `prepend` — the compiler asks for all three.
+- **Where a log is**: every host writes `baucord.log`, rolled over to
+  `baucord.log.1` past 5 MB (`app_core::logfile::FileSink`). The
+  desktop's sits beside `settings.json` — the config folder, or the
+  executable's in a portable install — since review 2026-10 (P2-47);
+  it was appended to for ever in whatever folder the app started in.
+  Android's is in the app's private directory, iOS's in its Documents
+  folder (the Files app). Settings → Debug shows, copies, sends and
+  clears it; Send log puts it on the server, under the identity
+  folder's `logs/`. A crash ends it with `PANIC in thread … at
+  file:line`.
 - **A test of the process's own CPU or memory asserts nothing about
   "idle" or "before and after"**: the figures are the whole test
   binary's, and the other tests run beside it (`usage.rs`'s first
@@ -840,11 +887,22 @@ Memory-mode servers (persistence off) still use the legacy
   the audio callback's latch, the socket through `ReadWaiter` — with
   a timeout only for timers it really has. The network loop's 1 ms
   poll was a thousand wakes a second for a whole session on a phone.
-  `client/tests/network_idle.rs` counts a quiet connection's loop and
-  watcher wakes (`network::loop_passes`, `watcher_wakes`) on every
-  platform: keep the two under 25 (0 + 2 at 1.2.1). And what only feeds
-  the screen checks `main_on_screen()` / `host_visible()`: a phone in
-  the background shows nothing (D42).
+  `client/tests/network_idle.rs` counts an admitted, quiet
+  connection's loop and watcher wakes (`network::loop_passes`,
+  `watcher_wakes`) over 12 s, on every platform: keep the two under 5
+  a second together (review 2026-10, P3-46; the old one-second window
+  before the `Welcome` saw neither the keep-alive nor the telemetry).
+  From the code, a quiet second is about one loop wake (the 2 s link
+  stats, the 5 s keep-alive and its ack, a telemetry sample at most
+  once a minute) and well under one watcher wake (one per datagram
+  that lands; its own backstop every 30 s, P2-40). The voice thread
+  has nothing due in a phone's lobby or on a Windows desktop with its
+  device watcher (an hour's sleep), and wakes every 2 s for the
+  default-device poll where streams are open and no device events
+  come (P2-41). And what only feeds the screen checks
+  `main_on_screen()` / `host_visible()`: a phone in the background
+  shows nothing (D42), and its timers slow or stop (`set_app_shown`,
+  P2-33).
 - **In `build.gradle.kts`, never write `java.awt.…` / `java.io.…`
   out in full**: `java` resolves to the project's `java` extension (AGP
   applies java-base) and the script fails with "Unresolved reference:
@@ -870,6 +928,10 @@ Memory-mode servers (persistence off) still use the legacy
   "native" table). Fluent's `ScrollView`/`ListView` never pan on a drag,
   so every scroll view a phone reaches binds
   `mouse-drag-pan-enabled: State.touch-host` (D27) — a new one must too.
+  A component that inherits `ScrollView` sizes its content only from
+  the layouts in its own definition: children passed in where it is
+  used count as nothing and it never scrolls, so give it a layout of
+  its own around `@children` (`NavScroll` in settings.slint, D73).
 - Interactions (drags, flicks, long-press) can't be screenshotted, but
   they can be driven headless: a scratch crate with `slint =
   { version = "=1.18.1", default-features = false, features = ["std",
@@ -1014,7 +1076,7 @@ Memory-mode servers (persistence off) still use the legacy
 - **A window's `icon` is its taskbar icon too, on Windows**: Slint
   gives the one image to both `WM_SETICON` slots (title bar and
   taskbar/Alt-Tab; `i-slint-backend-winit` `set_window_icon`). The
-  windows load the tray's glyph (`tray.png`); the exe's own icon is
+  windows load the tray's icon (`tray.png`); the exe's own icon is
   `icon.ico`, embedded by `desktop/build.rs`. Slint 1.18.1 multiplies
   an icon's colours by alpha twice (decoded premultiplied, then again
   in `icon_to_winit`), so soft edges come out a little dark on a light
@@ -1042,15 +1104,28 @@ the next one) — both clear it now; chat preview textures follow the
 window's scale factor (`preview_max_edge`: 360² on a 1× display,
 720² only at 2×, a quarter of the memory per picture for most
 Windows users); avatars from other clients are clamped to 128² at
-decode (ours already are at pick time). Since 2026-10-14 a chat
+decode (ours already are at pick time), on a worker thread since
+review 2026-10 (T2: `avatars.rs`, the cache read included), and one
+over 512 px a side is refused. Since 2026-10-14 a chat
 picture is decoded only while its row is on screen, off the UI
-thread, and kept in a 16 MB LRU after (`pictures.rs`); `/mem` reports
-how many are decoded. Since 1.1.9 the stream
+thread, and kept in a 16 MB LRU after (`pictures.rs`) — the previews
+of the rows on screen count toward the 16 MB too, so a screenful of
+large pictures leaves less for those scrolled past; `/mem` reports
+how many are decoded. Until review 2026-10 (P0-1) every received
+picture also went through the avatar path — decoded on arrival on the
+UI thread, kept for the session and written to `avatars/` for good —
+which this pass did not see; now only a picture someone's look names
+goes in. GIF frames, the gallery's full size and a picture being sent
+decode on workers too (ARCHITECTURE.md §7.1). Since 1.1.9 the stream
 viewer reuses a ring of three `SharedPixelBuffer`s per stream and the
-decoders' buffers go round `video::pool` (ANDROID-SPEC D57), so the
-8 MB allocation per 1080p frame is gone too. Left to measure: the `StyledText`
-layouts of visible rows and Skia's glyph cache with color emoji,
-both only visible from a heap profile.
+decoders' buffers go round `video::pool` (ANDROID-SPEC D57), so *our*
+8 MB allocation per 1080p frame is gone — **Skia's is not**: to draw
+an image it copies the pixels into a fresh buffer of its own
+(`i-slint-renderer-skia` `cached_image.rs:134-139`,
+`skia_safe::Data::new_copy`, C `malloc`), 8.3 MB per presented 1080p
+frame on the UI thread (review 2026-10, P2-36). Left to measure: the
+`StyledText` layouts of visible rows and Skia's glyph cache with
+color emoji, both only visible from a heap profile.
 
 ### Network diagnosis (the Movistar / port-5000 case, 2026-09-09..15)
 Three users on one ISP (Movistar fibre, 600/600) heard each other at
@@ -1058,10 +1133,14 @@ Three users on one ISP (Movistar fibre, 600/600) heard each other at
 join hung. Others were fine. **Cause: the relay's UDP port.** On 5000
 the ISP's gateway/path dropped ~40 % of the clients' *outbound*
 packets in on/off episodes; on 51000 nothing. Fix in place: the
-server listens on 51000 (`port` + `public_address` in `server.yaml`)
-and Docker publishes both `51000:51000/udp` and `5000:51000/udp` so
-old saved addresses still work — one socket, two doors; the invite
-string already carries 51000. Rules that came out of it:
+official server listens on 51000 (`port` + `public_address` in its
+config) and its host published both `51000:51000/udp` and
+`5000:51000/udp` so old saved addresses still worked — one socket, two
+doors; the invite string already carries 51000. The repository's
+`docker-compose.yaml` publishes `51000:51000/udp` only, with a comment
+on adding the second door when a server moves; its committed
+`config/baucord.yaml` said 5000 until review 2026-10 (P3-61), and now
+says 51000 like the rest. Rules that came out of it:
 
 - **A shipped binary may reference system libraries only** (macOS:
   frameworks and `/usr/lib`; Linux: `/lib`, `/usr/lib`). The 1.1.5
@@ -1083,7 +1162,8 @@ string already carries 51000. Rules that came out of it:
   `MACOSX_DEPLOYMENT_TARGET=11.0` and the verify step checks the
   binary's `minos`; and `video` no longer links libavdevice at all
   (`ffmpeg-next` without the `device` feature; both static builds
-  `--disable-avdevice`) — capture is xcap's, and libavdevice is where
+  `--disable-avdevice`) — capture never goes through FFmpeg (DXGI, our
+  X11 reader, xcap's screenshots), and libavdevice is where
   every capture-device dependency lived, on all three OSes. The
   deployment floor then broke the arm64 *link*: with the target below
   the SDK, FFmpeg's `__builtin_available` checks emit calls to
@@ -1141,9 +1221,20 @@ code: `/mem` at boot, while viewing and after stopping (the app's
 own buckets vs the process figure); on Linux `smaps_rollup`
 (`Anonymous` vs `Rss`) and the experiment
 `MALLOC_MMAP_THRESHOLD_=131072 ./baucord`; on macOS
-`vmmap --summary`. Expected fix: mimalloc as the global allocator in
-the hosts (one line, returns large blocks eagerly, builds for
-Android). Every stop-watching path does remove the `Viewer` (checked
+`vmmap --summary`. **Measured 2026-10-16** (review P2-36), with a
+program that makes the viewer's allocations and nothing else — 1080p
+frames from two decoder threads, each copied on the main thread into
+a C-`malloc`ed buffer as Skia does, 30 fps per decoder for 10 s, then
+2 s idle: glibc keeps about three frames (26 MB) after the stop, and
+0.41 s of CPU; `mallopt(M_MMAP_THRESHOLD, 1 MB)` gives them back (2 MB)
+at 3.5 s of CPU, eight times as much, every frame faulted in fresh;
+mimalloc as the Rust global allocator keeps the same 26 MB, since
+Skia's copy is C's `malloc`, out of its reach. Neither landed: the
+retention this pattern makes is bounded and small, so the ~150 MB a
+real stream leaves on Linux is something else — the next step is
+`/mem` and `smaps_rollup` on a real stream, not an allocator.
+mimalloc was the expected fix (PRODUCTION-PLAN.md PRD-6) until this
+measurement. Every stop-watching path does remove the `Viewer` (checked
 in the 2026-10-10 review), and a disconnect now sends `StopWatching`
 for each one it drains, so the decoder goes with it (review P0-6).
 

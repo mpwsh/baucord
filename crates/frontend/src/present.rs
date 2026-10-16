@@ -70,6 +70,9 @@ pub(crate) fn attach_screen(tx: ScreenTx) {
 /// send: a lost "visible" would leave the picture frozen, and the
 /// screen thread drains its channel constantly.
 pub(crate) fn set_stream_visible(client_id: Option<u64>, visible: bool) {
+    if let Some(id) = client_id {
+        client::network::set_stream_hidden(id, !visible);
+    }
     if let Some(tx) = SCREEN_TX.get() {
         let _ = tx.send(ScreenControl::SetVisible { client_id, visible });
     }
@@ -138,13 +141,9 @@ pub fn spawn(
                                 format,
                             },
                         ),
+                        // A stopped stream's buffers go by themselves,
+                        // `FORGET_AFTER` without a frame.
                         other => {
-                            if let ScreenEvent::PeerStoppedSharing { client_id } = &other {
-                                if let Some(frame) = newest.remove(client_id) {
-                                    video::pool::recycle(frame.pixels);
-                                }
-                                prep.forget(*client_id);
-                            }
                             if forward_tx.send(other).is_err() {
                                 return;
                             }
@@ -194,6 +193,10 @@ struct Prep {
     failing: HashSet<u64>,
     /// Cores a YUV conversion is spread over (`video::yuv::to_rgba_into`).
     threads: usize,
+    /// Their parked threads: started by the first YUV picture (only
+    /// Android's `MediaCodec` hands those over), ended with the last
+    /// stream's buffers.
+    bands: Option<video::yuv::BandPool>,
 }
 
 impl Prep {
@@ -211,6 +214,7 @@ impl Prep {
             rings: HashMap::new(),
             failing: HashSet::new(),
             threads,
+            bands: None,
         }
     }
 
@@ -269,7 +273,15 @@ impl Prep {
 
         let started = Instant::now();
         let mut buffer = self.buffer_for(client_id, width, height);
-        let filled = fill(buffer.make_mut_bytes(), &pixels, format, self.threads);
+        if matches!(format, PictureFormat::Yuv420 { .. }) && self.bands.is_none() {
+            self.bands = video::yuv::BandPool::new(self.threads);
+        }
+        let filled = fill(
+            buffer.make_mut_bytes(),
+            &pixels,
+            format,
+            self.bands.as_ref(),
+        );
         video::pool::recycle(pixels);
         if let Err(e) = filled {
             if self.failing.insert(client_id) {
@@ -321,14 +333,14 @@ impl Prep {
         Pixels::new(width, height)
     }
 
-    fn forget(&mut self, id: u64) {
-        self.rings.remove(&id);
-        self.failing.remove(&id);
-    }
-
     fn forget_idle(&mut self, now: Instant) {
         self.rings
             .retain(|_, ring| now.duration_since(ring.used) < FORGET_AFTER);
+        let rings = &self.rings;
+        self.failing.retain(|id| rings.contains_key(id));
+        if self.rings.is_empty() {
+            self.bands = None;
+        }
     }
 }
 
@@ -338,7 +350,7 @@ fn fill(
     out: &mut [u8],
     pixels: &[u8],
     format: PictureFormat,
-    threads: usize,
+    bands: Option<&video::yuv::BandPool>,
 ) -> Result<(), String> {
     match format {
         PictureFormat::Rgba => {
@@ -354,7 +366,7 @@ fn fill(
         }
         PictureFormat::Bgra => video::yuv::bgra_to_rgba_into(pixels, out),
         PictureFormat::Yuv420 { layout, color } => {
-            video::yuv::to_rgba_into(pixels, &layout, color, out, threads)
+            video::yuv::to_rgba_into(pixels, &layout, color, out, bands)
         }
     }
 }
@@ -367,9 +379,9 @@ mod tests {
     fn rgba_is_copied_and_a_wrong_size_refused() {
         let mut out = vec![0u8; 16];
         let pixels: Vec<u8> = (0..16).collect();
-        fill(&mut out, &pixels, PictureFormat::Rgba, 2).unwrap();
+        fill(&mut out, &pixels, PictureFormat::Rgba, None).unwrap();
         assert_eq!(out, pixels);
-        assert!(fill(&mut out, &pixels[..12], PictureFormat::Rgba, 2).is_err());
+        assert!(fill(&mut out, &pixels[..12], PictureFormat::Rgba, None).is_err());
     }
 
     /// iOS's decoder hands BGRA on; it becomes RGBA as it is written
@@ -378,9 +390,9 @@ mod tests {
     fn bgra_is_swapped_into_the_ui_buffer() {
         let pixels = [1u8, 2, 3, 0, 4, 5, 6, 0];
         let mut out = vec![0u8; 8];
-        fill(&mut out, &pixels, PictureFormat::Bgra, 2).unwrap();
+        fill(&mut out, &pixels, PictureFormat::Bgra, None).unwrap();
         assert_eq!(out, [3, 2, 1, 255, 6, 5, 4, 255]);
-        assert!(fill(&mut out, &pixels[..4], PictureFormat::Bgra, 2).is_err());
+        assert!(fill(&mut out, &pixels[..4], PictureFormat::Bgra, None).is_err());
     }
 
     #[test]
@@ -396,7 +408,7 @@ mod tests {
                 layout,
                 color: video::yuv::ColorSpec::default(),
             },
-            4,
+            video::yuv::BandPool::new(4).as_ref(),
         )
         .unwrap();
         for px in out.chunks_exact(4) {

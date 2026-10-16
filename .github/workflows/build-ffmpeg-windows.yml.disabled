@@ -7,18 +7,18 @@ name: Build FFmpeg prebuilt (Windows)
 #
 # Run this manually (Actions -> Build FFmpeg prebuilt (Windows) -> Run
 # workflow) whenever VCPKG_COMMIT, the feature set, or the triplet changes.
-# Give the zip a NEW name (bump the -vN suffix), then point the "Download
-# prebuilt FFmpeg (Windows)" step in build-and-release.yml at it. Never
-# overwrite an object that a shipped workflow revision still references --
-# old commits must stay buildable.
+# The object is named the way release.yml's "Download prebuilt FFmpeg
+# (Windows)" step asks for it: ci/ffmpeg-<first 10 of VCPKG_COMMIT>-
+# x264-gpl-nvcodec-amf-x64-windows-static-md.zip. A new pin is a new
+# name by itself; a new feature set or triplet changes the name here
+# and there together. Never overwrite an object that a shipped workflow
+# revision still references -- old commits must stay buildable. (This
+# took a name to type, whose default matched nothing release.yml reads:
+# review 2026-10. Kept disabled by the owner's decision; enable it by
+# dropping `.disabled` when the pin moves.)
 
 on:
   workflow_dispatch:
-    inputs:
-      zip_name:
-        description: "Object name to upload to the baucord R2 bucket"
-        required: true
-        default: ffmpeg-7.1.2-x264-gpl-nvcodec-amf-x64-windows-static-md-v1.zip
 
 env:
   # FFmpeg comes from vcpkg PINNED to the last ffmpeg 7.1.2 port. vcpkg
@@ -28,6 +28,7 @@ env:
   # vcpkg). Do NOT bump this without re-testing the full Windows build
   # AND a real stream -- encoder options are validated at runtime, not
   # compile time.
+  # Must match VCPKG_COMMIT in release.yml.
   VCPKG_COMMIT: 34823ada10080ddca99b60e85f80f55e18a44eea # ffmpeg 7.1.2
 
 jobs:
@@ -71,4 +72,5 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
-          aws s3 cp ffmpeg-prebuilt.zip "s3://baucord/${{ inputs.zip_name }}" --endpoint-url https://6bcc35de83e46a771896026baf11b4ac.r2.cloudflarestorage.com
+          $obj = "ci/ffmpeg-$($env:VCPKG_COMMIT.Substring(0,10))-x264-gpl-nvcodec-amf-x64-windows-static-md.zip"
+          aws s3 cp ffmpeg-prebuilt.zip "s3://baucord/$obj" --endpoint-url https://6bcc35de83e46a771896026baf11b4ac.r2.cloudflarestorage.com

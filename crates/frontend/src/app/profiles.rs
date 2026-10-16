@@ -28,9 +28,20 @@ pub(super) struct RosterSync {
     queued: bool,
     /// Each user's index in `users_model` as of the last rebuild.
     rows: HashMap<u64, usize>,
+    /// The tray's menu is behind: synced once at the end of the pass,
+    /// not once per change (3 per person in a join burst; review
+    /// 2026-10, P3-3).
+    tray: bool,
 }
 
 impl AppState {
+    /// Where `client_id`'s row is in the roster now (`user_id_at`'s
+    /// inverse), checked against the row itself.
+    pub fn roster_index_of(&self, client_id: u64) -> Option<i32> {
+        let index = i32::try_from(*self.roster_sync.rows.get(&client_id)?).ok()?;
+        (self.user_id_at(index) == Some(client_id)).then_some(index)
+    }
+
     /// Something about who is here changed: the room-dependent state
     /// follows now, the rows at the end of this pass of the event loop.
     pub fn update_user_list(&mut self) {
@@ -40,8 +51,9 @@ impl AppState {
         // keeps it alive off screen (D63). Both at once, never deferred.
         self.sync_voice_room();
         self.sync_keep_alive(false);
-        // The tray follows whether or not the window shows.
-        self.sync_tray();
+        // The tray follows whether or not the window shows: at the end
+        // of the pass, with the rows.
+        self.roster_sync.tray = true;
         self.roster_sync.dirty = true;
         if self.roster_sync.queued {
             return;
@@ -58,6 +70,9 @@ impl AppState {
     /// back (`host_shown` on a phone, the window revealed on a desktop).
     pub(crate) fn flush_roster(&mut self) {
         self.roster_sync.queued = false;
+        if std::mem::take(&mut self.roster_sync.tray) {
+            self.sync_tray();
+        }
         if self.roster_sync.dirty && self.main_on_screen() {
             self.rebuild_roster();
         }
@@ -74,15 +89,6 @@ impl AppState {
             self.session.is_muted,
             self.session.is_deafened,
         );
-        // Each account's session, once per rebuild: the look of every
-        // row is found by account, and scanning `details` per row made
-        // the rebuild quadratic.
-        let sessions: HashMap<client::UserId, u64> = self
-            .session
-            .details
-            .iter()
-            .map(|(client, (user, _))| (*user, *client))
-            .collect();
         self.roster_sync.rows.clear();
         // In-place update: write rows positionally, growing/shrinking
         // only when membership changed — preserves the ListView's
@@ -91,7 +97,7 @@ impl AppState {
         for (i, item) in items.iter().enumerate() {
             let mut row = ui::convert::roster_item(item);
             if let roster::RosterItem::User(user) = item {
-                self.decorate_user_row(&mut row, user, &sessions);
+                self.decorate_user_row(&mut row, user);
                 self.roster_sync.rows.insert(user.client_id, i);
             }
             converted.push(row);
@@ -100,7 +106,11 @@ impl AppState {
         let wanted = converted.len();
         for (i, row) in converted.into_iter().enumerate() {
             if i < current {
-                self.users_model.set_row_data(i, row);
+                // A row that did not change is not written: each write
+                // re-lays-out the row (review 2026-10, P3-3).
+                if self.users_model.row_data(i).as_ref() != Some(&row) {
+                    self.users_model.set_row_data(i, row);
+                }
             } else {
                 self.users_model.push(row);
             }
@@ -157,21 +167,9 @@ impl AppState {
     /// What the row and its card show beyond the view model: the look,
     /// the role, the level and the tooltip text. (The rank rule and the
     /// channel powers the menu needs are worked out when it opens.)
-    /// `sessions` is each account's session, from `details`.
-    pub(super) fn decorate_user_row(
-        &self,
-        row: &mut UserRow,
-        user: &roster::RosterRow,
-        sessions: &HashMap<client::UserId, u64>,
-    ) {
+    pub(super) fn decorate_user_row(&self, row: &mut UserRow, user: &roster::RosterRow) {
         let account = self.account_of(user.client_id);
-        self.apply_look(
-            &user.name,
-            user.is_us,
-            account.as_ref(),
-            Some(sessions),
-            row,
-        );
+        self.apply_profile_look(&user.name, user.is_us, account.as_ref(), row);
         if user.level > 0 {
             row.level_label = t!("tooltip-level", "level" => u32::from(user.level)).into();
         }
@@ -243,24 +241,10 @@ impl AppState {
         author: Option<&client::UserId>,
         row: &mut dyn ProfileLook,
     ) {
-        self.apply_look(name, is_us, author, None, row);
-    }
-
-    /// [`Self::apply_profile_look`], with each account's session looked
-    /// up in `sessions` when the caller built that index (the roster
-    /// rebuild), instead of a scan of `details`.
-    fn apply_look(
-        &self,
-        name: &str,
-        is_us: bool,
-        author: Option<&client::UserId>,
-        sessions: Option<&HashMap<client::UserId, u64>>,
-        row: &mut dyn ProfileLook,
-    ) {
         // The server's copy when it has one (that is what everyone
         // else sees); our settings before the server answered, or
         // when it does not carry profiles.
-        let from_server = self.server_look(name, is_us, author, sessions);
+        let from_server = self.server_look(name, is_us, author);
         let ours = is_us || name == self.settings.user.nickname;
         let (color, style, avatar) = match from_server {
             Some(p) => (
@@ -304,19 +288,11 @@ impl AppState {
         name: &str,
         is_us: bool,
         author: Option<&client::UserId>,
-        sessions: Option<&HashMap<client::UserId, u64>>,
     ) -> Option<&client::protocol::Profile> {
         if let Some(user) = author {
-            let session = match sessions {
-                Some(sessions) => sessions.get(user).copied(),
-                None => self
-                    .session
-                    .details
-                    .iter()
-                    .find(|(_, (u, _))| u == user)
-                    .map(|(c, _)| *c),
-            };
-            let online = session.and_then(|c| self.session.profiles.get(&c));
+            let online = self
+                .session_of(user)
+                .and_then(|c| self.session.profiles.get(&c));
             if let Some(look) =
                 online.or_else(|| self.session.author_looks.get(user).map(|l| &l.profile))
             {
@@ -528,58 +504,48 @@ impl AppState {
         self.refresh_account_look(&user, &name);
     }
 
-    /// A picture someone's look names: decoded from the disk cache, or
-    /// asked of the server once.
+    /// A picture someone's look names: decoded on the avatar worker,
+    /// from the cache on disk or else, once, from the server.
     fn want_avatar(&mut self, avatar: Option<client::protocol::BlobId>) {
         let Some(blob) = avatar else {
             return;
         };
-        if self.avatar_images.contains_key(&blob) {
+        if self.avatar_images.contains_key(&blob) || !self.avatar_decoding.insert(blob) {
             return;
         }
-        let cached = client::config::avatar_cache_dir().join(hex(&blob));
-        match std::fs::read(&cached) {
-            Ok(bytes) => self.take_avatar_bytes(blob, &bytes, false),
-            Err(_) => {
-                if self.session.avatar_fetches.insert(blob) {
+        crate::avatars::request(blob, crate::avatars::Source::Cache);
+    }
+
+    /// The picture a look asked for arrived from the server: decoded
+    /// on the avatar worker, which also caches it.
+    pub(super) fn take_avatar_blob(&mut self, blob: client::protocol::BlobId, bytes: &[u8]) {
+        self.avatar_decoding.insert(blob);
+        crate::avatars::request(blob, crate::avatars::Source::Wire(bytes.into()));
+    }
+
+    /// The avatar worker is done with `blob` (UI thread): its rows show
+    /// the picture now, or the server is asked for it.
+    pub(crate) fn avatar_decoded(
+        &mut self,
+        blob: client::protocol::BlobId,
+        outcome: crate::avatars::Outcome,
+    ) {
+        self.avatar_decoding.remove(&blob);
+        let pixels = match outcome {
+            crate::avatars::Outcome::Decoded(pixels) => pixels,
+            crate::avatars::Outcome::NotCached => {
+                if self.connected && self.session.avatar_fetches.insert(blob) {
                     self.network
                         .tx
                         .send(NetworkControl::FetchBlob { blob_id: blob })
                         .ok();
                 }
+                return;
             }
-        }
-    }
-
-    /// Decode a picture into the image map (and onto the disk cache
-    /// when it just arrived from the wire).
-    pub(super) fn take_avatar_bytes(
-        &mut self,
-        blob: client::protocol::BlobId,
-        bytes: &[u8],
-        cache: bool,
-    ) {
-        // Someone else's bytes: PNG, JPEG or GIF only (review P1-20).
-        let Ok(decoded) = app_core::images::decode_received(bytes) else {
-            return;
+            crate::avatars::Outcome::Refused => return,
         };
-        // Ours are 128² at pick time; a picture from another client is
-        // whatever the server's KB cap let through, and it is drawn at
-        // 64 px at most. Never keep more than 128² of it resident.
-        let side = app_core::images::AVATAR_SIDE;
-        let rgba = if decoded.width().max(decoded.height()) > side {
-            decoded.thumbnail(side, side).into_rgba8()
-        } else {
-            decoded.into_rgba8()
-        };
-        let image = ui::convert::rgba_image(rgba.as_raw(), rgba.width(), rgba.height());
-        self.avatar_images.insert(blob, image);
-        if cache {
-            let dir = client::config::avatar_cache_dir();
-            if std::fs::create_dir_all(&dir).is_ok() {
-                let _ = std::fs::write(dir.join(hex(&blob)), bytes);
-            }
-        }
+        self.avatar_images
+            .insert(blob, slint::Image::from_rgba8(pixels));
         self.update_user_list();
         self.rebuild_dms_model();
         // Whoever's picture this is, their rows can show it now: by
@@ -621,7 +587,6 @@ impl AppState {
                 let index = i32::try_from(index).unwrap_or(-1);
                 s.set_card_guest_open(false);
                 s.set_card_index(index);
-                self.user_hovered(index);
             }
             // Gone since they wrote: a card from what we still know.
             (true, None) => {
@@ -664,7 +629,9 @@ impl AppState {
 
     /// The pointer rests on a user row: fetch their last telemetry
     /// for the tooltip when we may, at most once every ten seconds.
-    pub(super) fn user_hovered(&mut self, index: i32) {
+    /// A roster row's card is up: an admin's shows the person's last
+    /// telemetry, asked for at most every 10 s.
+    pub(super) fn user_card_shown(&mut self, index: i32) {
         if !client::permissions::has(self.session.permissions, client::permissions::MANAGE_USERS) {
             return;
         }

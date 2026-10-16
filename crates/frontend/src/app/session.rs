@@ -63,10 +63,10 @@ impl AppState {
             self.session.pending_channel_join = Some(channel_id);
             self.network
                 .tx
-                .send(NetworkControl::JoinChannel {
+                .send(NetworkControl::Send(ClientMessage::JoinChannel {
                     channel_id,
                     password: None,
-                })
+                }))
                 .ok();
             return;
         }
@@ -82,10 +82,10 @@ impl AppState {
                 self.session.pending_channel_join = Some(channel_id);
                 self.network
                     .tx
-                    .send(NetworkControl::JoinChannel {
+                    .send(NetworkControl::Send(ClientMessage::JoinChannel {
                         channel_id,
                         password: Some(password),
-                    })
+                    }))
                     .ok();
             }
             None => self.open_channel_prompt(channel_id, false),
@@ -111,15 +111,15 @@ impl AppState {
         let name = self.channel_name(channel_id);
         if let Some(server) = self.settings.default_server_mut() {
             server.channel_passwords.insert(name, password.clone());
-            self.settings.save();
+            self.save_settings();
         }
         self.main.global::<State>().set_channel_prompt_open(false);
         self.network
             .tx
-            .send(NetworkControl::JoinChannel {
+            .send(NetworkControl::Send(ClientMessage::JoinChannel {
                 channel_id,
                 password: Some(password),
-            })
+            }))
             .ok();
     }
 
@@ -148,6 +148,11 @@ impl AppState {
         // roles, our own mute and deafen. What follows only tells the
         // window, the voice engine and the screen thread.
         self.session = Session::default();
+        // The pictures of the session's people: the next one decodes
+        // whoever it shows again, from the cache on disk.
+        self.avatar_images.clear();
+        self.avatar_decoding.clear();
+        self.paused_watch = None;
         self.reset_safety();
         // A test ends with the session it may have started in.
         if std::mem::take(&mut self.is_testing_mic) {
@@ -205,6 +210,8 @@ impl AppState {
         }
         crate::viewers::close_gallery(self);
         self.gifs.clear();
+        // Every picture of the session: the next one brings its own.
+        crate::pictures::clear();
 
         Self::clear_call_notice();
         // A menu open on a row that is about to vanish.
@@ -246,7 +253,8 @@ impl AppState {
         self.reconnect_attempts = 0;
         self.rejoin_channel = None;
         self.network.tx.send(NetworkControl::Disconnect).ok();
-        self.push_chat_system(&t!("chat-disconnected", "reason" => t!("disconnect-reason-user")));
+        // No "disconnected" line: the connect page hides the chat, and
+        // the next session's `Init` clears it.
         self.teardown_connection();
         self.show_connect_phase();
     }
@@ -319,10 +327,10 @@ impl AppState {
             .ok();
         self.network
             .tx
-            .send(NetworkControl::SendAudioState {
+            .send(NetworkControl::Send(ClientMessage::AudioState {
                 muted: self.session.is_muted,
                 deafened: self.session.is_deafened,
-            })
+            }))
             .ok();
         self.main.global::<State>().set_muted(self.session.is_muted);
         self.push_self_audio();
@@ -344,10 +352,10 @@ impl AppState {
             .ok();
         self.network
             .tx
-            .send(NetworkControl::SendAudioState {
+            .send(NetworkControl::Send(ClientMessage::AudioState {
                 muted: self.session.is_muted,
                 deafened: self.session.is_deafened,
-            })
+            }))
             .ok();
         self.main
             .global::<State>()
@@ -553,7 +561,7 @@ impl AppState {
         self.voice
             .tx
             .send(VoiceControl::Start {
-                settings: Box::new(self.settings.clone()),
+                config: Box::new(self.engine_config()),
                 our_client_id: None,
                 in_room: true,
             })
@@ -569,7 +577,10 @@ impl AppState {
         if !self.connected || self.session.our_client_id.is_none() {
             return;
         }
-        let in_room = !self.in_lobby() || self.is_testing_mic;
+        // The AFK room is out of a room too: the relay drops its voice,
+        // so its microphone service type and room wake lock were a
+        // battery cost for nothing (review 2026-10, P3-13; D53).
+        let in_room = !self.out_of_voice() || self.is_testing_mic;
         if force || self.kept_alive != Some(in_room) {
             self.kept_alive = Some(in_room);
             crate::host::keep_alive(Some(&self.server_name), in_room);
@@ -601,6 +612,26 @@ impl AppState {
             self.voice_in_room = in_room;
             self.voice.tx.send(VoiceControl::SetInRoom(in_room)).ok();
         }
+        // Someone to hear it: a voice room with somebody else in it,
+        // and no test keeping it here. Otherwise the encoder gets
+        // nothing — it encoded 50 frames a second for nobody (review
+        // 2026-10, P2-37); the light and the meters go on.
+        let transmit = self.in_voice_room() && !self.is_testing_mic && self.room_has_company();
+        if transmit != self.voice_transmit {
+            self.voice_transmit = transmit;
+            self.voice.tx.send(VoiceControl::SetTransmit(transmit)).ok();
+        }
+    }
+
+    /// Anyone else in our room.
+    fn room_has_company(&self) -> bool {
+        let (Some(us), Some(room)) = (self.session.our_client_id, self.our_channel()) else {
+            return false;
+        };
+        self.session
+            .users
+            .iter()
+            .any(|(id, user)| *id != us && user.channel_id == room)
     }
 
     /// What the network thread reads before it sends a voice packet:

@@ -2,7 +2,9 @@
 //!
 //! Slint's `Image` has no animation, so the shell drives GIFs itself:
 //! it swaps the image on a `slint::Timer`, using each frame's own
-//! delay.
+//! delay. The frames are decoded on a worker thread, one ahead of the
+//! one shown (`frontend/src/media.rs`): a [`GifStream`] is made and
+//! read there, and the UI thread only puts the pixels on screen.
 //!
 //! The wire pipeline caps animated GIFs at 800px / the byte budget,
 //! but neither caps the *frame count* — and every frame decodes to a
@@ -18,7 +20,7 @@
 //! (from [`loop_secs`]) but never more than 30 s, freeze to the first
 //! frame, replay on hover.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::images::{gif_gct_len, skip_gif_subblocks, ImageError};
 
@@ -36,11 +38,11 @@ pub fn autoplay_budget_secs(bytes: &[u8]) -> f64 {
     (3.0 * loop_secs(bytes) + 0.25).min(30.0)
 }
 
-/// `Cursor` needs `AsRef<[u8]>`; this lets one refcounted buffer back
-/// any number of sequential decoders without copying the compressed
-/// bytes per playback.
-struct RcBytes(Rc<Vec<u8>>);
-impl AsRef<[u8]> for RcBytes {
+/// `Cursor` needs `AsRef<[u8]>`; this lets one shared buffer back any
+/// number of sequential decoders, on any thread, without copying the
+/// compressed bytes per playback.
+struct SharedBytes(Arc<[u8]>);
+impl AsRef<[u8]> for SharedBytes {
     fn as_ref(&self) -> &[u8] {
         &self.0
     }
@@ -49,23 +51,23 @@ impl AsRef<[u8]> for RcBytes {
 /// A GIF being decoded *frame by frame* during playback, instead of
 /// all frames upfront: memory is one frame at a time (a playing 800px
 /// GIF holds ~2.5 MB instead of the 48 MB budget), at the cost of
-/// ~1–4 ms of decode per frame advance — comfortably inside a 33 ms
-/// animation tick. Looping reopens the decoder over the same
-/// refcounted bytes.
+/// ~1–4 ms of decode per frame advance, on the thread that reads it.
+/// Looping reopens the decoder over the same shared bytes.
 pub struct GifStream {
-    bytes: Rc<Vec<u8>>,
+    bytes: Arc<[u8]>,
     frames: image::Frames<'static>,
     width: u32,
     height: u32,
 }
 
 impl GifStream {
-    /// Open a stream over encoded GIF bytes. Applies the same codec
-    /// bomb limits as every other decode path.
+    /// Open a stream over encoded GIF bytes, with the limits for a
+    /// received animation (`images::received_gif_limits`): a canvas
+    /// over 1024 px does not open, and a frame over them ends the loop.
     ///
     /// # Errors
     /// [`ImageError::Codec`] when the header/limits are refused.
-    pub fn open(bytes: Rc<Vec<u8>>) -> Result<Self, ImageError> {
+    pub fn open(bytes: Arc<[u8]>) -> Result<Self, ImageError> {
         let frames = Self::reopen(&bytes)?;
         Ok(Self {
             bytes,
@@ -75,17 +77,13 @@ impl GifStream {
         })
     }
 
-    fn reopen(bytes: &Rc<Vec<u8>>) -> Result<image::Frames<'static>, ImageError> {
+    fn reopen(bytes: &Arc<[u8]>) -> Result<image::Frames<'static>, ImageError> {
         use image::{codecs::gif::GifDecoder, AnimationDecoder, ImageDecoder};
 
-        let mut decoder = GifDecoder::new(std::io::Cursor::new(RcBytes(Rc::clone(bytes))))
+        let mut decoder = GifDecoder::new(std::io::Cursor::new(SharedBytes(Arc::clone(bytes))))
             .map_err(|e| ImageError::Codec(e.to_string()))?;
-        let mut limits = image::Limits::default();
-        limits.max_image_width = Some(16_384);
-        limits.max_image_height = Some(16_384);
-        limits.max_alloc = Some(512 * 1024 * 1024);
         decoder
-            .set_limits(limits)
+            .set_limits(crate::images::received_gif_limits())
             .map_err(|e| ImageError::Codec(e.to_string()))?;
         Ok(decoder.into_frames())
     }
@@ -103,7 +101,10 @@ impl GifStream {
         };
         let (num, den) = frame.delay().numer_denom_ms();
         let ms = num.checked_div(den).unwrap_or(100);
-        let delay_ms = if ms == 0 { 100 } else { ms };
+        // 10 ms or less plays as 100 ms, as browsers do: a GIF saying
+        // 10 ms was never meant to run at 100 frames a second, and
+        // here each frame is a decode (review 2026-10, P3-6).
+        let delay_ms = if ms <= 10 { 100 } else { ms };
         let buf = frame.into_buffer();
         self.width = buf.width();
         self.height = buf.height();
@@ -143,7 +144,7 @@ impl GifStream {
 /// the 3-loop budget 3–5× too long for fast GIFs). Falls back to 3 s
 /// if the parse loses sync.
 #[must_use]
-pub fn loop_secs(bytes: &[u8]) -> f64 {
+pub(crate) fn loop_secs(bytes: &[u8]) -> f64 {
     let mut i = 13 + gif_gct_len(bytes);
     let mut total_cs: u64 = 0;
     while i < bytes.len() {
@@ -157,7 +158,8 @@ pub fn loop_secs(bytes: &[u8]) -> f64 {
                 // nearly every GIF's budget at the 30 s cap.
                 if is_gce && i + 5 < bytes.len() {
                     let d = u64::from(u16::from_le_bytes([bytes[i + 4], bytes[i + 5]]));
-                    total_cs += if d == 0 { 10 } else { d };
+                    // As `next_frame` plays them: 10 ms or less is 100 ms.
+                    total_cs += if d <= 1 { 10 } else { d };
                 }
                 i += 2;
                 i = skip_gif_subblocks(bytes, i);
@@ -227,7 +229,7 @@ mod decode_tests {
         // and keeps none.
         let bytes = synth_gif(480, 200);
         assert!(bytes.len() < 1024 * 1024, "must pass the wire budget");
-        let mut stream = GifStream::open(std::rc::Rc::new(bytes)).expect("opens");
+        let mut stream = GifStream::open(std::sync::Arc::from(bytes)).expect("opens");
         for _ in 0..3 {
             let frame = stream.next_frame().expect("a frame");
             assert_eq!(frame.rgba.len(), 480 * 480 * 4);
@@ -251,8 +253,8 @@ mod decode_tests {
 
     #[test]
     fn stream_decodes_frame_by_frame_and_rewinds() {
-        let bytes = std::rc::Rc::new(synth_gif(64, 5));
-        let mut stream = GifStream::open(std::rc::Rc::clone(&bytes)).expect("opens");
+        let bytes: std::sync::Arc<[u8]> = synth_gif(64, 5).into();
+        let mut stream = GifStream::open(std::sync::Arc::clone(&bytes)).expect("opens");
         let mut n = 0;
         while let Some(frame) = stream.next_frame() {
             assert_eq!(frame.delay_ms, 40);
@@ -276,7 +278,7 @@ mod decode_tests {
         let full = synth_gif(64, 10);
         // Chop the file mid-stream: some frames must still come out,
         // then a clean end instead of an error or panic.
-        let cut = std::rc::Rc::new(full[..full.len() * 2 / 3].to_vec());
+        let cut: std::sync::Arc<[u8]> = full[..full.len() * 2 / 3].into();
         let mut stream = GifStream::open(cut).expect("header intact");
         let mut n = 0;
         while stream.next_frame().is_some() {

@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use crate::{Interest, Kick, Modifier, Source};
+use crate::{Interest, Kick, Modifier, Source, Woke};
 
 pub(crate) fn is_modifier(_key: u16) -> bool {
     false
@@ -37,7 +37,7 @@ impl Source for Keys {
         false
     }
 
-    fn wait(&mut self, _timeout: Option<Duration>) -> bool {
-        false
+    fn wait(&mut self, _timeout: Option<Duration>) -> Woke {
+        Woke::Other
     }
 }

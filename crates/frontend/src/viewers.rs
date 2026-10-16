@@ -156,15 +156,20 @@ impl Viewer {
             let weak = win.as_weak();
             let armed = std::rc::Rc::new(std::cell::Cell::new(false));
             let seen = Rc::clone(&minimized);
-            crate::app::repaint_on_reveal(win.window(), armed, move || {
-                if let Some(w) = weak.upgrade() {
-                    w.set_repaint_flip(!w.get_repaint_flip());
-                }
-                // Revealed (focused, resized, uncovered): restored, if
-                // it was minimized. The hook runs before the event is
-                // applied, so the look comes after.
-                seen.recheck(&weak);
-            });
+            crate::app::repaint_on_reveal(
+                win.window(),
+                armed,
+                move || {
+                    if let Some(w) = weak.upgrade() {
+                        w.set_repaint_flip(!w.get_repaint_flip());
+                    }
+                    // Revealed (focused, resized, uncovered): restored, if
+                    // it was minimized. The hook runs before the event is
+                    // applied, so the look comes after.
+                    seen.recheck(&weak);
+                },
+                |_| {},
+            );
             win.show()?;
             Surface::Window(win)
         };
@@ -387,17 +392,35 @@ pub fn open_gallery(app: &mut AppState, row_id: i32) {
     s.set_viewer_has_prev(pos > 0);
     s.set_viewer_has_next(pos + 1 < ids.len());
 
-    // The picture (a GIF's first frame) at full size; an animation then
-    // loops for as long as the overlay shows it, frame by frame like a
-    // chat row's (no autoplay budget here).
-    if let Ok((img, _, _)) = ui::convert::decode_to_image(&bytes) {
-        s.set_viewer_image(img.clone());
-        if is_gif {
-            app.gallery_gif = crate::media::GifPlayer::looping(bytes, img);
-        }
-    }
-    if app.gallery_gif.is_some() {
-        app.ensure_gif_ticker();
+    // The row's preview at once, then the picture (a GIF's first frame)
+    // at full size, decoded on a thread of its own — up to 4096², it was
+    // a long stall on the UI thread (review 2026-10, CLI-1). An
+    // animation then loops for as long as the overlay shows it, frame
+    // by frame like a chat row's (no autoplay budget here).
+    s.set_viewer_image(crate::pictures::preview(row_id));
+    let spawned = std::thread::Builder::new()
+        .name("gallery-decode".into())
+        .spawn(move || {
+            let decoded = ui::convert::decode_preview_pixels(&bytes, u32::MAX);
+            let _ = slint::invoke_from_event_loop(move || {
+                crate::app::with_current(|app| {
+                    let Ok((pixels, _, _)) = decoded else {
+                        return;
+                    };
+                    if app.gallery_row != Some(row_id) {
+                        return;
+                    }
+                    let img = slint::Image::from_rgba8(pixels);
+                    app.main.global::<State>().set_viewer_image(img.clone());
+                    if is_gif {
+                        app.gallery_gif = Some(crate::media::GifPlayer::looping(bytes, img));
+                        app.ensure_gif_ticker();
+                    }
+                });
+            });
+        });
+    if let Err(e) = spawned {
+        log::warn!("gallery: no decoder thread: {e}");
     }
 
     app.main.global::<State>().set_viewer_open(true);

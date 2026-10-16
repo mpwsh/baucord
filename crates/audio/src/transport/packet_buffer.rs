@@ -173,9 +173,6 @@ pub struct PacketBuffer {
     /// does not run the decoder for it — it did, fifty times a second
     /// for every peer sitting quiet in the room (review P2-34).
     last_real_silent: bool,
-    /// Duration of the last decoded real frame, for the caller's
-    /// loss-protection floor.
-    last_real_samples: usize,
     /// Decoded PCM for the current slot, consumed by `fill`.
     staging: [f32; MAX_FRAME],
     staged: usize,
@@ -193,7 +190,6 @@ impl PacketBuffer {
             dry_plc_used: 0,
             last_real_quiet: true,
             last_real_silent: true,
-            last_real_samples: FRAME_SIZE,
             staging: [0.0; MAX_FRAME],
             staged: 0,
             pos: 0,
@@ -511,7 +507,6 @@ impl PacketBuffer {
                 self.dry_plc_used = 0;
                 self.last_real_quiet = is_quiet(&self.staging[..n]);
                 self.last_real_silent = is_silent(&self.staging[..n]);
-                self.last_real_samples = n;
                 self.next_seq = slot.seq.wrapping_add(1);
                 self.next_ts = slot.ts.wrapping_add(n as u32);
                 Refill::Real

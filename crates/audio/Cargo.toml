@@ -8,9 +8,6 @@ description = "audio components for baucord"
 [lints]
 workspace = true
 
-[features]
-serde = ["dep:serde"]
-
 [dependencies]
 # Audio I/O. 0.18.2 minimum: 0.18.0/0.18.1 advertise 48 kHz output on
 # WASAPI and then refuse to open it ("Stream configuration is not
@@ -52,7 +49,7 @@ realfft = "3.5"
 # (clap 3, anyhow, hound) and a `dasp` adapter, nothing the engine calls.
 nnnoiseless = { version = "0.5", default-features = false }
 
-serde = { workspace = true, optional = true }
+serde.workspace = true
 
 # Logging
 log.workspace = true

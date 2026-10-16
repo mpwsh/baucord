@@ -1,9 +1,14 @@
+# The official server's own config (PRODUCTION-PLAN OPS-1: it leaves
+# the repository once the host keeps its own copy). A new host starts
+# from config/baucord.example.yaml instead.
 server:
   name: Baucord Server
   host: 0.0.0.0
-  port: 5000
+  # The same port docker-compose.yaml publishes (old invites on 5000:
+  # publish "5000:51000/udp" as well, SESSION-GUIDE "Network diagnosis").
+  port: 51000
   # Printed in the invite string at startup: <public_address>#SHA256:<fingerprint>
-  public_address: "216.238.121.18:5000"
+  public_address: "216.238.121.18:51000"
   greeting_message: Welcome to the server!
 network:
   max_clients: 256
@@ -12,25 +17,23 @@ limits:
   max_viewers_per_stream: 8
   media_relay_kb_per_sec: 1024
   max_chat_bytes: 2000
-  max_image_kb_per_minute: 20480
-  max_image_kb_per_minute_global: 65536
+  max_transfer_kb_per_minute: 20480
+  max_transfer_kb_per_minute_global: 65536
 logging:
   level: info
   stats_interval_secs: 3600
   link_stats_interval_secs: 2
   telemetry: true
   file: ""
-authentication:
-  # Every connection is encrypted and pinned regardless; `secure` only
-  # decides whether Hello must carry the room password.
-  secure: true
-  password: conos
 identity:
   # Mounted from ./data/baucord on the host (docker-compose.yml) so the
   # Ed25519 identity key survives container recreation. Generated on
   # first start; clients pin it, so back it up. Client log uploads land
   # in logs/ underneath.
   dir: /app/data
+persistence:
+  # Where the relative default put it (WORKDIR /app), written out.
+  path: /app/data/baucord/baucord.db
 channels:
   - name: Lobby
     default: true

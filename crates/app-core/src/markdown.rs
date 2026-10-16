@@ -18,7 +18,7 @@
 
 /// One piece of a message after fence extraction.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Segment {
+pub(crate) enum Segment {
     /// Regular text (still carrying `*`/`_`/`` ` `` markup).
     Text(String),
     /// The verbatim inside of a ```` ``` ```` fence.
@@ -33,7 +33,7 @@ pub enum Segment {
 /// a fence — the rest stays literal text, like `WhatsApp` treats
 /// unpaired markup.
 #[must_use]
-pub fn split_fences(body: &str) -> Vec<Segment> {
+pub(crate) fn split_fences(body: &str) -> Vec<Segment> {
     let mut out = Vec::new();
     let mut text = String::new();
     let mut rest = body;
@@ -114,6 +114,19 @@ fn find_close(chars: &[char], open: usize, tok: char) -> Option<usize> {
 /// trailing sentence punctuation is not part of the link, and a bare
 /// scheme with nothing behind it doesn't count.
 fn match_url(chars: &[char]) -> Option<(String, usize)> {
+    // Only a word that starts like a link is collected: two strings per
+    // word, every word of every message, was the old price (review
+    // 2026-10, P3-48).
+    let starts = |prefix: &str| {
+        prefix.len() <= chars.len()
+            && prefix
+                .chars()
+                .zip(chars)
+                .all(|(p, c)| c.to_ascii_lowercase() == p)
+    };
+    if !(starts("http://") || starts("https://") || starts("www.")) {
+        return None;
+    }
     // The destination is emitted as `](<url>)`: a `<` or `>` would end
     // it early and a backslash could escape the closer, letting the
     // rest of the message add a second link of any scheme
@@ -182,6 +195,7 @@ pub fn to_commonmark(text: &str, code_color: Option<&str>) -> (String, bool) {
     let mut styled = false;
     // Where in `out` the open heading's text begins (after its `**`).
     let mut heading: Option<usize> = None;
+    let mut unclosed = Unclosed::default();
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
@@ -215,9 +229,12 @@ pub fn to_commonmark(text: &str, code_color: Option<&str>) -> (String, bool) {
             // literally, so nothing inside needs escaping (a backtick
             // can't appear inside a single-backtick span anyway).
             '`' => {
-                if let Some(close) = (i + 1..chars.len())
-                    .take_while(|&j| chars[j] != '\n')
-                    .find(|&j| chars[j] == '`')
+                let close = unclosed.find(&chars, i, || {
+                    (i + 1..chars.len())
+                        .take_while(|&j| chars[j] != '\n')
+                        .find(|&j| chars[j] == '`')
+                });
+                if let Some(close) = close
                     && close > i + 1
                 {
                     if let Some(color) = code_color {
@@ -239,7 +256,7 @@ pub fn to_commonmark(text: &str, code_color: Option<&str>) -> (String, bool) {
                 i += 1;
             }
             '*' | '_' if can_open(&chars, i) => {
-                if let Some(close) = find_close(&chars, i, c) {
+                if let Some(close) = unclosed.find(&chars, i, || find_close(&chars, i, c)) {
                     let (open_mark, close_mark) = if c == '*' {
                         ("**", "**") // WhatsApp bold
                     } else {
@@ -292,6 +309,41 @@ pub fn to_commonmark(text: &str, code_color: Option<&str>) -> (String, bool) {
 /// `CommonMark`, and a heading typed with a space after it showed its
 /// asterisks (review P3-39). A heading of nothing but spaces is no
 /// heading: its opening goes too.
+/// Where the line ends past which a closer was looked for and not
+/// found, per opener (`*`, `_`, a backtick): every later opener on that
+/// line looks in less and finds none either, so it does not look. A
+/// line of unmatched `*`s was quadratic (review 2026-10, P3-48).
+#[derive(Default)]
+struct Unclosed([Option<usize>; 3]);
+
+impl Unclosed {
+    /// The closer `search` finds for the opener at `chars[at]`, unless
+    /// one like it on this line already looked in vain.
+    fn find(
+        &mut self,
+        chars: &[char],
+        at: usize,
+        search: impl FnOnce() -> Option<usize>,
+    ) -> Option<usize> {
+        let slot = match chars[at] {
+            '*' => 0,
+            '_' => 1,
+            _ => 2,
+        };
+        if self.0[slot].is_some_and(|end| at < end) {
+            return None;
+        }
+        let found = search();
+        if found.is_none() {
+            let line_end = (at..chars.len())
+                .find(|&j| chars[j] == '\n')
+                .unwrap_or(chars.len());
+            self.0[slot] = Some(line_end);
+        }
+        found
+    }
+}
+
 fn close_heading(out: &mut String, text_at: usize) {
     let end = out.trim_end_matches([' ', '\t']).len();
     if end <= text_at {
@@ -304,6 +356,25 @@ fn close_heading(out: &mut String, text_at: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Thousands of unmatched openers on a line take linear time, and
+    /// render as they were typed (review 2026-10, P3-48).
+    #[test]
+    fn unmatched_openers_are_cheap_and_literal() {
+        let line = " *a _b".repeat(20_000);
+        let started = std::time::Instant::now();
+        let (out, styled) = to_commonmark(&line, None);
+        assert!(!styled);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(out.contains("\\*a"), "escaped, not styled");
+        // A closer on the next line is a new line's business.
+        // (A newline goes out as a hard break.)
+        assert_eq!(to_commonmark("*a\n*b*", None).0, "\\*a\\\n**b**");
+    }
 
     fn to_commonmark_none(text: &str) -> (String, bool) {
         to_commonmark(text, None)

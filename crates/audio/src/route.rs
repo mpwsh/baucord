@@ -91,7 +91,7 @@ pub fn label(device: &RouteDevice) -> String {
 /// The device the automatic choice takes: a connected headset, else
 /// the loudspeaker, else whatever is first.
 #[must_use]
-pub fn auto_choice(devices: &[RouteDevice]) -> Option<usize> {
+fn auto_choice(devices: &[RouteDevice]) -> Option<usize> {
     PERSONAL
         .iter()
         .find_map(|kind| devices.iter().position(|d| d.kind == *kind))

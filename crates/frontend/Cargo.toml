@@ -54,7 +54,7 @@ client = { path = "../client" }
 # Fingerprint parsing for the settings editor and the identity key type.
 transport = { path = "../transport" }
 i18n = { path = "../i18n" }
-audio = { path = "../audio", features = ["serde"] }
+audio = { path = "../audio" }
 video = { path = "../video" }
 app-core = { path = "../app-core" }
 ui = { path = "../ui" }
@@ -101,13 +101,10 @@ arboard = { version = "3", default-features = false, optional = true, features =
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"], optional = true }
 pollster = { version = "0.4", optional = true }
 
-[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
-# The app's own CPU and memory, for the resource line and `/mem`. A
-# phone reads the two numbers itself (`app_core::usage`) and does not
-# carry the library (review P3-50).
-sysinfo = { version = "0.39", default-features = false, features = ["system"] }
-
 [target.'cfg(target_os = "macos")'.dependencies]
+# `setxattr` for the quarantine flag on a saved download (review
+# 2026-10, P1-9); already in the tree through std's own dependents.
+libc = "0.2"
 # Native NSPasteboard access for what the toolkit clipboard layer can't
 # see: copied files (paste the file, not its icon) and PNG-only
 # sources like screenshot copies. Only the NSPasteboard header —

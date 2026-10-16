@@ -27,19 +27,20 @@ pub enum DeviceNotice {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct DeviceDiff {
     pub notices: Vec<DeviceNotice>,
-    /// Clear the saved input selection and rebuild on the default.
-    pub rebuild_input: bool,
-    /// Clear the saved output selection and rebuild on the default —
-    /// and, if a screen share is running, restart WASAPI loopback
-    /// capture (it records from the default output device).
-    pub rebuild_output: bool,
+    /// The output voice plays on moved: the default changed with nothing
+    /// picked, or the picked output came or went. A running share's
+    /// sound capture is restarted on it. The engine follows the default
+    /// by itself, and the shell stands the default in for a picked
+    /// device while it is unplugged (review 2026-10, P2-9): this asked
+    /// it to clear the pick and reopen, a second time.
+    pub output_moved: bool,
     /// Nothing changed at all (early-out for the caller).
     pub unchanged: bool,
 }
 
 /// Extract the name of whichever device is marked as the OS default.
 #[must_use]
-pub fn default_device(devices: &[(String, bool)]) -> Option<String> {
+pub(crate) fn default_device(devices: &[(String, bool)]) -> Option<String> {
     devices
         .iter()
         .find(|(_, is_default)| *is_default)
@@ -97,34 +98,34 @@ pub fn diff(
         notices.push(DeviceNotice::SpeakerDisconnected((*name).into()));
     }
 
-    let rebuild_input = match selected_input {
-        Some(sel) => !new_in.contains(sel),
-        None => old_in_default != new_in_default,
-    };
-    if rebuild_input {
-        notices.push(if selected_input.is_some() {
-            DeviceNotice::InputLost
-        } else {
-            DeviceNotice::InputDefaultChanged(new_in_default)
-        });
+    // Said when it happens, once: a pick that went away (not at every
+    // change while it stays away), a default that moved.
+    match selected_input {
+        Some(sel) if old_in.contains(sel) && !new_in.contains(sel) => {
+            notices.push(DeviceNotice::InputLost);
+        }
+        None if old_in_default != new_in_default => {
+            notices.push(DeviceNotice::InputDefaultChanged(new_in_default));
+        }
+        _ => {}
     }
-
-    let rebuild_output = match selected_output {
-        Some(sel) => !new_out.contains(sel),
+    let output_moved = match selected_output {
+        Some(sel) => old_out.contains(sel) != new_out.contains(sel),
         None => old_out_default != new_out_default,
     };
-    if rebuild_output {
-        notices.push(if selected_output.is_some() {
-            DeviceNotice::OutputLost
-        } else {
-            DeviceNotice::OutputDefaultChanged(new_out_default)
-        });
+    match selected_output {
+        Some(sel) if old_out.contains(sel) && !new_out.contains(sel) => {
+            notices.push(DeviceNotice::OutputLost);
+        }
+        None if output_moved => {
+            notices.push(DeviceNotice::OutputDefaultChanged(new_out_default));
+        }
+        _ => {}
     }
 
     DeviceDiff {
         notices,
-        rebuild_input,
-        rebuild_output,
+        output_moved,
         unchanged: false,
     }
 }
@@ -160,28 +161,36 @@ mod tests {
     }
 
     #[test]
-    fn unplugging_selected_input_rebuilds_and_notes_loss() {
+    fn unplugging_selected_input_notes_the_loss_once() {
         let old = devs(&[("USB Mic", false), ("Built-in", true)]);
         let new = devs(&[("Built-in", true)]);
         let out = devs(&[("Spk", true)]);
         let d = diff(&old, &new, &out, &out, Some("USB Mic"), None);
-        assert!(d.rebuild_input);
         assert!(d.notices.contains(&DeviceNotice::InputLost));
         assert!(d
             .notices
             .contains(&DeviceNotice::MicDisconnected("USB Mic".into())));
+        assert!(!d.output_moved);
+        // Another device comes while it is away: no second "lost".
+        let more = devs(&[("Built-in", true), ("Webcam", false)]);
+        let d = diff(&new, &more, &out, &out, Some("USB Mic"), None);
+        assert!(!d.notices.contains(&DeviceNotice::InputLost));
     }
 
     #[test]
-    fn default_change_rebuilds_when_following_default() {
+    fn a_default_change_is_said_when_following_the_default() {
         let inp = devs(&[("Mic", true)]);
         let old_out = devs(&[("A", true), ("B", false)]);
         let new_out = devs(&[("A", false), ("B", true)]);
         let d = diff(&inp, &inp, &old_out, &new_out, None, None);
-        assert!(d.rebuild_output);
+        assert!(d.output_moved);
         assert!(d
             .notices
             .contains(&DeviceNotice::OutputDefaultChanged(Some("B".into()))));
+        // A picked output that stays is not moved by the default.
+        let d = diff(&inp, &inp, &old_out, &new_out, None, Some("A"));
+        assert!(!d.output_moved);
+        assert!(d.notices.is_empty());
     }
 
     #[test]

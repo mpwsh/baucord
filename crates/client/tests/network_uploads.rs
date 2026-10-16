@@ -266,9 +266,14 @@ fn uploads_keep_their_own_state() {
     // file's leftover slot used to make `CancelImage` do nothing, and
     // the picture went out in full: 1 MiB is two seconds of pacing.
     net.tx
-        .send(NetworkControl::SendImage(bytes(1024 * 1024, 3)))
+        .send(NetworkControl::SendImage {
+            token: 1,
+            data: bytes(1024 * 1024, 3),
+        })
         .expect("send");
-    net.tx.send(NetworkControl::CancelImage).expect("send");
+    net.tx
+        .send(NetworkControl::CancelImage { token: 1 })
+        .expect("send");
     thread::sleep(Duration::from_secs(3));
     let (image_chunks, image_count) = {
         let s = seen.lock().unwrap();
@@ -294,7 +299,10 @@ fn uploads_keep_their_own_state() {
         s.image_count = 0;
     }
     net.tx
-        .send(NetworkControl::SendImage(bytes(20 * 1024, 5)))
+        .send(NetworkControl::SendImage {
+            token: 2,
+            data: bytes(20 * 1024, 5),
+        })
         .expect("send");
     net.tx
         .send(NetworkControl::CancelUpload { upload_id: 103 })

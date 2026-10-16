@@ -10,13 +10,16 @@ workspace = true
 [dependencies]
 protocol = { path = "../protocol" }
 transport = { path = "../transport", features = ["server"] }
-serde = { version = "1.0", features = ["derive"] }
+serde.workspace = true
 chrono.workspace = true
-log = "0.4"
+log.workspace = true
 env_logger.workspace = true
 clap = { version = "4.6", features = ["derive", "env"] }
 ctrlc = { version = "3.5", features = ["termination"] }
 serde_yaml = "0.9.34"
+# A relayed picture's size from its header, without decoding it
+# (review 2026-10, CLI-1). Already in the tree through resvg.
+imagesize = "0.15"
 # SHA-256 for chat-image content hashes and client-key user ids.
 thiserror.workspace = true
 crossbeam-channel.workspace = true

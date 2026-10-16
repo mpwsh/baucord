@@ -38,8 +38,9 @@ What stands between this and "production for strangers":
    serves**, unsigned (UPD-1). Whoever gets the bucket key, the domain
    or a CI action gets code execution on every desktop that clicks
    Update.
-3. **Nothing runs the tests automatically** — releases are
-   compile-only (REL-1).
+3. **A release does not wait for the tests** — they run on every pull
+   request and push to `main` (`pr-check.yaml`, green on GitHub since
+   1.2.1), but the release jobs do not depend on them (REL-1).
 4. **Crashes in the field are invisible** (OPS-2).
 5. **Malicious content from other users** can freeze or exhaust a
    client: image/GIF decode bombs, oversized video, unbounded audio
@@ -148,15 +149,6 @@ What stands between this and "production for strangers":
 
 ### Client
 
-- [ ] **CLI-1 [P0][M] Picture decode bombs freeze every client.**
-  Received images decode on the UI thread with limits of 16384² and
-  512 MiB (`app-core/src/images.rs` ~190); GIF frames allocate a full
-  canvas each (`app-core/src/gif.rs` ~178–215, from `media.rs` ~198); the 800 px GIF cap is only on the
-  sender; history replays the picture to every newcomer; avatars use
-  the same path. A long UI stall backs up `route_message` and can drop
-  the connection. Fix: read the header first and refuse stills over
-  ~4096 px and GIF canvases over ~800 px, `max_alloc` ~64 MB, decode
-  off the UI thread; check dimensions on the server too.
 - [ ] **CLI-2 [P0][S] Oversized video from a malicious sharer.** The
   FFmpeg decoder has no `max_pixels` and builds a scaler and an RGBA
   frame at whatever size the SPS says (`video/src/codec.rs` ~620–746).
@@ -183,16 +175,17 @@ What stands between this and "production for strangers":
   unpacking the next release elsewhere makes a new user; import
   overwrites the key without a backup and with default permissions.
   Use the platform folder unless a `portable` marker exists; back up
-  before import; 0600.
-- [ ] **CLI-8 [P1][S] Received files open with one click.** Names keep
-  bidi controls (`invoice‮fdp.exe`); Open runs the OS handler; no
-  Mark-of-the-Web or quarantine. Strip format characters, confirm (or
-  refuse) executables and scripts, tag downloads on Windows/macOS.
+  before import; 0600. *2026-10-16 (review 2026-10, P2-17):* when the
+  settings move to another folder, `identity.key` and `avatar.png` go
+  with them (where the new folder has none); they were left behind and
+  the user was silently someone new.
 - [ ] **CLI-9 [P1][S] A device that will not come back should say
   so.** Since 2026-10-08 (§7) a side that failed to reopen is retried
-  every 2 s (`input_pending`, `output_pending`), so a lost device no
-  longer silences the session for good. Left: a `DeviceLost/Restored`
-  event, and the mic button showing it.
+  (`input_pending`, `output_pending`), so a lost device no longer
+  silences the session for good — after 2 s, then backing off to a
+  minute and starting over on any device event (2026-10-16, review
+  2026-10 P2-38: every 2 s for hours was a thread and a warning each).
+  Left: a `DeviceLost/Restored` event, and the mic button showing it.
 - [ ] **CLI-11 [P0][S] Windows lowers other apps while baucord is in
   voice** (user reports, 1.1.7). The echo canceller's Communications
   streams trigger Windows' "reduce other sounds by 80 %" (AEC-SPEC
@@ -215,6 +208,16 @@ What stands between this and "production for strangers":
   opt-out was not granted and Windows is set to lower, and a toast
   points there once per install. Not ducking at all on Windows 10
   takes our own canceller on plain streams (AEC-SPEC §8); not now.
+  *2026-10-16 (review 2026-10, P1-5; §7):* the call path is wanted in
+  a voice room only, on every platform — connecting turned every
+  other app down on Windows 10 speakers for the whole session, the
+  lobby included; and in a room the call-path streams open their
+  endpoint by id, not through the Communications role (AEC-SPEC E16),
+  for the reports that watching a stream on Windows 11 still lowered
+  other apps. Neither run on Windows yet: the `[10-16]` lines of
+  `DEVICE-CHECKLIST.md` — lobby on speakers, other apps keep their
+  volume; in a room, whether they are lowered (if not, E15's notice
+  can go).
 - [ ] **CLI-16 [P2][M] Desktop voice latency: what is left.** The
   2026-10-08 review: native WASAPI cost nothing (event-driven, MMCSS,
   20 ms render buffer). Our code adds ~74 ms one way; the estimate
@@ -231,10 +234,8 @@ What stands between this and "production for strangers":
 - [ ] **CLI-10 [P2] Smaller client items** *(review)*: auto-reconnect
   gives up after ~60 s (5 tries) — phones on a train need longer;
   server addresses must be IP literals (no DNS — also an App Review
-  problem on Apple's IPv6-only network); the desktop log lives in the
-  working directory and is never rotated; start-minimized plus an
-  update prompt never connects; `percent_decode` slices on bytes and
-  panics on a pasted `file:///%aé` (`images.rs` ~331); `with_app` is a
+  problem on Apple's IPv6-only network); start-minimized plus an
+  update prompt never connects; `with_app` is a
   plain `borrow_mut` that a synchronous Slint callback could re-enter;
   chat memory is bounded by rows, not bytes; release symbols are
   stripped so panic backtraces have no names.
@@ -259,6 +260,9 @@ What stands between this and "production for strangers":
   fires on `release: published`, which includes pre-releases, and the
   R2 `version` file moves too (the Docker image no longer moves
   `latest` for one, §7). Guard on `github.event.release.prerelease`.
+  *2026-10-16 (review 2026-10, P2-27):* the `version` file and the
+  site no longer move for a pre-release or an older tag. Left: the
+  phone workflows.
 
 ## 2a. The 2026-10-10 review
 
@@ -270,14 +274,26 @@ clash with this file's) are the work list for 1.2.1; a finished one gets
 a line in §7 naming its id, an open one stays in the review. Where a
 review item finished an item of this file, that item left its list.
 
+The second review, of `ui/tray-improvements` at `d2a800d`
+([baucord — staff engineering review, October 2026](https://claude.ai/code/artifact/3679c79a-0419-46f3-b4c1-f708bff49621)):
+2 P0, 12 P1, 51 P2 and 66 P3 items and a dead-code list. Its ids start
+at `P0-1` again, so this file and the code cite them as "review
+2026-10, P1-5"; a bare "review P1-5" is the first review's. All of it
+was fixed on 2026-10-16 (§7), with what only a device can confirm in
+`DEVICE-CHECKLIST.md` **[10-16]**.
+
 ## 3. Milestone B — release integrity, licensing, operations
 
 - [ ] **LEG-1 [P1][S] Pin the FFmpeg source.** Decided 2026-10-09
   (§6, 1; §7): a desktop build as a whole is GPL-3.0, and its notices
   say so and name the exact sources (LEG-3); x264 is pinned
-  (`X264_COMMIT`). Left: checksum the FFmpeg tarball (REL-4), and
-  configure FFmpeg with `--disable-everything` plus only what is used
-  (also less attack surface).
+  (`X264_COMMIT`). *2026-10-16 (review 2026-10, P3-38):* every desktop
+  ships FFmpeg 7.1.2 (Linux and macOS built 7.1.1, Windows vcpkg's
+  7.1.2), the tarball is checked against `FFMPEG_SHA256` in
+  `release.yml` — a digest computed from the HTTPS download that day,
+  **not** checked against FFmpeg's PGP signature — and avfilter and
+  swresample are configured out. Left: `--disable-everything` plus only
+  what is used (also less attack surface), and the signature.
 - [ ] **LEG-4 [P1] H.264 patent licensing** for encoding/decoding on the
   desktop — a question for counsel, not code.
 - [ ] **LEG-5 [P0 for stores][S] The stores' data forms.** The privacy
@@ -310,15 +326,19 @@ review item finished an item of this file, that item left its list.
 - [ ] **REL-1 [P0][S–M] A CI gate.** *In part, 2026-10-12:*
   `pr-check.yaml` is enabled again and rewritten — nightly
   `fmt --check`, `cargo check --locked` of the desktop build and the
-  phones' shared code, clippy, and the tests of the eight crates that
+  phones' shared code, clippy, and the tests of the nine crates that
   need no display (the versions test among them), in a Debian 13
-  container, on pull requests and on pushes to `main`. **Never run on
-  GitHub**: its first run is its test — the six socket-wait tests (§8)
-  have only ever failed in the sandbox it was written in. Left:
-  `release.yml` still runs `cargo build` without `--locked`; the release
-  guard checks only `crates/desktop` against the tag; clippy does not
-  yet deny warnings (the crates carry pedantic ones); the release jobs
-  do not `needs:` the check.
+  container, on pull requests and on pushes to `main`. It **ran green
+  on GitHub on `0b8c374`** (2026-10-12, §7), the six socket-wait tests
+  (§8) included: they fail only in the sandbox. *2026-10-16 (review
+  2026-10, P2-29, P3-59, T6):* `--locked` in `release.yml`'s build, the
+  Android release build and the iOS Release script too; one clippy
+  pass instead of a check and a clippy; the nightly pinned
+  (`nightly-2026-10-10`); `tools/chat-scroll-sim` and a Windows
+  type-check from Linux (MinGW, eight crates) as jobs of their own.
+  The release guard reads the workspace version every shipped crate
+  inherits. Left: clippy does not yet deny warnings (the crates carry
+  pedantic ones); the release jobs do not `needs:` the check.
 - [ ] **REL-2 [P1][M] Code signing**: Windows (Azure Trusted Signing or an
   OV certificate) and macOS (Developer ID, a real `.app` with an
   `Info.plist` — which is also how macOS attributes the microphone and
@@ -335,9 +355,11 @@ review item finished an item of this file, that item left its list.
 - [ ] **REL-4 [P1][S] Pin and verify build inputs.** Actions by SHA
   (`dtolnay/rust-toolchain@stable` is a branch), top-level
   `permissions: {}`, SHA-256 for the FFmpeg, PipeWire and x264 sources
-  and the Windows FFmpeg zip on R2 (its builder workflow is disabled and
-  names a different object). Skia's prebuilt download is unverified
-  upstream — note it.
+  and the Windows FFmpeg zip on R2. Skia's prebuilt download is
+  unverified upstream — note it. *2026-10-16:* the FFmpeg tarball has
+  its SHA-256 (LEG-1); the Windows zip's builder
+  (`build-ffmpeg-windows.yml.disabled`, kept disabled — the owner's
+  decision) now names the object `release.yml` downloads.
 - [ ] **REL-5 [P1][S] The website can advertise versions that do not
   exist yet**: `web.yaml` runs after any successful "Build and
   Release", including the cache-seeding pushes to `chunk`, and stamps
@@ -346,22 +368,31 @@ review item finished an item of this file, that item left its list.
   APK, which `android-release.yml` uploads on its own schedule: until
   it lands, the Android link 404s (minutes). Deploying the page after
   both workflows, or hiding a row whose HEAD fails, closes it.
+  *Since:* the page deploys after a release run only (1.2.1, review
+  P2-50), and only for the newest stable tag (2026-10-16, review
+  2026-10 P2-27: a rebuilt older tag or a backport moved it, the
+  `version` file and Docker's `latest` backwards). Left: the APK link.
 - [ ] **REL-6 [P2] Supply chain and release hygiene**: no
-  cargo-deny/audit; `serde_yaml` is deprecated; `atty` arrives through
-  `nnnoiseless`'s default `bin` feature; Dependabot PRs merge with no
+  cargo-deny/audit; `serde_yaml` is deprecated; Dependabot PRs merge with no
   CI; no Gradle wrapper checksum; floating NDK, cargo-ndk and runner
-  images; no CHANGELOG; the `version` file can go up before its zip;
+  images;
   the site promises SHA256SUMS that are never produced, "about 40 MB of
   RAM" (100–200 MB on macOS/Linux) and "a desktop app"; Google Fonts are
   loaded from Google (privacy).
 - [ ] **OPS-1 [P1][S] Deployment leftovers.** The drift itself is
-  fixed (2026-10-08, §7). Left: `config/baucord.yaml` is still the
-  official server's own, committed with its public IP, port 5000 and a
-  1.0 room password. Take it out of the repo once the host has its own
-  copy (a pull that deletes it would break the bind mount, and a
-  changed channel list applies live). Also: no `HEALTHCHECK`, no
+  fixed (2026-10-08, §7). *2026-10-16 (review 2026-10, P3-60, P3-61):*
+  `config/baucord.yaml` says port 51000 like the compose file, its 1.0
+  room password is gone (the server warns about an `authentication:`
+  section, or any section it does not read), and `persistence.path` is
+  written out there and in the example (the same file as before, no
+  longer relative to the container's working directory). Left: the
+  file is still the official server's own, with its public IP: take it
+  out of the repo once the host has its own copy (a pull that deletes
+  it would break the bind mount, and a changed channel list applies
+  live). Also: no `HEALTHCHECK`, no
   `read_only`/`cap_drop`/`no-new-privileges`, base images not pinned
-  by digest, amd64 only.
+  by digest, amd64 only. (The builder is Debian 12 like the runtime,
+  and the image is started once before it is pushed: P2-28.)
 - [ ] **OPS-2 [P1][M] Crash reporting.** Release builds abort on panic
   and write the hook's lines to a local log; native crashes (Skia,
   AAudio, JNI, FFmpeg) leave nothing a user can reach; Android symbols
@@ -444,6 +475,11 @@ Store is not decided yet.
   a connect error that names a refused local-network permission;
   activating the audio session on joining a room and deactivating it
   with `notifyOthersOnDeactivation` on leaving (a podcast resumes);
+  *2026-10-16, not built here (review 2026-10, P1-7, P3-14):* the
+  permission strings are in the three languages
+  (`ios/Resources/*.lproj/InfoPlist.strings`) and the bundle declares
+  them; out of a call the session mixes with other apps, and ending a
+  call deactivates it with `notifyOthersOnDeactivation`;
   the route control (Settings lists cpal's devices on iOS today; the
   plan maps `AVAudioSessionPort`s onto `audio::route`); DSCP through
   `SO_NET_SERVICE_TYPE` for both address families; dropping the
@@ -494,8 +530,10 @@ Store is not decided yet.
   today); the video group's finish-ack deadline (500 ms + 2·RTT),
   tuned once `sharing` lines show which cause abandons groups;
   timestamps on stream audio (real A/V sync); telemetry additions;
-  mimalloc for memory retention on macOS/Linux (measure first,
-  SESSION-GUIDE §4); simulcast or per-viewer rungs; a relay keyframe
+  memory retention on macOS/Linux (SESSION-GUIDE §4; mimalloc is not
+  the answer — measured 2026-10-16, §7: it never sees Skia's copy of
+  each frame, which goes through C `malloc`); simulcast or per-viewer
+  rungs; a relay keyframe
   cache; hardware decode on the desktop; hot-reload beyond
   `channels`; channel topics, reserved names, an away toggle
   (PERSISTENCE-SPEC §11 "later").
@@ -576,13 +614,16 @@ Store is not decided yet.
    `share` in `settings.json` is the way back for a machine where it
    draws wrong; there is no switch in the app.
 10. **Chat pictures' bytes on disk** (2026-10-14, open). Decoded
-   pictures are now kept only for what is on screen (§7), but each
+   pictures are now kept within 16 MB, those on screen included (§7), but each
    picture's wire bytes stay in memory for as long as its row (0.2–2
    MB, up to 10 MB a GIF): General's 500 rows of a picture-heavy
    evening can still hold tens of MB. Spilling the older ones to a
-   cache folder (emptied at start, like the avatars' cache beside it)
-   would bound that — but DM pictures would then sit on disk,
-   unencrypted, until the next start. Assumed no until you say.
+   cache folder (emptied at start) would bound that — but DM pictures
+   would then sit on disk, unencrypted, until the next start. Assumed
+   no until you say. (The avatars' cache beside it is kept across
+   starts, and holds profile pictures only since 2026-10-16: until
+   then every received chat picture, DM ones too, went into it for
+   good — review 2026-10, P0-1; §7.)
 
 ## 7. Done
 
@@ -836,7 +877,11 @@ One line each; the spec decision named holds the detail.
     decide on), `Config.authentication` (until OPS-1),
     `DecodedFrame.timestamp_ms` (its writers include the iOS decoder,
     which cannot be compiled here), and the two `.disabled` workflows
-    (to fix and enable, not to delete).
+    (to fix and enable, not to delete). *2026-10-16:* the blob, its
+    decoders, the columns, `Config.authentication` and
+    `DecodedFrame.timestamp_ms` are gone (§7); the one `.disabled`
+    workflow left names the right object and stays disabled, the
+    owner's decision.
 - **2026-10-12 — 1.2.1, the review's third batch** (§2a): what costs
   while nothing happens, and the audio leftovers.
   - *Timers.* The share's stats timer, the update's progress poll, the
@@ -1385,7 +1430,7 @@ One line each; the spec decision named holds the detail.
     asks `Logic.chat-picture(row-id, image-rev)` for the rows its
     `ListView` built, which are the ones on screen; `pictures.rs`
     keeps the wire bytes per row and an LRU of previews (16 MB of
-    RGBA beyond what is on screen), decodes a missing one on one
+    RGBA, the rows on screen included), decodes a missing one on one
     worker thread (newest request first), and bumps the row's
     `image-rev` when it is ready; it fades in over the empty frame.
     Rows are laid out from the header's size (`received_dimensions`),
@@ -1395,6 +1440,12 @@ One line each; the spec decision named holds the detail.
     wire bytes themselves stay in memory (0.2–2 MB a picture, 10 MB at
     most): spilling them to disk would cut that too, but would write
     DM pictures to disk — a decision for §6, not taken here.
+    *(Corrected 2026-10-16: every received picture still went through
+    the avatar path as well — decoded on the UI thread as it arrived,
+    kept for the session, written to `avatars/` for good — until
+    review 2026-10 P0-1; and Skia copies each picture and each stream
+    frame it draws into a buffer of its own, so the saving is smaller
+    than this reads, review 2026-10 P2-36.)*
   - *Tooltips* are drawn by one layer per window (`Tip` global,
     `TipLayer` in `widgets.slint`, last child of each window): a
     tooltip that was a child of its button was drawn under whatever
@@ -1474,6 +1525,174 @@ One line each; the spec decision named holds the detail.
   no other reader and is gone (`scripts/desktop-icons.py` no longer
   writes it; its `.ico` is byte for byte the same). Read back from a
   real X11 window: 64×64, the glyph.
+- **2026-10-16 — chat pictures are no longer avatars** (review
+  2026-10, P0-1). Every blob that arrived without being a download was
+  taken as an avatar: each chat picture — General on a server that
+  keeps history, every DM, every history page — was decoded on the UI
+  thread, kept as a 128² copy for the session, and its bytes written to
+  `avatars/` beside the settings for good. Only a blob a look asked
+  for is an avatar now (`Session::avatar_fetches`); the cache is
+  `avatar-cache/`, the old folder (with the chat pictures in it) is
+  deleted at startup on a thread of its own, and the decoded avatars
+  go with the session. `DEVICE-CHECKLIST.md` **[10-16]**.
+- **2026-10-16 — received pictures decode within what a sender can
+  reach** (review P0-2; CLI-1 in part). `received_dimensions` and
+  `decode_received` refuse a picture over 4096 px, or a progressive
+  JPEG over 8 MP (its decoder keeps every coefficient outside the
+  image crate's count), before decoding: it stays a file card to
+  save. They decode within 4096² and 64 MiB (were 16384² and 512 MB);
+  an animated GIF plays within a 1024 px canvas and 16 MiB, which also
+  stops a frame larger than its canvas (a 1×1 canvas with an 11000²
+  frame took 484 MB a frame). No sender makes more than 1280 px, so
+  nothing a shipped client sends as a picture is refused; a photo over
+  4096 px attached as a file now shows as a card. Also CLI-10's
+  `percent_decode`, which aborted the app on a pasted `file:///%aé`.
+  Tested in `app-core` (147 tests).
+- **2026-10-16 — leaving Settings keeps nothing but through Save and
+  close; the tab lists scroll** (ANDROID-SPEC D73, IOS-SPEC D63; the
+  user's ask, review P2-20). Escape, Back and the top bar's arrow do
+  what Close does; Back first takes down the Reset question. The
+  Settings and admin tab lists scroll and pan, so an iPhone SE keeps
+  Close and Save and close on screen. `DEVICE-CHECKLIST.md`
+  **[10-16]**.
+- **2026-10-16 — the tray's icons are hand-made**: the user drew
+  `tray.png` and `tray-quiet.png` from the app icon's dog on a disc
+  (`c597173`) and keeps them; `scripts/tray-icons.py`, which drew the
+  flat glyph and would have overwritten them, is gone, and START-HERE,
+  SESSION-GUIDE and the comments say so (review P3-57).
+- **2026-10-16 — the 2026-10 review, fixed whole** (§2a; the user:
+  "fix all, even the outside the code ones"). Every item of the second
+  review — 2 P0, 12 P1, 51 P2, 66 P3 and the dead-code list — and the
+  follow-ups asked for alongside. Each id's note is in the review's
+  working list; by area:
+  - *Pictures and memory* (CLI-1 done). After P0-1 and P0-2 (above):
+    GIF frames, avatars, the gallery, the send preview of a pasted or
+    linked picture and dropped or picked files are read and decoded on
+    threads of their own (`gif-decode`, `avatar-decode`,
+    `gallery-decode`, `picture-load`, `file-read`); an avatar over
+    512 px is refused (its initial shows). The picture decoder keeps
+    the newest 12 requests and shares each picture's bytes instead of
+    copying them (P1-4); a closed DM's, a blocked person's and an
+    ended session's pictures leave the store (P2-31); received bytes
+    carry no growth slack (P2-42). Photos turn by their EXIF
+    orientation, and EXIF and GPS no longer leave with a JPEG sent
+    as-is (P2-18). The relay drops a live chat picture over 4096 px a
+    side, which no client would show (stored pictures are files to the
+    server; clients refuse them on arrival, P0-2). "Load earlier" stops
+    where the held list would trim what is being read (P3-51).
+  - *Work nobody sees.* A share nobody watches for 3 s takes the still
+    screen's pace (P1-1). A stream nobody can see is not downloaded:
+    a phone in the background stops watching and resumes by itself on
+    return; a minimized desktop viewer keeps the sound and drops the
+    video before decoding (P1-2, P2-44). The chat's follow timer, the
+    device poll, the resource timer and GIFs wait while nothing is
+    drawn, Settings and the admin page included (P1-3, P2-30, P2-33).
+    The voice thread waits for events instead of a 1 s tick, and logs
+    its stats line in a room only, when something moved (P2-41); the
+    inbound watcher's backstop is 30 s (P2-40); a silenced capture and
+    an idle encoder wait (P3-24); no voice is encoded for nobody — a
+    mic test, the meter, an empty room (P2-37); a muted stream is not
+    decoded (P3-27); quiet telemetry goes once a minute (P3-40).
+    `keywatch` trusts proven key events for the whole process and
+    backs its check-up beat off to 4 s, and on Windows only a beat
+    that ran out counts as a missed press (P2-34). Stream audio goes
+    from the network thread to the player (P2-45). X11 screen capture
+    reads only what changed (DAMAGE, one connection, tested on Xvfb);
+    the other screenshot backends rest on a still screen (P2-43).
+    Android's colour conversion keeps its threads (P2-35); Windows
+    halves a 1440p/4K desktop on the GPU (P2-46) and redraws only the
+    pointer when only the pointer moved (P3-35).
+  - *Windows audio* (CLI-11). The call path only in a voice room
+    (P1-5) and call-path streams opened by endpoint id (AEC-SPEC E16):
+    see CLI-11. Device picks are kept while unplugged, the default
+    standing in (P2-9); a device that will not open is retried with a
+    back-off to 60 s (P2-38); the device-removed callback no longer
+    reopens every stream (P3-32); cpal's error callbacks count instead
+    of logging on the real-time thread (P3-33).
+  - *Network and server.* The server sends a keep-alive every 20 s
+    (P1-6, ANDROID-SPEC D74), so an Android phone in the lobby with
+    the screen off keeps its session — and a vanished client is now
+    noticed after up to ~50 s (30 s idle + 20 s), was ~30 s. A full
+    server is retried in 5–60 s and every reconnect is spread ±50 %
+    (P2-16). Pictures and files have budgets of their own (P1-11); a
+    ban made in the panel cannot drop out of memory (P1-12); a DM
+    store that timed out keeps its file's reference and recounts it (P2-24);
+    `max_chat_bytes` is capped at what a history page holds (P2-26);
+    a cancelled download stops the server's stream (P3-44); the CLI
+    keeps the panel's role and reason caps (P3-65). Database schema 7
+    (`0007_drop_unused.sql`) drops the six unused columns and the
+    stored telemetry blobs: **one way** — a 1.2.1 server refuses the
+    database, so rolling back means restoring a backup.
+  - *The client.* The identity key moves with the settings (P2-17);
+    the desktop log lives in the config folder and rolls at 5 MB
+    (P2-47, CLI-10 in part); a person's menu acts on that person, not
+    on the row (P1-8); a received program gets the Mark of the Web or
+    macOS's quarantine and opens its folder instead of running, and
+    names lose bidi controls and what Windows refuses (P1-9, P2-19:
+    CLI-8 done); an upload is hashed and framed off the network
+    thread (P2-39); settings saves are synced and skip identical
+    writes, and a missing key no longer sets a section aside (P3-43);
+    created invites are logged by their first 4 characters (P3-45).
+  - *Settings and quitting* (the user's ask, after D73). Only Save and
+    close keeps changes; a quit the user starts — the tray's Quit,
+    `/quit`, closing the window without a tray, an update's restart —
+    with unsaved changes brings the window up and asks: Save and quit,
+    Quit without saving, Cancel (stacked on a phone). The system
+    ending the app saves nothing.
+  - *Phones.* A mention has its own chime, a DM burst one sound
+    (P3-12, P3-15); the AFK room is out of a room for Android's
+    service (P3-13); the iOS bundle declares its three languages
+    (P3-14); the iPhone mixes with other apps out of a call (P1-7); a
+    phone decoder that loses its session asks for a keyframe (P1-10);
+    the small-screen fixes of P2-20 to P2-23 and P3-17 to P3-19.
+  - *Build and release.* Docker's `latest`, the `version` file and the
+    site move only for the newest stable tag (P2-27, REL-5); the image
+    builds on Debian 12 and starts once before the push (P2-28);
+    `--locked` everywhere (P2-29); release runs no longer save caches
+    nobody reads, and Docker's cache is in the registry (P2-48); FFmpeg
+    7.1.2 checksummed on every desktop (P3-38, LEG-1); the notices
+    leave our own crates out (all of `crates/`) and the site lists
+    Alpine.js (P3-56); the release scripts' quoting and pipes (P3-58);
+    CI cancels superseded pushes, skips docs-only ones, runs clippy
+    once on a pinned nightly's rustfmt, and runs `chat-scroll-sim` and
+    a Windows type-check (P3-59, REL-1); signed APKs and bundles only
+    from release tags, kept 7 days (P3-62); one list of workspace
+    dependencies (P3-63); the Play graphic without alpha (P3-64);
+    OPS-1 in part (P3-60, P3-61).
+  - *Dead code.* The 2026-10-12 list's leftovers (the telemetry blob
+    and its decoders, the columns, `Config.authentication`,
+    `DecodedFrame.timestamp_ms`) and the review's: `sysinfo` (one
+    sampler, `app_core::usage`, Windows included), unused `VoiceChat`,
+    capturer and buffer methods and fields, the `audio` crate's
+    `serde` feature, app-core items narrowed to the crate, unused Slint
+    properties, callbacks and imports, a translation key. The FFmpeg
+    builder workflow names the object `release.yml` downloads and stays
+    disabled (the owner's decision).
+  - *Decided.* Windows' 1 ms timer stays held in a voice room
+    (P3-30): dropping it needs a measurement of the voice path's waits
+    on Windows, and latency is what must not get worse. Skia's copy of
+    every drawn frame (P2-36) was measured on the pattern (1080p
+    frames from two decoder threads, copied on the UI thread through C
+    `malloc`): glibc keeps about three frames (26 MB) after a stop;
+    mimalloc as Rust's allocator changes nothing, since the copy is
+    Skia's; a fixed mmap threshold gives it back at 8× the CPU —
+    neither landed. These frames do not explain the ~150 MB
+    SESSION-GUIDE §4 reports after a viewed stream: measure it there
+    (`/mem`, `smaps_rollup`) first.
+    The desktop keeps its capture open in the lobby (§6, 5): P1-5's
+    second step, closing it there, is not done.
+  - *Checked*: 860 tests of the nine CI crates pass, the six
+    socket-wait ones failing as in every sandbox run (§8); clippy and
+    the nightly `fmt` CI pins; Windows (MinGW) clippy of eight crates,
+    Android's audio, video, client and app-core with the host crate's
+    Rust and Java, iOS's video, app-core and keywatch, macOS's
+    app-core and keywatch; the desktop with the tray and the phones'
+    `frontend`; Settings and the admin pages in the three languages at
+    five sizes and the quit question at two (headless, keys and taps);
+    `chat-scroll-sim`; the workflows with actionlint and shellcheck.
+    **Not run anywhere real:** Windows DXGI halving and the pointer
+    redraw, E16's streams, everything on iOS, the server against a
+    live deployment — `DEVICE-CHECKLIST.md` **[10-16]**.
 
 ## 8. Facts this plan rests on
 

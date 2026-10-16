@@ -98,7 +98,9 @@ sync skips rows that already match, so reading is not a change (1.2.1,
 review P1-22). With the server's socket wait capped at 1 s (review
 P1-2), a change reaches live sessions within about 3 s.
 Migrations are forward-only, recorded in `schema_version`; a downgrade
-refuses to start rather than guess.
+refuses to start rather than guess. Since migration 7 (columns dropped,
+§2) going back to an older server means restoring a backup taken before
+the upgrade.
 
 ### 1.1 Persistence on and off
 
@@ -142,7 +144,8 @@ after a restart, by design.
 ```yaml
 persistence:
   enabled: true                       # false = everything in memory for the session (§1.1)
-  path: data/baucord/baucord.db
+  path: data/baucord/baucord.db       # relative to the working directory; the Docker
+                                      # example writes /app/data/baucord/baucord.db out
   history: { replay: 50, retain_days: 90 }
   files:   { max_mb: 50, per_user_daily_mb: 500, total_cap_gb: 20, retain_days: 30 }
   avatars: { max_kb: 256 }
@@ -170,8 +173,8 @@ pins it to the wall.
 schema_version   (version)
 users            (user_id PK, name, created_at, last_seen, invited_with NULL,
                   name_color NULL, name_style {normal,bold,italic}, avatar_blob NULL,
-                  profile_locked, profile_updated_at)
-user_keys        (key_hash PK, user_id FK, label, added_at, last_seen, retired_at NULL)
+                  profile_updated_at)
+user_keys        (key_hash PK, user_id FK, added_at, last_seen, retired_at NULL)
                                                     -- devices; a user = one or more keys
 roles            (role_id PK, name UNIQUE, permissions BIGINT, rank, builtin)
 user_roles       (user_id, role_id, granted_by, granted_at)
@@ -181,8 +184,8 @@ restrictions     (id PK, user_id FK NULL, key_hash NULL, ip NULL,
 invites          (code PK, created_by FK, created_at, expires_at NULL, max_uses NULL,
                   uses, grants_role FK, revoked_at NULL)                   -- TS3 privilege key
 channels         (channel_id PK, name UNIQUE, password NULL, user_limit NULL,
-                  min_role NULL, permanent, afk_after_min NULL, is_afk,
-                  source {config,user}, created_by NULL, created_at, position, empty_since NULL)
+                  min_role NULL, permanent, afk_after_min NULL,
+                  source {config,user}, created_by NULL, created_at, empty_since NULL)
 conversations    (conv_id PK, kind {general,dm}, user_a NULL, user_b NULL)  -- dm: a < b
 messages         (msg_id PK, conv_id FK, ts, user_id, body, blob_id NULL, deleted_at NULL)
 message_reads    (conv_id, user_id, last_read_msg_id)                     -- unread counts
@@ -191,8 +194,8 @@ audit            (id PK, ts, actor_user_id, action, target, detail)
 user_progress    (user_id PK, xp, talk_seconds, share_seconds, watch_seconds,
                   online_seconds, messages, updated_at)
 telemetry_samples(ts, user_id, key_hash, rtt_ms, path_loss, voice_loss, groups_behind,
-                  rung, input_device, output_device, sample BLOB)
-telemetry_events (ts, user_id, key_hash, kind, event BLOB)
+                  rung, input_device, output_device)
+telemetry_events (ts, user_id, key_hash, kind)
 ```
 
 Indexes: `messages(conv_id, msg_id)`, `messages(ts)`, `restrictions(user_id)`,
@@ -200,7 +203,13 @@ Indexes: `messages(conv_id, msg_id)`, `messages(ts)`, `restrictions(user_id)`,
 since 1.2.1 `messages(user_id)` and `conversations(user_b)` (migration
 5, with the `counters` table that keeps the message-id watermark) and
 `messages(blob_id)` (migration 6, for the reference recount at
-startup). The schema is at version 6.
+startup). The schema is at version 7: migration 7 (`0007_drop_unused`,
+2026-10-16) drops what nothing read — `users.profile_locked` (the lock
+is the `profile` restriction), `user_keys.label`, `channels.is_afk`
+and `channels.position`, `blobs.declared_mime` (the sniffed type is
+the one served), and the whole telemetry sample and event kept as
+blobs beside the columns the reports read. A server older than
+schema 7 refuses the database; going back means restoring a backup.
 
 ### 2.1 Ids and keys
 
@@ -234,7 +243,7 @@ The 1.0 channel list in `server.yaml` remains the *base*: rows with
 `source = config` are re-synced from the file at startup and on hot
 reload; UI-created channels are `source = user` and survive restarts.
 The effective list is config channels first (file order), then user
-channels by `position`.
+channels in the order they were made (`created_at`, then id).
 
 ## 3. Identity, invites, and admission
 
@@ -581,10 +590,17 @@ ServerMessage::Blob… on a Media stream (existing paced relay), sha verified by
   `per_user_daily_mb` (500), `total_cap_gb` (20; oldest unreferenced
   blobs evicted first, then a hard refusal), and the per-minute
   transfer budget (`limits.max_transfer_kb_per_minute[_global]`) on top:
-  a minute with nothing in it takes any one upload whole, and the next
-  waits until those bytes leave the window — a file larger than the
-  budget used to be refused for good, as "today's allowance" (review
-  2026-10-14 SRV-1). A refusal by the budget is `Refused`, not `Quota`.
+  a minute with nothing of the client's in it takes any one upload of
+  theirs whole, and the next waits until those bytes leave the window —
+  a file larger than the budget used to be refused for good, as
+  "today's allowance" (review 2026-10-14 SRV-1). Pictures and stored
+  files keep a bucket each, per client and server-wide; the server-wide
+  one has no empty-minute exception, and the file one is never smaller
+  than the file cap (`allow_transfer(kind)`): one 20–50 MB file filled
+  the shared minute and every picture and file after it was refused for
+  60 s (review 2026-10, P1-11). A refusal by the budget is `Refused`,
+  not `Quota`. A chat picture over 4096 px on a side is not relayed
+  (its header read, `imagesize`; no client sends one that big).
   The paced relay bounds the instantaneous rate. Guests: no `UPLOAD`.
 - **What is stored:** bytes on disk by hash, metadata in `blobs`. The
   server sniffs the first bytes and stores *its* MIME next to the
@@ -642,8 +658,8 @@ ServerMessage::ProfileUpdated { user_id, profile: Profile }
 - **Rate limit:** one profile change per 30 s per user; over it,
   `ProfileDenied { RateLimited }`.
 - **Admin:** `ResetProfile { user_id, lock: bool }` clears it and,
-  with `lock`, sets `profile_locked` (a `profile` restriction) so it
-  cannot be set again until lifted. Audited like everything else.
+  with `lock`, adds a `profile` restriction so it cannot be set again
+  until lifted. Audited like everything else.
 
 The client keeps its profile locally and sends it in `SetProfile`
 right after `Welcome` on every connect. With persistence on the server
@@ -720,9 +736,12 @@ telemetry into the database, keep the log lines.
 - The persistence thread also stores each `TelemetrySample` as a row
   with the columns worth querying pulled out — `rtt_ms`, `path_loss`,
   `voice_loss`, `groups_behind`, `rung`, `input_device`,
-  `output_device` — and the whole sample as a blob for anything else.
-  Events (`ShareStarted`, `RateRungChanged`, `Disconnected`, …) go to
-  `telemetry_events`. Retention `telemetry.retain_days` (30).
+  `output_device`. Events (`ShareStarted`, `RateRungChanged`,
+  `Disconnected`, …) go to `telemetry_events` by kind. The whole sample
+  and event were kept as blobs too, which nothing ever read; migration
+  7 dropped them (§2), with their decoders. Retention
+  `telemetry.retain_days` (30). A client sends a quiet sample (both
+  directions under 2 kbit/s) once a minute, not every 10 s.
 - Coalescing under load: one row per user per sample interval, last
   wins; never a backlog.
 
@@ -846,8 +865,8 @@ voice unaffected, writes counted as dropped".
   `BlobChunk`, `BlobMissing`, bit `BLOBS`), which for now admit only
   avatar-sized images (`avatars.max_kb`); files as cards, daily
   quotas and eviction land on the same messages later. The lock is
-  the `profile` restriction; `profile_locked` on the user row stays
-  unused. Chat rows carry names only, by choice — the tile lives in
+  the `profile` restriction; `profile_locked` on the user row stayed
+  unused, and migration 7 dropped it. Chat rows carry names only, by choice — the tile lives in
   the roster and the hover card.
 - **Kick forgets, ban blocks (1.1, in use).** A kick is not a
   restriction: it closes the session and deletes the person's device
@@ -1043,6 +1062,34 @@ voice unaffected, writes counted as dropped".
     link (`web/terms.html`; `terms-notice`, `terms-link`). Nothing is
     stored; a settings file with the test builds' `terms_version`
     still loads. A server's own rules go in its greeting.
+
+- **S2. The 2026-10 review on the server (after 1.2.1, decided
+  2026-10-16).** *Schema 7* (§2): the unused columns and the telemetry
+  blobs dropped, one way — a backup taken before the upgrade is the
+  way back (CHANGELOG). *Transfers* (§7): a bucket for pictures and one
+  for files. *A stale policy snapshot is never taken*: one read before
+  the tick's own latest writes is asked for again at once, then after a
+  1 s pause, and after three such pauses every 4 s
+  (`RELOAD_PATIENCE`), the policy in memory kept meanwhile, until a
+  snapshot holds those writes — taking one dropped a ban made from the
+  panel 3–4 s earlier from memory until the next reload (P1-12). *A file's count after a
+  timeout*: a file DM whose store answer timed out keeps its reference
+  (the row may have been written) and asks the store, behind every
+  write already sent, how many rows point at the file
+  (`Query::BlobRefs` → `Answer::Count`, `Persist::ask_behind_writes`);
+  the count in memory becomes that, plus what changed in memory since
+  (P2-24). *History pages*: `limits.max_chat_bytes` is capped at a
+  quarter of a history page's budget (`MAX_CHAT_BYTES_LIMIT`, with a
+  warning), and a stored row too long for a page alone goes cut short
+  rather than as an empty page that said "more" (P2-26). *Roles*: the
+  CLI's role creation keeps to the panel's 100 (`policy::MAX_ROLES`,
+  `PersistError::TooManyRoles`), and a CLI restriction's reason is
+  clipped as the panel's is (P3-65). *Config*: the Docker example
+  writes `persistence.path` out (`/app/data/baucord/baucord.db`, where
+  the relative default put it under `WORKDIR /app`), and a top-level
+  section the server does not read is named in a warning at startup
+  — 1.0's `authentication` among them, whose settings went with this
+  batch.
 
 The first draft's decisions, in short (the entries above refine them):
 

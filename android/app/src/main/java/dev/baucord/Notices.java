@@ -45,8 +45,8 @@ final class Notices {
 
     private static Bitmap largeIcon;
 
-    /** The message chime, written to the cache once a process. */
-    private static File chime;
+    /** The chimes by name, each written to the cache once a process. */
+    private static final java.util.Map<String, File> chimes = new java.util.HashMap<>();
     /** The chime playing: held so the collector cannot cut it short. */
     private static MediaPlayer player;
 
@@ -156,19 +156,26 @@ final class Notices {
     }
 
     /**
-     * Play the message chime ({@code wav}) as a notification sound — for
-     * when the voice engine has no stream open (out of a voice room,
-     * ANDROID-SPEC.md D53). Rust has already checked the ringer and Do
-     * Not Disturb; the notification volume applies. UI thread.
+     * Play chime {@code name} ("message", "mention") as a notification
+     * sound — for when the voice engine has no stream open (out of a
+     * voice room, ANDROID-SPEC.md D53). {@code wav} is its sound the
+     * first time a run, empty after that (the file written then is
+     * played). Rust has already checked the ringer and Do Not Disturb;
+     * the notification volume applies. UI thread.
      */
-    static void playChime(Context context, byte[] wav) {
+    static void playChime(Context context, String name, byte[] wav) {
         try {
-            if (chime == null) {
-                File file = new File(context.getCacheDir(), "chime.wav");
+            File chime = chimes.get(name);
+            if (wav.length > 0) {
+                File file = new File(context.getCacheDir(), "chime-" + name + ".wav");
                 try (FileOutputStream out = new FileOutputStream(file)) {
                     out.write(wav);
                 }
+                chimes.put(name, file);
                 chime = file;
+            }
+            if (chime == null) {
+                return;
             }
             if (player != null) {
                 player.release();

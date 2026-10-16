@@ -42,8 +42,7 @@ pub use lanes::{
     VIDEO_FRAME_BUDGET, VOICE_DATAGRAM_BUDGET,
 };
 pub use messages::{
-    decode_client_message, decode_server_message, decode_telemetry_event, decode_telemetry_sample,
-    encode_client_message, encode_server_message, encode_telemetry_event, encode_telemetry_sample,
+    decode_client_message, decode_server_message, encode_client_message, encode_server_message,
     keep_prefix_that_fits, keep_suffix_that_fits, split_to_fit, Attachment, AudioSample, Auth,
     AuthorInfo, BlobId, ChannelDenyReason, ChannelInfo, ChannelSpec, ChannelUiDenyReason,
     ChatMessage, ClientId, ClientInfo, ClientKeyProof, ClientMessage, ConvRef, DenyReason,
@@ -72,8 +71,8 @@ pub use video::{
     MAX_VIDEO_FRAME_BYTES, VIDEO_CHUNK_PAYLOAD, VIDEO_HEADER_SIZE,
 };
 pub use voice::{
-    pack_voice, pack_voice_with_flags, parse_voice, VoiceHeader, VOICE_FLAGS_KNOWN, VOICE_FLAG_RED,
-    VOICE_HEADER_SIZE, VOICE_MAX_FRAME_SIZE, VOICE_MTU_BUDGET,
+    pack_voice, pack_voice_into, pack_voice_with_flags, parse_voice, VoiceHeader,
+    VOICE_FLAGS_KNOWN, VOICE_FLAG_RED, VOICE_HEADER_SIZE, VOICE_MAX_FRAME_SIZE, VOICE_MTU_BUDGET,
 };
 
 /// A full 64-hex-digit id (a user id, a key hash, a blob id) as its 32

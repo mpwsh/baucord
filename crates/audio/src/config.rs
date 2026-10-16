@@ -6,21 +6,20 @@
 /// Top-level configuration for [`VoiceChat`](crate::VoiceChat).
 ///
 /// Only expose what users actually need to decide. Sample rates, channel
-/// mapping, buffer sizes, and codec settings are all handled internally.
+/// mapping, buffer sizes, and codec settings are all handled internally;
+/// so are noise suppression, AGC and the compressor, always on (they
+/// were switches nothing turned off, review 2026-10 P2-50).
+///
+/// The defaults below are this crate's own (tests, examples). The app
+/// builds its configuration from the user's settings
+/// (`client::voice::engine_config`), whose defaults differ: a gate of
+/// `0.010` and an output gain of `1.0`.
 #[derive(Debug, Clone)]
 pub struct VoiceChatConfig {
     /// Input device name, or `None` for system default.
     pub input_device: Option<String>,
     /// Output device name, or `None` for system default.
     pub output_device: Option<String>,
-
-    /// Enable RNNoise-based noise suppression. Default: `true`.
-    ///
-    /// When enabled, background noise (fans, HVAC, keyboard, etc.) is
-    /// removed before the gate and encoding. This also reduces false
-    /// gate activations.
-    /// Toggle at runtime via [`VoiceChat::set_noise_suppression`](crate::VoiceChat::set_noise_suppression).
-    pub noise_suppression: bool,
 
     /// Master input gain multiplier (0.0–2.0). Default: `1.0`.
     ///
@@ -29,7 +28,7 @@ pub struct VoiceChatConfig {
     /// Adjustable at runtime via [`VoiceChat::set_input_gain`](crate::VoiceChat::set_input_gain).
     pub input_gain: f32,
 
-    /// Master output gain multiplier (0.0–2.0). Default: `1.0`.
+    /// Master output gain multiplier (0.0–2.0). Default: `0.4`.
     ///
     /// Applied after jitter buffer mixing, before playback.
     /// This is the "master volume" control.
@@ -49,26 +48,14 @@ pub struct VoiceChatConfig {
     /// Good starting points:
     /// - `0.005` (~-46 dBFS): Very sensitive — picks up whispers
     /// - `0.010` (~-40 dBFS): High sensitivity — quiet environments
-    /// - `0.020` (~-34 dBFS): Default — balanced for most situations
+    ///   (the app's default setting)
+    /// - `0.012` (~-38 dBFS): this type's default
+    /// - `0.020` (~-34 dBFS): Balanced for most situations
     /// - `0.040` (~-28 dBFS): Medium — requires clear speech
     /// - `0.080` (~-22 dBFS): Low sensitivity — only loud speech passes
     ///
     /// Adjustable at runtime via [`VoiceChat::set_gate_threshold`](crate::VoiceChat::set_gate_threshold).
     pub gate_threshold: f32,
-    /// Enable dynamic range compression. Default: `true`.
-    ///
-    /// Tames loud peaks (shouts, mic bumps) so they don't sound harsh,
-    /// especially when multiple people talk at once.
-    pub compressor_enabled: bool,
-    /// Enable automatic gain control. Default: `true`.
-    /// When enabled, mic input is automatically normalized to a consistent
-    /// level regardless of mic sensitivity or distance.
-    pub agc_enabled: bool,
-
-    /// AGC target loudness (RMS, 0.01–0.5). Default: `0.10`.
-    /// Higher = louder output. 0.10 ≈ -20 dBFS, good for voice chat.
-    pub agc_target_rms: f32,
-
     /// Echo cancellation (`AEC-SPEC.md`): when to open the streams on
     /// the platform's voice-call path. Default: [`AecMode::Auto`].
     /// Changed at runtime via
@@ -81,13 +68,9 @@ impl Default for VoiceChatConfig {
         Self {
             input_device: None,
             output_device: None,
-            noise_suppression: true,
             input_gain: 1.0,
             output_gain: 0.4,
             gate_threshold: 0.012,
-            compressor_enabled: true,
-            agc_enabled: true,
-            agc_target_rms: 0.10,
             echo_cancellation: crate::aec::AecMode::Auto,
         }
     }
@@ -96,8 +79,9 @@ impl Default for VoiceChatConfig {
 /// Per-peer audio settings (volume, mute).
 ///
 /// Used by the jitter buffer / mixer on the output side.
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+// Saved in the client's settings file; the feature that gated these
+// derives was always on (review 2026-10, P3-63).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PeerAudioSettings {
     /// Playback volume multiplier (0.0–2.0). Default 1.0.
     pub volume: f32,

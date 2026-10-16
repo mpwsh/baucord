@@ -34,16 +34,29 @@ static POOL: Mutex<Pool> = Mutex::new(Pool {
 /// recycled one that is big enough, else a new one. (It was the first
 /// that fit: a 3 MB YUV picture took the 8 MB RGBA buffer, and the next
 /// RGBA picture found none and allocated — review P2-43.)
+///
+/// A buffer more than twice the size asked for is not handed out: after
+/// a 4K share its 33 MB buffers served 8 MB pictures, most of each
+/// unused (review 2026-10, P3-37). One of them is freed instead each
+/// time nothing fits, so they leave as the smaller pictures come.
 #[must_use]
 pub fn take(len: usize) -> Vec<u8> {
     let reused = POOL.lock().ok().and_then(|mut pool| {
-        let (i, _) = pool
+        let most = len.saturating_mul(2);
+        let fit = pool
             .buffers
             .iter()
             .enumerate()
-            .filter(|(_, b)| b.capacity() >= len)
-            .min_by_key(|(_, b)| b.capacity())?;
-        Some(pool.buffers.swap_remove(i))
+            .filter(|(_, b)| (len..=most).contains(&b.capacity()))
+            .min_by_key(|(_, b)| b.capacity())
+            .map(|(i, _)| i);
+        if let Some(i) = fit {
+            return Some(pool.buffers.swap_remove(i));
+        }
+        if let Some(i) = pool.buffers.iter().position(|b| b.capacity() > most) {
+            drop(pool.buffers.swap_remove(i));
+        }
+        None
     });
     match reused {
         Some(mut buf) => {
@@ -124,6 +137,22 @@ mod tests {
         let (first, second) = (take(2_999), take(2_999));
         assert_eq!(first.as_ptr(), small_ptr);
         assert_eq!(second.as_ptr(), large_ptr, "then the next larger");
+    }
+
+    #[test]
+    fn a_buffer_far_too_large_is_freed_not_handed_out() {
+        let _turn = TURN.lock();
+        let held = |cap: usize| {
+            let pool = POOL.lock().unwrap();
+            pool.buffers.iter().any(|b| b.capacity() == cap)
+        };
+        recycle(Vec::with_capacity(9_013));
+        let small = take(4_000);
+        assert!(small.capacity() < 9_013, "a new one");
+        assert!(!held(9_013), "and the large one is gone");
+        // Twice the size is still taken.
+        recycle(Vec::with_capacity(8_011));
+        assert_eq!(take(4_006).capacity(), 8_011);
     }
 
     #[test]

@@ -58,12 +58,24 @@ targets:
 
     sources:
       - path: Resources/Assets.xcassets
+      # The permission prompts in the app's other languages (review
+      # 2026-10, P3-14; MOB-19): one InfoPlist.strings per .lproj.
+      - path: Resources/en.lproj
+      - path: Resources/es.lproj
+      - path: Resources/pt-BR.lproj
 
     info:
       path: Generated/Info.plist
       properties:
         CFBundleDisplayName: baucord
         CFBundleDevelopmentRegion: en
+        # The languages the app speaks: without them iOS shows its own
+        # pickers, share sheets and prompts in English to a Spanish or
+        # Portuguese phone (review 2026-10, P3-14).
+        CFBundleLocalizations:
+          - en
+          - es
+          - pt-BR
         # XcodeGen's defaults are "1.0" and "1": point them at the build
         # settings so the version and the build number are real.
         CFBundleShortVersionString: $(MARKETING_VERSION)

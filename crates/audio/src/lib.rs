@@ -78,7 +78,6 @@ pub mod stream;
 pub mod transport;
 
 use std::{
-    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, Mutex,
@@ -93,6 +92,7 @@ pub use aec::{AecMode, AecReport, AecTier, OutputKind};
 pub use config::{PeerAudioSettings, VoiceChatConfig};
 use cpal::traits::{DeviceTrait, HostTrait};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+pub use encoder::MAX_VOICE_PAYLOAD;
 use log::{debug, error, info};
 pub use loopback::LOOPBACK_DELAY;
 pub use platform::TimerResolutionGuard;
@@ -141,6 +141,14 @@ type Incoming = (AudioPacket, Instant);
 /// Minimum spacing between automatic stream restart attempts, so a device
 /// that is genuinely gone is retried calmly rather than hammered.
 const RESTART_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The longest wait between tries of a side that will not open: the
+/// wait doubles from [`RESTART_BACKOFF`] up to this. A missing device
+/// was tried every 2 s for the whole connection — on Windows a thread,
+/// COM and a warning each time, ~1,800 lines an hour (review 2026-10,
+/// P2-38). A device event, a pick, a room change or a success starts
+/// it over.
+const RETRY_MAX: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// How often `service` re-checks the OS default device where there are no
 /// change notifications (macOS/Linux).
@@ -303,6 +311,27 @@ fn platform_output_kind(_output_device: Option<&str>, _mode: aec::AecMode) -> ae
     }
 }
 
+/// Windows: the engine's "Default" is the communications device, and
+/// the device lists mark that one as the default — the one voice
+/// follows — not cpal's console default (review 2026-10, P2-9).
+#[cfg(windows)]
+static LISTS_MARK_COMMUNICATIONS: AtomicBool = AtomicBool::new(false);
+
+/// The name the device lists mark as the default: `console` (cpal's),
+/// or on Windows the communications default while voice follows it.
+#[cfg_attr(not(windows), allow(clippy::missing_const_for_fn))]
+fn voice_default_name(console: Option<String>, input: bool) -> Option<String> {
+    #[cfg(windows)]
+    if LISTS_MARK_COMMUNICATIONS.load(Ordering::Relaxed)
+        && let Some(name) = native::wasapi::communications_default_name(input)
+    {
+        return Some(name);
+    }
+    #[cfg(not(windows))]
+    let _ = input;
+    console
+}
+
 /// Windows: "Default" — no device picked — means the Default
 /// Communications Device unless echo cancellation is Off (AEC-SPEC.md
 /// D4), and it is resolved once, from the setting, for everything that
@@ -419,13 +448,16 @@ pub struct VoiceChat {
     loopback_rx: Receiver<PcmFrame>,
     sound_tx: Sender<sounds::SoundType>,
     sound_rx: Option<Receiver<sounds::SoundType>>,
+    /// The chimes, decoded once here for every output this engine
+    /// opens (review 2026-10, P3-25).
+    sounds: Arc<sounds::SoundBank>,
 
     // ── Thread handles ───────────────────────────────────────────────
     encoder_thread: Option<std::thread::JoinHandle<()>>,
 
     // ── Shared state ─────────────────────────────────────────────────
-    user_settings: Arc<Mutex<HashMap<u64, PeerAudioSettings>>>,
-    removed_peers: Arc<Mutex<HashSet<u64>>>,
+    /// Each peer\'s volume and mute, and who left, for the output worker.
+    peers: Arc<transport::jitter_buffer::PeerTable>,
     stats: Arc<AudioStats>,
     /// The speaking light (one for the engine's life; each input's
     /// chain drives it), and the ring its changes sound on.
@@ -454,6 +486,8 @@ pub struct VoiceChat {
     /// Last default-device poll (non-Windows) and last restart attempt.
     last_device_poll: Instant,
     last_restart_attempt: Instant,
+    /// The wait before the next try ([`RETRY_MAX`]).
+    retry_after: std::time::Duration,
 
     // ── Echo cancellation (`aec`, AEC-SPEC.md) ───────────────────────
     /// The plan the open streams were opened with: on the platform's
@@ -521,7 +555,7 @@ pub struct VoiceChat {
 
 /// What [`VoiceChat::start`] opened. Not a `Result`: with playback up
 /// and no microphone the engine is worth keeping, and an `Err` for that
-/// case had every caller checking `output_running()` before deciding
+/// case had every caller checking whether playback was open before deciding
 /// (the ones that did not, dropped the engine and silenced the room —
 /// review P3-24).
 #[derive(Debug)]
@@ -637,20 +671,12 @@ impl VoiceChat {
         let output_gain = Arc::new(AtomicU32::new(config.output_gain.to_bits()));
         let deafened = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(AudioStats::new());
-        let removed_peers = Arc::new(Mutex::new(HashSet::new()));
 
         // ── Spawn encoder thread ────────────────────────────────────
         let encoder_thread =
             encoder::spawn(audio_to_encoder_rx, encoder_to_network_tx, stats.clone());
 
-        let input_config = Arc::new(InputConfig::new(
-            config.noise_suppression,
-            config.input_gain,
-            config.gate_threshold,
-            config.compressor_enabled,
-            config.agc_enabled,
-            config.agc_target_rms,
-        ));
+        let input_config = Arc::new(InputConfig::new(config.input_gain, config.gate_threshold));
 
         #[cfg(windows)]
         let aec_communications = Arc::new(AtomicBool::new(false));
@@ -672,9 +698,9 @@ impl VoiceChat {
             sound_tx,
             input_config,
             sound_rx: Some(sound_rx),
+            sounds: Arc::new(sounds::SoundBank::new()),
             encoder_thread: Some(encoder_thread),
-            user_settings: Arc::new(Mutex::new(HashMap::new())),
-            removed_peers,
+            peers: Arc::new(transport::jitter_buffer::PeerTable::default()),
             #[cfg(windows)]
             device_watcher: match native::wasapi::DeviceWatcher::start(
                 stats.clone(),
@@ -692,6 +718,7 @@ impl VoiceChat {
             output_pending: false,
             last_device_poll: Instant::now(),
             last_restart_attempt: Instant::now().checked_sub(RESTART_BACKOFF).unwrap(),
+            retry_after: RESTART_BACKOFF,
             aec_wanted: false,
             aec_output: aec::OutputKind::Unknown,
             voice_streams: false,
@@ -783,6 +810,11 @@ impl VoiceChat {
     /// Bring the streams to what the configuration, the presence and
     /// the platform call for, given what just changed.
     fn reconcile(&mut self, cause: Cause) -> Done {
+        // Anything but a supervision tick is news: a side still missing
+        // is tried again soon.
+        if !matches!(cause, Cause::Tick(_)) {
+            self.retry_after = RESTART_BACKOFF;
+        }
         match self.decide(cause) {
             Step::Keep => Done::default(),
             Step::Replan(why) => {
@@ -1134,14 +1166,17 @@ impl VoiceChat {
             self.network_to_output_rx.clone(),
             self.loopback_rx.clone(),
             sound_rx,
-            self.user_settings.clone(),
-            self.removed_peers.clone(),
+            self.sounds.clone(),
+            self.peers.clone(),
             self.stats.clone(),
             self.config.output_gain,
             self.voice_streams,
         )?;
         #[cfg(windows)]
         output.set_communications_default(self.comms_default);
+        // The lobby's output on a phone that keeps one (iOS, D51) only
+        // keeps the app alive and plays a chime: large buffers there.
+        output.set_quiet(self.traits.shared_unit && !self.in_room);
         // A reopened output (a device change; on a phone every move
         // between the lobby and a room) carries on deafened and at the
         // volume it was — its handles start from the config otherwise.
@@ -1257,11 +1292,15 @@ impl VoiceChat {
     }
 
     /// What "Default" means from here on: for the streams the engine
-    /// opens next and, on Windows, for the device watcher.
+    /// opens next and, on Windows, for the device watcher and the
+    /// device lists' default mark.
     fn set_comms_default(&mut self, on: bool) {
         self.comms_default = on;
         #[cfg(windows)]
-        self.aec_communications.store(on, Ordering::Relaxed);
+        {
+            self.aec_communications.store(on, Ordering::Relaxed);
+            LISTS_MARK_COMMUNICATIONS.store(on, Ordering::Relaxed);
+        }
     }
 
     /// Put the platform in the plan's state, before either stream
@@ -1308,9 +1347,15 @@ impl VoiceChat {
         // or — if it will not open — neither does.
         #[cfg(target_os = "ios")]
         {
-            self.voice_unit = None;
+            let was_call = self.voice_unit.take().is_some();
             self.plain_watch = None;
+            if was_call && !wanted {
+                native::avsession::end_call();
+            }
             native::avsession::set_voice_mode(wanted);
+            if !self.in_room {
+                native::avsession::prefer_quiet_io();
+            }
             if wanted {
                 // Opened already muted when the microphone is not
                 // wanted, so a re-plan never lets it record (D51).
@@ -1352,10 +1397,11 @@ impl VoiceChat {
         if !self.traits.voice_path {
             return false;
         }
-        // A phone out of the voice rooms wants no plan and opened its
-        // streams without one: nothing can have gone stale, and the
-        // platform is not asked — three device lists on Android, the
-        // route on iOS, every 2 s in the lobby (review P3-25).
+        // Out of the voice rooms nothing wants the call path, and the
+        // streams opened without it: nothing can have gone stale, and
+        // the platform is not asked — three device lists on Android,
+        // the route on iOS, the endpoint's form factor on Windows,
+        // every 2 s in the lobby (review P3-25).
         if !self.call_path_wanted() && !self.aec_wanted {
             return false;
         }
@@ -1387,10 +1433,12 @@ impl VoiceChat {
     // ── What the phones keep open ────────────────────────────────────────
 
     /// Where we are and whether the microphone is wanted. On the
-    /// desktop only the room counts, and the streams stay as they are:
-    /// out of one, capture drops its samples like mute — nothing is
-    /// denoised, encoded or sent for the relay to throw away (review
-    /// P1-6); mute itself is [`Self::set_muted`]'s. On a phone
+    /// desktop only the room counts, and the streams stay open: out of
+    /// one, capture drops its samples like mute — nothing is denoised,
+    /// encoded or sent for the relay to throw away (review P1-6); mute
+    /// itself is [`Self::set_muted`]'s. Only a plan that changes with
+    /// the room — speakers under Automatic, the call path in a room and
+    /// plain streams out of one (P1-5) — reopens them. On a phone
     /// ([`RELEASES_MIC`]) it is what stays open. Before `start()` it
     /// only records them; after, it opens and closes what changed:
     ///
@@ -1407,11 +1455,24 @@ impl VoiceChat {
     pub fn set_presence(&mut self, in_room: bool, mic_wanted: bool) {
         self.stats.in_room.store(in_room, Ordering::Relaxed);
         if !self.traits.releases_mic {
+            let moved = in_room != self.in_room;
             self.in_room = in_room;
             self.sync_timer();
             self.input_config.in_room.store(in_room, Ordering::Relaxed);
             if !in_room {
                 self.is_speaking.set(false);
+            }
+            // The call path is a room's (`call_path_wanted`): a speakers
+            // user under Automatic re-plans at the join and the leave;
+            // anyone whose plan is plain streams either way keeps them.
+            if moved && self.started {
+                if self.call_path_plan() == self.aec_wanted {
+                    // Same streams; the report goes from "takes effect
+                    // when you join" to what they are, or back.
+                    self.update_aec_report();
+                } else {
+                    self.reconcile(Cause::Presence { path_moved: true });
+                }
             }
             return;
         }
@@ -1458,10 +1519,23 @@ impl VoiceChat {
     }
 
     /// The streams and paths go on the call path (the platform's echo
-    /// canceller, Android's communication mode): on a phone only in a
-    /// voice room.
+    /// canceller, Android's communication mode): in a voice room only,
+    /// on every platform. The desktop's was always wanted, and Windows
+    /// lowers every other app while a Communications stream runs: a
+    /// speakers user under Automatic had everything else turned down
+    /// from connect to disconnect, the lobby included, where there is
+    /// nothing to cancel (review 2026-10, P1-5).
     fn call_path_wanted(&self) -> bool {
-        !self.traits.releases_mic || self.in_room
+        self.in_room
+    }
+
+    /// Whether a plan made now would put the streams on the call path
+    /// (what [`Self::plan_aec`] decides), for the desktop to tell a
+    /// presence change that moves it from one that does not.
+    fn call_path_plan(&self) -> bool {
+        self.traits.voice_path
+            && self.call_path_wanted()
+            && aec::wants_aec(self.config.echo_cancellation, self.survey().output)
     }
 
     /// Playback is open: out of a room Android needs none (its
@@ -1531,6 +1605,10 @@ impl VoiceChat {
                 reason: aec::reasons::UNSUPPORTED,
                 lowers_others: false,
             })
+        } else if !self.call_path_wanted() {
+            // Out of a room nothing is planned (P1-5): "takes effect
+            // when you join voice", not "headphones" on speakers.
+            None
         } else if !self.aec_wanted {
             Some(aec::AecReport::not_wanted(mode, output))
         } else {
@@ -1584,14 +1662,6 @@ impl VoiceChat {
         }
     }
 
-    /// Playback is open. A caller whose `start()` failed on the capture
-    /// side only should keep this instance: the room stays audible and
-    /// the microphone is retried by `service()`.
-    #[must_use]
-    pub fn output_running(&self) -> bool {
-        self.output.is_some()
-    }
-
     // ── Public API ───────────────────────────────────────────────────────
 
     pub fn play_sound(&self, sound: SoundType) {
@@ -1618,28 +1688,16 @@ impl VoiceChat {
     }
 
     pub fn set_peer_settings(&self, peer_id: u64, settings: PeerAudioSettings) {
-        if let Ok(mut s) = self.user_settings.lock() {
-            s.insert(peer_id, settings);
-        }
+        self.peers.set(peer_id, settings);
     }
 
     pub fn add_peer(&self, peer_id: u64) {
-        if let Ok(mut s) = self.user_settings.lock() {
-            s.entry(peer_id).or_insert_with(PeerAudioSettings::default);
-        }
-        if let Ok(mut r) = self.removed_peers.lock() {
-            r.remove(&peer_id);
-        }
+        self.peers.add(peer_id);
         info!("Peer {peer_id} added");
     }
 
     pub fn remove_peer(&self, peer_id: u64) {
-        if let Ok(mut r) = self.removed_peers.lock() {
-            r.insert(peer_id);
-        }
-        if let Ok(mut s) = self.user_settings.lock() {
-            s.remove(&peer_id);
-        }
+        self.peers.remove(peer_id);
         info!("Peer {peer_id} removed");
     }
 
@@ -1704,8 +1762,11 @@ impl VoiceChat {
         }
     }
 
-    pub fn is_muted(&self) -> bool {
-        self.input_config.muted.load(Ordering::Relaxed)
+    /// Whether what the microphone hears goes to the encoder: off while
+    /// nobody can hear it (`InputConfig::transmit`). The speaking light
+    /// and the meters keep running either way.
+    pub fn set_transmit(&self, on: bool) {
+        self.input_config.transmit.store(on, Ordering::Relaxed);
     }
 
     pub fn set_deafened(&self, deafened: bool) {
@@ -1746,8 +1807,44 @@ impl VoiceChat {
         (self.opened_input.clone(), self.opened_output.clone())
     }
 
-    /// Device supervision. Call this from any periodic tick (100 ms – 1 s
-    /// is fine; it is cheap when nothing changed). It:
+    /// Rings when a stream failed or a default device moved: call
+    /// [`Self::service`] then. With [`Self::next_service`] it is all the
+    /// owner needs to wait on (review 2026-10, P2-41).
+    #[must_use]
+    pub fn trouble(&self) -> Receiver<()> {
+        self.stats.trouble()
+    }
+
+    /// When [`Self::service`] has something to do next without being
+    /// rung: a side still to be opened (its retry wait), or the slow
+    /// default-device poll where the OS sends no events and streams are
+    /// open. `None`: nothing until [`Self::trouble`] rings or a command
+    /// comes — a phone in the lobby with nothing open, a Windows desktop
+    /// whose device watcher is up. It was a tick every second whenever
+    /// an engine existed.
+    #[must_use]
+    pub fn next_service(&self) -> Option<Instant> {
+        let stats = &self.stats;
+        let flagged = stats.input_stream_failed.load(Ordering::Relaxed)
+            || stats.output_stream_failed.load(Ordering::Relaxed)
+            || stats.default_input_changed.load(Ordering::Relaxed)
+            || stats.default_output_changed.load(Ordering::Relaxed);
+        let late = (self.input.is_none() && self.input_pending && self.capture_wanted())
+            || (self.output.is_none() && self.output_pending && self.playback_wanted());
+        let retry = (flagged || late || self.aec_replan)
+            .then(|| self.last_restart_attempt + self.retry_after);
+        let open = self.input.is_some() || self.output.is_some();
+        let poll = (open && !self.has_device_events())
+            .then(|| self.last_device_poll + DEFAULT_DEVICE_POLL);
+        match (retry, poll) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Device supervision. Call this when [`Self::next_service`] comes
+    /// or [`Self::trouble`] rings (any periodic tick works too; it is
+    /// cheap when nothing changed). It:
     ///
     /// - restarts a side whose stream failed (device unplugged, invalidated,
     ///   repeated engine errors) on the same selection, with a 2 s backoff;
@@ -1783,10 +1880,20 @@ impl VoiceChat {
             input_late: self.input.is_none() && self.input_pending && self.capture_wanted(),
             output_late: self.output.is_none() && self.output_pending && self.playback_wanted(),
         };
+        // Taken whether or not anything waits for a device.
+        let arrived = stats.device_arrived.swap(false, Ordering::Relaxed);
         if !seen.any() && !self.aec_replan {
             return false;
         }
-        if now.duration_since(self.last_restart_attempt) < RESTART_BACKOFF {
+        // The OS said a device came or a default moved: try soon, not
+        // at the end of a long wait.
+        if arrived
+            || stats.default_input_changed.load(Ordering::Relaxed)
+            || stats.default_output_changed.load(Ordering::Relaxed)
+        {
+            self.retry_after = RESTART_BACKOFF;
+        }
+        if now.duration_since(self.last_restart_attempt) < self.retry_after {
             return false;
         }
         self.last_restart_attempt = now;
@@ -1801,6 +1908,13 @@ impl VoiceChat {
         let input_why = why(&stats.input_stream_failed);
         let output_why = why(&stats.output_stream_failed);
         let done = self.reconcile(Cause::Tick(seen));
+        let still_missing =
+            matches!(done.output, Some(Err(_))) || matches!(done.input, Some(Err(_)));
+        self.retry_after = if still_missing {
+            (self.retry_after * 2).min(RETRY_MAX)
+        } else {
+            RESTART_BACKOFF
+        };
         if done.replanned {
             return true;
         }
@@ -2001,7 +2115,10 @@ impl VoiceChat {
         }
 
         let host = cpal::default_host();
-        let default_name = host.default_input_device().and_then(|d| device_name(&d));
+        let default_name = voice_default_name(
+            host.default_input_device().and_then(|d| device_name(&d)),
+            true,
+        );
         let mut devices = Vec::new();
         for device in host.input_devices()? {
             if let Some(name) = device_name(&device) {
@@ -2050,7 +2167,10 @@ impl VoiceChat {
         }
 
         let host = cpal::default_host();
-        let default_name = host.default_output_device().and_then(|d| device_name(&d));
+        let default_name = voice_default_name(
+            host.default_output_device().and_then(|d| device_name(&d)),
+            false,
+        );
         let mut devices = Vec::new();
         for device in host.output_devices()? {
             if let Some(name) = device_name(&device) {
@@ -2094,6 +2214,7 @@ impl Drop for VoiceChat {
         // out of the voice-chat mode.
         #[cfg(target_os = "ios")]
         if self.voice_unit.take().is_some() {
+            native::avsession::end_call();
             native::avsession::set_voice_mode(false);
         }
 
@@ -2165,7 +2286,7 @@ mod headless_tests {
         for _ in 0..3 {
             // The microphone (also missing here) is not what is retried.
             vc.input_pending = false;
-            let due = Instant::now().checked_sub(RESTART_BACKOFF).unwrap();
+            let due = Instant::now().checked_sub(RETRY_MAX).unwrap();
             vc.last_restart_attempt = due;
             vc.service();
             assert!(

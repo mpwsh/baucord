@@ -12,9 +12,8 @@
 //!
 //! ## Context interaction
 //!
-//! - **Reads**: `ctx.gate_open` (hold gain when closed),
-//!   `ctx.agc_enabled` (bypass when `false`)
-//! - **Writes**: nothing (its gain is internal state; `current_gain()` exposes it)
+//! - **Reads**: `ctx.gate_open` (hold gain when closed)
+//! - **Writes**: nothing (its gain is internal state; the tests read it)
 //!
 //! ## How it works
 //!
@@ -23,39 +22,14 @@
 //! prevents pumping). Gate-aware: holds gain during silence so the next
 //! speech onset isn't blasted at max gain.
 
-use std::sync::{
-    atomic::{AtomicU32, Ordering},
-    Arc,
-};
-
 use super::{compute_rms, AudioProcessor, FrameContext};
 
-/// Tuneable parameters for automatic gain control.
-///
-/// Lives inside [`InputConfig`](crate::input_config::InputConfig).
-pub struct Knobs {
-    /// Target RMS level (f32 bits, 0.01–0.5). Default: 0.10.
-    pub target_rms: AtomicU32,
-}
-
-impl Knobs {
-    #[must_use]
-    pub fn with_target(target_rms: f32) -> Self {
-        Self {
-            target_rms: AtomicU32::new(target_rms.clamp(0.01, 0.5).to_bits()),
-        }
-    }
-}
-
-impl Default for Knobs {
-    fn default() -> Self {
-        Self::with_target(0.10)
-    }
-}
+/// The loudness the AGC steers speech to: RMS 0.10, about −20 dBFS. A
+/// knob nothing ever turned (review 2026-10, P2-50).
+pub const TARGET_RMS: f32 = 0.10;
 
 /// Real-time automatic gain control processor.
 ///
-/// All parameters are adjustable at runtime via atomic handles.
 pub struct AutoGainControl {
     // ── Target & limits ─────────────────────────────────────────────
     max_gain: f32,
@@ -67,18 +41,16 @@ pub struct AutoGainControl {
 
     // ── Runtime state ───────────────────────────────────────────────
     current_gain: f32,
-    knobs: Arc<Knobs>,
 }
 
 impl AutoGainControl {
-    /// Create an AGC that reads its target from shared knobs.
+    /// An AGC steering to [`TARGET_RMS`].
     ///
-    /// - `knobs`: shared parameter panel.
     /// - `max_gain_db`: maximum boost in dB (0–60). 30 dB ≈ 31.6×.
-    pub fn new(knobs: Arc<Knobs>, max_gain_db: f32) -> Self {
+    #[must_use]
+    pub fn new(max_gain_db: f32) -> Self {
         let max_gain = 10.0_f32.powf(max_gain_db.clamp(0.0, 60.0) / 20.0);
         Self {
-            knobs,
             max_gain,
             min_gain: 0.5,
             // Per-frame smoothing at a 20 ms frame cadence. These are the
@@ -91,6 +63,7 @@ impl AutoGainControl {
         }
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn current_gain(&self) -> f32 {
         self.current_gain
@@ -116,7 +89,7 @@ impl AutoGainControl {
             return g;
         }
 
-        let target = f32::from_bits(self.knobs.target_rms.load(Ordering::Relaxed));
+        let target = TARGET_RMS;
         let rms = compute_rms(samples);
 
         // Near-silence that snuck past the gate (e.g., hold period):
@@ -160,9 +133,6 @@ impl AutoGainControl {
 
 impl AudioProcessor for AutoGainControl {
     fn process(&mut self, samples: &mut [f32], ctx: &mut FrameContext) {
-        if !ctx.agc_enabled {
-            return;
-        }
         // Treat the gate's hold window like a closed gate: only the
         // residual noise floor is passing, and adapting to it ramps
         // gain upward, amplifying the post-speech noise tail. The
@@ -182,8 +152,7 @@ mod tests {
 
     #[test]
     fn gain_holds_steady_during_gate_hold_window() {
-        let knobs = Arc::new(Knobs::default());
-        let mut agc = AutoGainControl::new(knobs, 30.0);
+        let mut agc = AutoGainControl::new(30.0);
         let mut ctx = crate::processor::FrameContext::default();
         // Converge on quiet speech (gain rises toward target).
         for _ in 0..200 {
@@ -213,10 +182,7 @@ mod tests {
 
     #[test]
     fn quiet_signal_is_boosted_toward_target_after_convergence() {
-        let knobs = Arc::new(Knobs {
-            target_rms: AtomicU32::new((0.10_f32).to_bits()),
-        });
-        let mut agc = AutoGainControl::new(knobs, 30.0);
+        let mut agc = AutoGainControl::new(30.0);
         let template = sine_frame(0.01, 440.0);
 
         let mut scratch = vec![0.0f32; 480];
@@ -237,10 +203,7 @@ mod tests {
 
     #[test]
     fn gain_holds_steady_when_gate_is_closed() {
-        let knobs = Arc::new(Knobs {
-            target_rms: AtomicU32::new((0.10_f32).to_bits()),
-        });
-        let mut agc = AutoGainControl::new(knobs, 30.0);
+        let mut agc = AutoGainControl::new(30.0);
         let template = sine_frame(0.05, 300.0);
 
         let mut scratch = vec![0.0f32; 480];
@@ -264,10 +227,7 @@ mod tests {
 
     #[test]
     fn gain_does_not_exceed_max() {
-        let knobs = Arc::new(Knobs {
-            target_rms: AtomicU32::new((0.10_f32).to_bits()),
-        });
-        let mut agc = AutoGainControl::new(knobs, 20.0);
+        let mut agc = AutoGainControl::new(20.0);
 
         let frame = [0.001f32; 480];
         let mut scratch = vec![0.0f32; 480];
@@ -285,10 +245,7 @@ mod tests {
 
     #[test]
     fn attack_responds_faster_than_release() {
-        let knobs = Arc::new(Knobs {
-            target_rms: AtomicU32::new((0.10_f32).to_bits()),
-        });
-        let mut agc = AutoGainControl::new(knobs, 30.0);
+        let mut agc = AutoGainControl::new(30.0);
         let quiet = sine_frame(0.02, 300.0);
         let loud = sine_frame(0.5, 300.0);
 

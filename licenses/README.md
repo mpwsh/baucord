@@ -12,7 +12,11 @@ site (`web/licenses.html`). `scripts/licenses.py` writes both:
   (libjpeg-turbo, libpng, zlib, Wuffs, FreeType, ICU data), FFmpeg and
   x264 in the desktop builds (with the GPL texts), the NVIDIA and AMD
   encoder headers in FFmpeg's Windows build, libopus, the Lucide icons,
-  and Slint's royalty-free license (its crates carry no license file).
+  and Slint's royalty-free license (its crates carry no license file);
+- the website's own: Alpine.js (`web/js/alpine.min.js`), on the site's
+  page only, since the apps do not contain it.
+
+Our own crates — every package under `crates/` — are left out.
 
 Nobody has to run it. `.github/workflows/licenses.yml` runs it from
 the commit being built, and every workflow that ships something calls
@@ -35,7 +39,7 @@ Two licenses ask for more than the text:
   Settings → About.
 - **FFmpeg and x264** (GNU GPL 2.0 or later, desktop builds only): a
   desktop build as a whole is distributed under the GNU GPL version 3,
-  and the exact source of each is named — FFmpeg 7.1.1 (7.1.2 from the
-  pinned vcpkg on Windows) and x264 at `X264_COMMIT` in
-  `.github/workflows/release.yml`. Changing either means changing the
-  `COMPONENTS` notes too.
+  and the exact source of each is named — FFmpeg 7.1.2 (`FFMPEG_VERSION`,
+  checked against `FFMPEG_SHA256`; the pinned vcpkg's on Windows) and
+  x264 at `X264_COMMIT` in `.github/workflows/release.yml`. Changing
+  either means changing the `COMPONENTS` notes too.

@@ -185,16 +185,66 @@ impl ChatServer {
                 self.fail_dm(pending.sender, pending.client_ref, DmFailReason::Store);
             }
             _ => {
+                // It may still be stored: a store already running when
+                // it timed out commits. The file's reference stays —
+                // given back, the prune could delete a file a saved DM
+                // points to (review 2026-10, P2-24) — and the store is
+                // asked what points at it, behind that write.
                 warn!("DM store did not answer in time");
-                self.release_unsent_file(pending);
+                if let Some(attachment) = &pending.attachment {
+                    self.recount_blob(attachment.blob_id);
+                }
                 self.fail_dm(pending.sender, pending.client_ref, DmFailReason::Store);
             }
         }
     }
 
-    /// A file DM was not stored: the reference taken for it when it
-    /// was sent goes back. It used to stay, and a file with a count
-    /// above zero is never deleted (review P2-11).
+    /// Ask the store how many rows point at `blob_id`. Queued behind
+    /// every write already sent, so the answer counts them; changes made
+    /// in memory meanwhile are kept ([`Self::resolve_blob_recount`]).
+    fn recount_blob(&mut self, blob_id: protocol::BlobId) {
+        let Some(refs_then) = self.policy.blobs.get(&blob_id).map(|b| b.refs) else {
+            return;
+        };
+        let ask = self
+            .persist
+            .ask_behind_writes(Query::BlobRefs { blob_id }, self.now + DM_STORE_DEADLINE);
+        self.waiting
+            .insert(ask, Waiting::BlobRecount { blob_id, refs_then });
+    }
+
+    /// The store's count for a file: the count in memory becomes it,
+    /// plus what changed in memory since it was asked. Unanswered, the
+    /// count stays as it is — too high at worst, which only keeps the
+    /// file longer, and the next start recounts every file.
+    pub(super) fn resolve_blob_recount(
+        &mut self,
+        blob_id: protocol::BlobId,
+        refs_then: u32,
+        outcome: &Outcome,
+    ) {
+        let Outcome::Answered(Answer::Count(on_disk)) = *outcome else {
+            return;
+        };
+        let Some(now) = self.policy.blobs.get(&blob_id).map(|b| b.refs) else {
+            return;
+        };
+        let since = i64::from(now) - i64::from(refs_then);
+        let wanted = (i64::from(on_disk) + since).max(0);
+        let delta = wanted - i64::from(now);
+        if delta != 0 {
+            info!(
+                "file {}: reference count corrected by {delta}",
+                crate::persistence::hex(&blob_id[..8])
+            );
+            self.blob_ref(&blob_id, i32::try_from(delta).unwrap_or(0));
+        }
+    }
+
+    /// A file DM was not stored — the store answered that it failed:
+    /// the reference taken for it when it was sent goes back. It used to
+    /// stay, and a file with a count above zero is never deleted (review
+    /// P2-11). Not on a timeout (see `resolve_dm_answer`).
     fn release_unsent_file(&mut self, pending: &PendingDm) {
         if let Some(attachment) = &pending.attachment {
             self.blob_ref(&attachment.blob_id, -1);

@@ -50,10 +50,9 @@ struct Sim {
     failures: Vec<String>,
 }
 
-/// `app_core::chat::MAX_ROWS` and `HELD_MAX_ROWS`: what an append trims
-/// the list to, from the front — the second while the front is held.
-const MAX_ROWS: usize = 500;
-const HELD_MAX_ROWS: usize = 4 * MAX_ROWS;
+// What an append trims the list to, from the front — the second while
+// the front is held.
+use app_core::chat::{HELD_MAX_ROWS, MAX_ROWS};
 
 impl Sim {
     fn frame(&mut self) {

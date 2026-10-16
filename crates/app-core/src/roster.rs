@@ -273,8 +273,12 @@ pub fn grouped_rows(
     };
 
     let our_channel = our_id.and_then(|id| users.get(&id)).map(|u| u.channel_id);
+    // By name as a person reads it ("ana" before "Zoe"; bytes put every
+    // capital first), then by client id: two of the same name kept no
+    // order of their own, the map's from one rebuild to the next (review
+    // 2026-10, P3-50).
     let mut sorted: Vec<_> = users.iter().collect();
-    sorted.sort_by(|(_, a), (_, b)| a.username.cmp(&b.username));
+    sorted.sort_by_cached_key(|(id, st)| (st.username.to_lowercase(), **id));
 
     let mut items = Vec::with_capacity(channels.len() + users.len());
     for channel in channels {
@@ -362,6 +366,29 @@ mod tests {
             from_config: true,
             hidden: false,
         }
+    }
+
+    /// Names sort as people read them, and two of a name by client id
+    /// (review 2026-10, P3-50).
+    #[test]
+    fn members_sort_by_name_ignoring_case_then_by_id() {
+        let channels = [meta(0, "Lobby")];
+        let mut users = HashMap::new();
+        users.insert(9, UserState::new("ana", PeerAudio::default(), 0));
+        users.insert(4, UserState::new("Zoe", PeerAudio::default(), 0));
+        users.insert(7, UserState::new("bo", PeerAudio::default(), 0));
+        users.insert(5, UserState::new("bo", PeerAudio::default(), 0));
+        let items = grouped_rows(&channels, &users, None, &HashSet::default(), true, false);
+        let order: Vec<(String, u64)> = items
+            .iter()
+            .filter_map(|item| match item {
+                RosterItem::User(u) => Some((u.name.clone(), u.client_id)),
+                RosterItem::Channel(_) => None,
+            })
+            .collect();
+        let expected =
+            [("ana", 9), ("bo", 5), ("bo", 7), ("Zoe", 4)].map(|(name, id)| (name.to_string(), id));
+        assert_eq!(order, expected);
     }
 
     #[test]

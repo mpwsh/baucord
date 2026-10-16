@@ -66,7 +66,6 @@ mod chat;
 mod commands;
 mod conversations;
 mod devices;
-/// Compiled-in version of this binary.
 // `AppState`'s methods, by concern; each file is a child module so
 // nothing here had to become `pub` for them.
 mod events;
@@ -77,6 +76,9 @@ mod safety;
 mod session;
 mod stats;
 
+pub(crate) use safety::reason_label;
+
+/// Compiled-in version of this binary.
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Slint's Android backend has one window per process (every `Window`
@@ -94,6 +96,14 @@ pub(crate) const SINGLE_WINDOW_HOST: bool = cfg!(any(target_os = "android", targ
 /// §4.1) and Apple's rule is that only the user closes an app, from the
 /// app switcher. The Quit button is hidden and `/quit` says how.
 pub(crate) const HOST_CAN_QUIT: bool = !cfg!(target_os = "ios");
+
+/// How the app is leaving (`AppState::leave_app`): asked about first
+/// when the Settings page holds changes nobody saved.
+pub(crate) enum Leaving {
+    Quit,
+    /// Install the downloaded update at this path, and relaunch.
+    InstallUpdate(String),
+}
 
 // ── What the host tells the app (phones) ────────────────────────────────
 
@@ -216,6 +226,13 @@ pub(crate) struct Session {
     /// Who each session is (`UserDetails`): user id and roles, from
     /// the server's tables. Slash commands resolve names through it.
     pub(crate) details: HashMap<u64, (client::UserId, Vec<client::RoleId>)>,
+    /// Each account's session online (`details` the other way round),
+    /// kept with it: six places scanned `details` for this, some per
+    /// chat row (review 2026-10, P3-4). An account online twice maps
+    /// to its latest session.
+    account_sessions: HashMap<client::UserId, u64>,
+    /// When each DM partner's alert last made a sound (`alerts.rs`).
+    dm_sounded: HashMap<client::UserId, Instant>,
     /// Admin requests in flight: what to do with the answer.
     pending_admin: HashMap<u32, PendingAdmin>,
     /// The typed commands among them, as typed: what the activity log
@@ -288,6 +305,8 @@ impl Default for Session {
             permissions: 0,
             our_user_id: None,
             details: HashMap::new(),
+            account_sessions: HashMap::new(),
+            dm_sounded: HashMap::new(),
             pending_admin: HashMap::new(),
             admin_typed: HashMap::new(),
             server_muted: None,
@@ -363,9 +382,12 @@ pub(crate) struct Transfers {
         HashMap<client::protocol::BlobId, Vec<(Option<client::UserId>, u64)>>,
     /// Our own picture posts awaiting their ack, by client ref.
     picture_acks: HashMap<u32, Vec<u8>>,
-    /// An image on its way: the placeholder row's message id, replaced
-    /// by our own echo.
-    image_upload: Option<u64>,
+    /// Our images on their way, in the order sent: each placeholder
+    /// row's message id (also the network's token for it), replaced by
+    /// our own echo, which comes back in that order. One slot used to
+    /// serve them all, and a second send lost the first card (review
+    /// 2026-10, P3-2).
+    image_uploads: std::collections::VecDeque<u64>,
     /// Transfers shown on cards, by (conversation, message id): the
     /// kind (1 up, 2 down) and percent. Rows are rebuilt freely, so
     /// `chat_row_at` reads this rather than the row carrying it.
@@ -474,6 +496,8 @@ pub struct AppState {
     pub profile_dirty: bool,
     /// Decoded pictures by hash: the on-disk cache, warmed on demand.
     avatar_images: HashMap<client::protocol::BlobId, slint::Image>,
+    /// Pictures on the avatar worker (`avatars.rs`), asked for once.
+    avatar_decoding: HashSet<client::protocol::BlobId>,
     pub is_testing_mic: bool,
     /// What the network thread reads: what the microphone hears stays
     /// on this device — a test, or the Audio tab's meter out of a voice
@@ -528,6 +552,9 @@ pub struct AppState {
     /// the microphone, or showing its meter). A phone keeps no
     /// microphone open otherwise (`sync_voice_room`).
     voice_in_room: bool,
+    /// What the voice engine was last told about anyone hearing what it
+    /// sends (`VoiceControl::SetTransmit`).
+    voice_transmit: bool,
     /// What the host was last told keeps the session alive: `Some(in
     /// a room)` while connected (`sync_keep_alive`, D63).
     kept_alive: Option<bool>,
@@ -545,6 +572,11 @@ pub struct AppState {
     /// The Settings page's state when it opened, for its Close; `None`
     /// while it is shut.
     pub(crate) settings_opened: Option<crate::settingsui::OpenedWith>,
+    /// A quit waiting on the question about unsaved Settings changes.
+    pending_leave: Option<Leaving>,
+    /// The stream a phone stopped watching when it went to the
+    /// background: asked for again when it comes back (`host_shown`).
+    paused_watch: Option<u64>,
 
     /// The server entry this session connected with (its name): what
     /// an account deletion clears, whatever the default is by then.
@@ -571,11 +603,16 @@ pub struct AppState {
     /// what a picked index means (`settingsui::refresh_devices`).
     pub picker_inputs: Vec<String>,
     pub picker_outputs: Vec<String>,
-    last_input_devices: Vec<(String, bool)>,
-    last_output_devices: Vec<(String, bool)>,
+    pub(crate) last_input_devices: Vec<(String, bool)>,
+    pub(crate) last_output_devices: Vec<(String, bool)>,
+    /// The picked microphone / output is unplugged, and the engine
+    /// plays and records on the default until it is back; the pick
+    /// stays in Settings (`AppState::engine_input`, review 2026-10 P2-9).
+    pub(crate) input_standin: bool,
+    pub(crate) output_standin: bool,
 
-    // Own-process resource sampling (sidebar stats line, `/mem`)
-    usage: crate::resources::Sampler,
+    // Own-process CPU between two looks (sidebar stats line)
+    usage: app_core::usage::CpuMeter,
 
     hotkeys: Option<HotkeyManager>,
     pub keybind_recording: Option<usize>,
@@ -606,6 +643,9 @@ pub struct AppState {
     /// The single animation ticker driving every playing GIF (chat
     /// rows + the viewer overlay). Runs only while something plays.
     gif_ticker: slint::Timer,
+    /// When the animation ticker last ran: its next step is the time
+    /// since (`gif_tick`).
+    gif_last_tick: Option<Instant>,
     /// What ends with the connection ([`Session`]).
     pub(crate) session: Session,
 }
@@ -731,6 +771,11 @@ pub fn run() {
 
     let settings = Settings::load();
     apply_log_level(&settings);
+    // Once per launch, and a no-op after the first: a folder of chat
+    // pictures can take a while to delete.
+    let _ = std::thread::Builder::new()
+        .name("cache-cleanup".into())
+        .spawn(client::config::remove_old_avatar_cache);
 
     // Localize before any UI is built. None = follow the OS locale.
     let locale = i18n::init(settings.language.as_deref());
@@ -762,11 +807,11 @@ pub fn run() {
         .set_users(ModelRc::from(users_model.clone()));
 
     // The emoji palette — straight from the shared catalog.
-    let emoji_rows: Vec<ui::EmojiRow> = app_core::EMOJI
-        .iter()
-        .map(|(name, glyph, _section)| ui::EmojiRow {
-            code: (*name).into(),
-            glyph: (*glyph).into(),
+    let emoji_rows: Vec<ui::EmojiRow> = app_core::emoji::palette()
+        .into_iter()
+        .map(|(name, glyph)| ui::EmojiRow {
+            code: name.into(),
+            glyph: glyph.into(),
         })
         .collect();
     main.global::<State>()
@@ -794,6 +839,7 @@ pub fn run() {
         own_avatar: None,
         profile_dirty: false,
         avatar_images: HashMap::new(),
+        avatar_decoding: HashSet::new(),
         settings,
         is_testing_mic: false,
         is_testing_mic_shared,
@@ -814,12 +860,15 @@ pub fn run() {
         lobby_name: None,
         last_join_notice: None,
         voice_in_room: true,
+        voice_transmit: true,
         kept_alive: None,
         rejoin_channel: None,
         admin_audit_oldest: None,
         admin_blob_cap: 0,
         admin_pending: None,
         settings_opened: None,
+        pending_leave: None,
+        paused_watch: None,
         session_server: None,
         account_deleted: false,
         viewers: HashMap::new(),
@@ -833,9 +882,11 @@ pub fn run() {
         picker_outputs: Vec::new(),
         last_input_devices: Vec::new(),
         last_output_devices: Vec::new(),
+        input_standin: false,
+        output_standin: false,
         present: present_shared,
         ui_screen_rx: screen_fwd_rx,
-        usage: crate::resources::Sampler::new(),
+        usage: app_core::usage::CpuMeter::new(),
         hotkeys: None,
         keybind_recording: None,
         device_timer: slint::Timer::default(),
@@ -848,6 +899,7 @@ pub fn run() {
         reconnect_attempts: 0,
         meter_timer: slint::Timer::default(),
         gif_ticker: slint::Timer::default(),
+        gif_last_tick: None,
         session: Session::default(),
     }));
 
@@ -864,6 +916,12 @@ pub fn run() {
         st.push_connect_fields();
         st.apply_text_scale();
         st.main.global::<State>().set_phase(Phase::Splash);
+        // The composer's counter counts to the cap the send path cuts
+        // at; the two were separate copies of 400.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        st.main
+            .global::<State>()
+            .set_max_chars(app_core::chat::MAX_MESSAGE_CHARS as i32);
 
         // Seed the initial device snapshot so the first poll has
         // something to diff against.
@@ -897,7 +955,9 @@ pub fn run() {
         let st = state.borrow();
         st.settings.startup.start_minimized && cfg!(feature = "tray")
     };
-    if !start_hidden {
+    if start_hidden {
+        state.borrow().set_app_shown(false);
+    } else {
         let st = state.borrow();
         st.main.show().expect("failed to show the main window");
         st.place_main_once();
@@ -905,14 +965,27 @@ pub fn run() {
     {
         let weak = state.borrow().main.as_weak();
         let armed = state.borrow().main_repaint_arm.clone();
-        repaint_on_reveal(state.borrow().main.window(), armed, move || {
-            if let Some(main) = weak.upgrade() {
-                main.set_repaint_flip(!main.get_repaint_flip());
-            }
-            // Shown again: what waited for that (the roster, playing
-            // GIFs). Deferred: this runs inside winit's dispatch.
-            let _ = slint::invoke_from_event_loop(|| with_current(AppState::main_revealed));
-        });
+        repaint_on_reveal(
+            state.borrow().main.window(),
+            armed,
+            move || {
+                if let Some(main) = weak.upgrade() {
+                    main.set_repaint_flip(!main.get_repaint_flip());
+                }
+                // Shown again: what waited for that (the roster, playing
+                // GIFs). Deferred: this runs inside winit's dispatch.
+                let _ = slint::invoke_from_event_loop(|| with_current(AppState::main_revealed));
+            },
+            |hidden| {
+                // Minimized or covered: what only draws waits (the chat's
+                // follow, review 2026-10 P1-3); uncovered, `main_revealed`.
+                if hidden {
+                    let _ = slint::invoke_from_event_loop(|| {
+                        with_current(|app| app.set_app_shown(false));
+                    });
+                }
+            },
+        );
     }
     {
         let mut st = state.borrow_mut();
@@ -955,7 +1028,6 @@ pub fn run() {
 
 // ── Callback wiring ─────────────────────────────────────────────────────
 
-/// Convenience: run `f` with a `&mut AppState` if the app still exists.
 /// What a dragged user row carries (inside the opaque
 /// `slint::DataTransfer`): the client id, nothing else.
 struct DragUser(u64);
@@ -1018,6 +1090,7 @@ fn center_on_monitor(win: &slint::Window) {
     });
 }
 
+/// Run `f` with a `&mut AppState` if the app still exists.
 fn with_app(weak: &Weak<RefCell<AppState>>, f: impl FnOnce(&mut AppState)) {
     if let Some(rc) = weak.upgrade() {
         enter(&rc, f);
@@ -1085,7 +1158,7 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
                 .and_then(|i| app.settings.servers.get(i))
             {
                 app.settings.server = entry.name.clone();
-                app.settings.save();
+                app.save_settings();
             }
             // A pending invite prompt referred to the previous server.
             app.clear_connect_verdicts();
@@ -1102,9 +1175,14 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     logic.on_open_settings(move || {
         with_app(&w, crate::settingsui::open);
     });
-    logic.on_quit(|| {
-        let _ = slint::quit_event_loop();
-    });
+    let w = Rc::downgrade(state);
+    logic.on_quit(move || with_app(&w, |app| app.leave_app(Leaving::Quit)));
+    let w = Rc::downgrade(state);
+    logic.on_quit_ask_save(move || with_app(&w, |app| app.answer_leave(Some(true))));
+    let w = Rc::downgrade(state);
+    logic.on_quit_ask_discard(move || with_app(&w, |app| app.answer_leave(Some(false))));
+    let w = Rc::downgrade(state);
+    logic.on_quit_ask_cancel(move || with_app(&w, |app| app.answer_leave(None)));
 
     // ── Sidebar ─────────────────────────────────────────────────
     let w = Rc::downgrade(state);
@@ -1118,10 +1196,8 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
 
     // ── Roster hover (the profile card) ──────────────────────────
     let w = Rc::downgrade(state);
-    logic.on_user_hovered(move |index, hovering| {
-        if hovering {
-            with_app(&w, |app| app.user_hovered(index));
-        }
+    logic.on_user_card_shown(move |index| {
+        with_app(&w, |app| app.user_card_shown(index));
     });
     let w = Rc::downgrade(state);
     logic.on_author_hovered(move |name, hovering| {
@@ -1135,13 +1211,11 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     });
     // Drag a user onto a channel: the payload is our own type inside
     // the opaque transfer, so nothing is parsed on the way back.
-    let w = Rc::downgrade(state);
     // The payload is built from the row's own client id, never from
     // its index: the binding is cached per row, and after the roster
     // reshuffles (someone moved) an index-keyed payload would carry
     // whoever sat in that slot before.
     logic.on_user_drag_data(move |lo, hi| {
-        let _ = &w;
         let mut data = slint::DataTransfer::default();
         let id = roster::join_id(lo, hi);
         if id != 0 {
@@ -1286,7 +1360,7 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     });
     let w = Rc::downgrade(state);
     logic.on_clear_chat(move || {
-        with_app(&w, AppState::clear_chat);
+        with_app(&w, AppState::ask_clear_chat);
     });
     let w = Rc::downgrade(state);
     logic.on_composer_newline(move |cursor, anchor| {
@@ -1485,7 +1559,7 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
             app.settings.share.quality = quality.key().to_string();
             app.settings.share.monitor = u32::try_from(monitor_index).ok();
             app.settings.share.everyone = everyone;
-            app.settings.save();
+            app.save_settings();
             video::capture::set_pointer_shown(app.settings.share.pointer);
             app.screen
                 .tx
@@ -1521,6 +1595,13 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     });
     let w = Rc::downgrade(state);
     logic.on_invite_create(move || with_app(&w, AppState::open_invite_dialog));
+    let w = Rc::downgrade(state);
+    logic.on_main_screen_shown(move || {
+        with_app(&w, |app| {
+            app.flush_roster();
+            app.resume_gifs();
+        });
+    });
     let w = Rc::downgrade(state);
     logic.on_admin_open(move || {
         with_app(&w, |app| {
@@ -1563,10 +1644,8 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     let w = Rc::downgrade(state);
     logic.on_update_install(move || {
         with_app(&w, |app| {
-            if let Some(path) = app.update_zip_path.clone()
-                && let Err(e) = crate::updater::extract_and_install(&path)
-            {
-                app.show_error(&e);
+            if let Some(path) = app.update_zip_path.clone() {
+                app.leave_app(Leaving::InstallUpdate(path));
             }
         });
     });
@@ -1585,11 +1664,16 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
                 // Going to the tray: stop all GIF work right now rather
                 // than on the next tick — nothing is visible anymore.
                 app.freeze_chat_gifs();
+                app.set_app_shown(false);
                 response = slint::CloseRequestResponse::HideWindow;
             } else {
-                app.save_window_geometry();
-                response = slint::CloseRequestResponse::HideWindow;
-                let _ = slint::quit_event_loop();
+                // A build without a tray: closing the window is quitting,
+                // and unsaved Settings changes are asked about first,
+                // with the window still up.
+                app.leave_app(Leaving::Quit);
+                if app.pending_leave.is_some() {
+                    response = slint::CloseRequestResponse::KeepWindowShown;
+                }
             }
         });
         response
@@ -1627,12 +1711,25 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
 ///
 /// No raw window events without winit: no reveal glitches to paper
 /// over, and no OS file drags either.
+///
+/// `occluded` hears the window go out of view (minimized, or wholly
+/// covered: `true`) and come back (`false`).
 #[cfg(not(feature = "desktop"))]
-pub fn repaint_on_reveal(_win: &slint::Window, _armed: Rc<Cell<bool>>, _flip: impl Fn() + 'static) {
+pub fn repaint_on_reveal(
+    _win: &slint::Window,
+    _armed: Rc<Cell<bool>>,
+    _flip: impl Fn() + 'static,
+    _occluded: impl Fn(bool) + 'static,
+) {
 }
 
 #[cfg(feature = "desktop")]
-pub fn repaint_on_reveal(win: &slint::Window, armed: Rc<Cell<bool>>, flip: impl Fn() + 'static) {
+pub fn repaint_on_reveal(
+    win: &slint::Window,
+    armed: Rc<Cell<bool>>,
+    flip: impl Fn() + 'static,
+    occluded: impl Fn(bool) + 'static,
+) {
     use slint::winit_030::WinitWindowAccessor;
     win.on_winit_window_event(move |_w, ev| {
         use slint::winit_030::winit::event::WindowEvent;
@@ -1644,6 +1741,7 @@ pub fn repaint_on_reveal(win: &slint::Window, armed: Rc<Cell<bool>>, flip: impl 
         match ev {
             WindowEvent::HoveredFile(_) => set_drop_hover(true),
             WindowEvent::HoveredFileCancelled => set_drop_hover(false),
+            WindowEvent::Occluded(hidden) => occluded(*hidden),
             WindowEvent::DroppedFile(path) => {
                 let path = path.clone();
                 let _ = slint::invoke_from_event_loop(move || {
@@ -1756,8 +1854,16 @@ struct Editing {
 
 /// What the generic confirm dialog will do.
 enum Confirm {
-    DeleteMessage { msg_id: u64, by_admin: bool },
-    DeleteChannel { channel_id: u16 },
+    DeleteMessage {
+        msg_id: u64,
+        by_admin: bool,
+    },
+    DeleteChannel {
+        channel_id: u16,
+    },
+    /// Clear chat, asked first on a touch host: one stray tap beside
+    /// the composer wiped the scrollback (review 2026-10, P3-18).
+    ClearChat,
 }
 
 /// The channel dialog's subject (spec §5).
@@ -1829,8 +1935,11 @@ enum Incoming<'a> {
 /// What the open context menu is about (`AppState::show_menu`): the
 /// entries were built for it, and a pick resolves against it.
 enum MenuTarget {
-    /// A roster user row, by index into the users model.
-    User(i32),
+    /// A roster user, by client id: their row is found again when an
+    /// entry is picked. It held the row index, and a join, leave or
+    /// move while the menu was open sent the pick to whoever had moved
+    /// into that row (review 2026-10, P1-8).
+    User(u64),
     Channel(u16),
     /// A chat row: its row id (images, the plain-view toggle), the
     /// server's message id (edit, delete) and the body (copy).
@@ -1859,7 +1968,6 @@ pub fn short_id(id: &[u8]) -> String {
     })
 }
 
-/// Milliseconds since the epoch as the chat's local `HH:MM`.
 /// The local calendar day of a server timestamp (days since the epoch
 /// in the viewer's zone): what the day dividers compare.
 fn local_day(ms: u64) -> i64 {
@@ -1948,6 +2056,7 @@ pub(crate) fn format_wall_stamp(ms: u64) -> String {
     }
 }
 
+/// Milliseconds since the epoch as the chat's local `HH:MM`.
 pub(crate) fn format_wall_time(ms: u64) -> String {
     let secs = i64::try_from(ms / 1000).unwrap_or(0);
     chrono::DateTime::from_timestamp(secs, 0).map_or_else(
@@ -2067,7 +2176,6 @@ pub(crate) fn describe_upload_deny(reason: client::protocol::UploadRejectReason)
     })
 }
 
-/// The built-in role's name, or `role <id>` for a custom one.
 /// The five look fields `UserRow` and `ChatRow` share, so one writer
 /// serves both.
 trait ProfileLook {
@@ -2236,11 +2344,6 @@ fn audit_line_text(e: &client::protocol::AuditEntry) -> String {
         line.push_str(d);
     }
     line
-}
-
-/// A report reason in words (the panel's Reports tab, `/reports`).
-pub(crate) fn report_reason_text(reason: client::protocol::ReportReason) -> String {
-    safety::reason_text(reason)
 }
 
 /// Where a rank stands, in words (the panel's Roles tab).
@@ -2568,8 +2671,7 @@ pub mod tray {
             with_current(|app| app.show_main());
         });
         tray.on_quit_app(|| {
-            with_current(AppState::save_settings_now);
-            let _ = slint::quit_event_loop();
+            with_current(|app| app.leave_app(super::Leaving::Quit));
         });
         tray.on_toggle_mute(|| with_current(AppState::handle_toggle_mute));
         tray.on_toggle_deafen(|| with_current(AppState::handle_toggle_deafen));

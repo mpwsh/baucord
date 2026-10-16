@@ -19,7 +19,7 @@ use std::time::Duration;
 /// jumping (first phone look, 2026-10-12); at twice that it rides over
 /// the gaps inside a word and comes down between words, which is what
 /// a gate threshold is set against.
-pub const RELEASE: Duration = Duration::from_millis(300);
+pub(crate) const RELEASE: Duration = Duration::from_millis(300);
 
 /// The least movement worth a redraw: about a pixel of a phone's bar.
 pub const STEP: f32 = 0.004;

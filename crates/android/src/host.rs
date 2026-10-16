@@ -118,8 +118,8 @@ impl Hooks for AndroidHost {
         }
     }
 
-    fn play_chime(&self, wav: &[u8]) -> bool {
-        match java::play_chime(wav) {
+    fn play_chime(&self, tone: frontend::host::Tone, wav: &[u8]) -> bool {
+        match java::play_chime(tone.name(), wav) {
             Ok(()) => true,
             Err(e) => {
                 log::warn!("chime: {e}");

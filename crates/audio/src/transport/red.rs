@@ -100,6 +100,20 @@ pub fn encode(primary: &[u8], redundant: &[(u32, &[u8])], out: &mut Vec<u8>) {
     out.extend_from_slice(primary);
 }
 
+/// The size [`encode`] makes of these: its header, the blocks it keeps
+/// and the primary.
+#[must_use]
+pub fn encoded_len(primary: &[u8], redundant: &[(u32, &[u8])]) -> usize {
+    let kept = redundant
+        .iter()
+        .filter(|(off, d)| !d.is_empty() && d.len() <= 0xFFFF && *off <= 0xFFFF)
+        .take(MAX_BLOCKS);
+    1 + kept
+        .map(|(_, d)| HEADER_BYTES_PER_BLOCK + d.len())
+        .sum::<usize>()
+        + primary.len()
+}
+
 /// Parse a bundle. `None` if the payload is malformed.
 #[must_use]
 pub fn decode(payload: &[u8]) -> Option<Bundle<'_>> {
@@ -150,6 +164,17 @@ pub fn decode(payload: &[u8]) -> Option<Bundle<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_length_is_what_encode_makes() {
+        let (a, b, p) = ([1u8; 40], [2u8; 70], [3u8; 90]);
+        let blocks: [(u32, &[u8]); 3] = [(1920, &a), (960, &b), (0, &[])];
+        let mut out = Vec::new();
+        encode(&p, &blocks, &mut out);
+        assert_eq!(encoded_len(&p, &blocks), out.len());
+        encode(&p, &[], &mut out);
+        assert_eq!(encoded_len(&p, &[]), out.len());
+    }
 
     #[test]
     fn round_trips_primary_and_two_blocks() {

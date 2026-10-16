@@ -217,6 +217,13 @@ export global State {
     /// exit there, and Apple's rule is that only the user closes an
     /// app): the connect page's Quit is hidden.
     in property <bool> can-quit: true;
+    /// Something of ours is on screen: not in the tray, minimized,
+    /// wholly covered, nor a phone app in the background. What only
+    /// draws waits while it is false (the chat's follow).
+    in property <bool> app-shown: true;
+    /// A quit is waiting on the question about unsaved Settings
+    /// changes (`AppState::leave_app`).
+    in property <bool> quit-ask-open: false;
     /// The screen edges the system draws over, as the host itself
     /// measures them (IOS-SPEC.md §14 D39): iOS pushes `UIKit`'s safe
     /// area here whenever it changes. The pages keep clear of the larger
@@ -251,6 +258,7 @@ export global State {
     // Chat
     in property <[ChatRow]> chat;
     in-out property <string> draft;
+    /// `app_core::chat::MAX_MESSAGE_CHARS`, set by the host at startup.
     in property <int> max-chars: 400;
     /// Older pages exist on the server (History.more): the "load
     /// earlier" control appears at the top of the list.
@@ -446,7 +454,7 @@ export global State {
 
     // The terms of use (1.2): connecting is agreeing; the connect
     // card says so and links them.
-    in property <string> terms-url: "https://baucord.com/terms.html";
+    out property <string> terms-url: "https://baucord.com/terms.html";
 
     // Image viewer overlay (chat image tapped) — replaces the old
     // separate gallery window.
@@ -468,15 +476,17 @@ export global Logic {
     callback edit-servers();
     callback open-settings();
     callback quit();
+    /// The unsaved-Settings question before a quit: keep the changes
+    /// and quit, drop them and quit, or stay.
+    callback quit-ask-save();
+    callback quit-ask-discard();
+    callback quit-ask-cancel();
 
     // Sidebar
     callback toggle-mute();
     callback toggle-deafen();
     callback toggle-share();
     callback disconnect();
-    /// The pointer entered/left a user row: the host fetches the last
-    /// telemetry for the card when it may.
-    callback user-hovered(int, bool);
     /// The LIVE chip on a user row was clicked: open (or raise) that
     /// sharer's viewer.
     callback watch-user(index: int);
@@ -595,6 +605,12 @@ export global Logic {
     callback invite-create();
     /// The Admin chip: open the panel (spec §8).
     callback admin-open();
+    /// A roster row's card came up after its dwell (its index).
+    callback user-card-shown(int);
+    /// The main screen is drawn again: a page over it (Settings, the
+    /// admin panel, a phone's stream) closed. What waited while it was
+    /// covered — the roster, GIFs — catches up.
+    callback main-screen-shown();
     /// The dialog: mint with the picked options; copy the code; close.
     callback invite-dialog-create();
     callback invite-dialog-copy();

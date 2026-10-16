@@ -50,7 +50,9 @@ jobs:
           set -eu
           CRATE="$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)"
           if [ "${TAG#v}" != "$CRATE" ]; then
-            echo "::error::release tag $TAG, but Cargo.toml says $CRATE — bump `[workspace.package]`, then tag v$CRATE"
+            # No backticks inside these quotes: they would run a command
+            # (review 2026-10, P3-58).
+            echo "::error::release tag $TAG, but Cargo.toml says $CRATE — bump [workspace.package], then tag v$CRATE"
             exit 1
           fi
           echo "version $CRATE"
@@ -70,11 +72,13 @@ jobs:
           rustup target add aarch64-apple-ios
           rustup show active-toolchain
 
+      # Saved by none: a dispatch's cache is scoped to its branch too,
+      # and could evict main's (review 2026-10, P2-48).
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
           key: ios-release-arm64
-          save-if: ${{ github.event_name != 'release' }}
+          save-if: false
 
       - name: Install signing certificate and profile
         if: ${{ env.P12_B64 != '' && env.PROFILE_B64 != '' }}
@@ -170,7 +174,10 @@ jobs:
           set -euo pipefail
           APP="$RUNNER_TEMP/baucord.xcarchive/Products/Applications/baucord.app"
           lipo -info "$APP/baucord"
-          MINOS="$(otool -l "$APP/baucord" | awk '/LC_BUILD_VERSION/ { f = 1 } f && /minos/ { print $2; exit }')"
+          # From a file: awk stops at the first match, and the otool it
+          # cut off would fail the step under pipefail (P3-58).
+          otool -l "$APP/baucord" > "$RUNNER_TEMP/loadcmds.txt"
+          MINOS="$(awk '/LC_BUILD_VERSION/ { f = 1 } f && /minos/ { print $2; exit }' "$RUNNER_TEMP/loadcmds.txt")"
           echo "minos: $MINOS"
           if [ "$MINOS" != "17.0" ]; then
             echo "::error::the binary targets iOS $MINOS, not 17.0 (IPHONEOS_DEPLOYMENT_TARGET did not reach cargo?)"

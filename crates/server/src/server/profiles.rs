@@ -544,7 +544,6 @@ impl ChatServer {
                     created_at: self.wall_now(),
                     refs: 0,
                 },
-                Some(announced.mime),
                 bytes,
                 announced.is_file,
             );
@@ -571,18 +570,10 @@ impl ChatServer {
     /// and in memory for avatars (the only copy without persistence,
     /// a cache with it). A file's bytes live on disk only — a 50 MB
     /// download is read back through `Query::Blob`, not held.
-    fn store_blob(
-        &mut self,
-        blob_id: BlobId,
-        meta: BlobMeta,
-        declared_mime: Option<String>,
-        bytes: Vec<u8>,
-        is_file: bool,
-    ) {
+    fn store_blob(&mut self, blob_id: BlobId, meta: BlobMeta, bytes: Vec<u8>, is_file: bool) {
         let record = BlobRecord {
             blob_id,
             mime: meta.mime.clone(),
-            declared_mime,
             size: meta.size,
             name: meta.name.clone(),
             created_by: meta.created_by,

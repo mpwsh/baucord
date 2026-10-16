@@ -39,7 +39,7 @@ use windows::{
     },
 };
 
-use crate::{Interest, Kick, Modifier, Source, POLL};
+use crate::{Interest, Kick, Modifier, Source, Woke, POLL};
 
 // Either side of each modifier…
 const VK_SHIFT: u16 = 0x10;
@@ -290,10 +290,10 @@ impl Source for Keys {
         self.raw.is_some()
     }
 
-    fn wait(&mut self, timeout: Option<Duration>) -> bool {
+    fn wait(&mut self, timeout: Option<Duration>) -> Woke {
         if self.raw.is_none() {
             crate::wait_on_the_clock(timeout);
-            return false;
+            return Woke::TimedOut;
         }
         let deadline = timeout.map(|t| Instant::now() + t);
         // One sleep, then what it brought: a key of interest, or
@@ -310,7 +310,7 @@ impl Source for Keys {
             }
         };
         if self.drain() {
-            return true;
+            return Woke::Key;
         }
         // SAFETY: no handles, plain values. `MWMO_INPUTAVAILABLE`:
         // return for what is queued, not only for what arrives after
@@ -318,14 +318,20 @@ impl Source for Keys {
         let woke =
             unsafe { MsgWaitForMultipleObjectsEx(None, ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE) };
         if woke == WAIT_TIMEOUT {
-            return false;
+            return Woke::TimedOut;
         }
         if woke != WAIT_OBJECT_0 {
             // The wait itself failed: do not spin on it.
             crate::wait_on_the_clock(Some(POLL));
-            return false;
+            return Woke::Other;
         }
-        self.drain()
+        // Any message wakes this wait — a kick, another key, one for a
+        // window — and none of them is the time running out (P2-34).
+        if self.drain() {
+            Woke::Key
+        } else {
+            Woke::Other
+        }
     }
 }
 

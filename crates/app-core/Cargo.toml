@@ -9,19 +9,23 @@ description = "Platform-agnostic application layer for baucord — view models, 
 workspace = true
 
 [dependencies]
-# The bounded decode/encode pipeline. Same feature set the desktop
-# crate used — png/gif are the wire formats, the rest cover
-# attach/paste/drop sources. No default features (no rayon etc.).
+# The bounded decode/encode pipeline. png/gif are the wire formats,
+# jpeg/webp what a phone's gallery and a browser hand over. No default
+# features (no rayon etc.).
 image = { version = "0.25.9", default-features = false, features = [
   "png",
   "jpeg",
   "gif",
   "webp",
-  "bmp",
-  "tiff",
 ] }
-thiserror = "2"
+thiserror.workspace = true
 log.workspace = true
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+# A desktop's files and clipboard (screenshots on Windows, scans) also
+# hold BMP and TIFF; a phone's gallery does not, and its build carried
+# both decoders for nothing (review 2026-10, P3-55).
+image = { version = "0.25.9", default-features = false, features = ["bmp", "tiff"] }
 
 [target.'cfg(unix)'.dependencies]
 # `getrusage` and the page size, for the app's own CPU and memory

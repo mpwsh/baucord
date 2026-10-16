@@ -28,7 +28,7 @@ use x11rb::{
     rust_connection::RustConnection,
 };
 
-use crate::{Interest, Kick, Modifier, Source};
+use crate::{Interest, Kick, Modifier, Source, Woke};
 
 /// What an X11 keycode adds to the input event code.
 const X11_OFFSET: u16 = 8;
@@ -164,20 +164,20 @@ impl Source for Keys {
         self.events
     }
 
-    fn wait(&mut self, timeout: Option<Duration>) -> bool {
+    fn wait(&mut self, timeout: Option<Duration>) -> Woke {
         let deadline = timeout.map(|t| Instant::now() + t);
         let x11: RawFd = self.conn.stream().as_raw_fd();
         let kick: RawFd = self.kicked.as_raw_fd();
         loop {
             if self.drain() {
-                return true;
+                return Woke::Key;
             }
             let ms = match deadline {
                 None => -1,
                 Some(deadline) => {
                     let left = deadline.saturating_duration_since(Instant::now());
                     if left.is_zero() {
-                        return false;
+                        return Woke::TimedOut;
                     }
                     // Rounded up: a wait of 0 would spin.
                     i32::try_from(left.as_micros().div_ceil(1000)).unwrap_or(i32::MAX)
@@ -202,19 +202,19 @@ impl Source for Keys {
                 if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
-                return false;
+                return Woke::Other;
             }
             if ready == 0 {
-                return false;
+                return Woke::TimedOut;
             }
             if fds[1].revents != 0 {
                 let mut spent = [0u8; 64];
                 while matches!((&self.kicked).read(&mut spent), Ok(n) if n > 0) {}
-                return false;
+                return Woke::Other;
             }
             if fds[0].revents & libc::POLLIN == 0 {
                 // Hung up or in error: the next `refresh` says so.
-                return false;
+                return Woke::Other;
             }
         }
     }

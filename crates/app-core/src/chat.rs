@@ -23,7 +23,7 @@ pub const MAX_MESSAGE_CHARS: usize = 400;
 
 /// Messages from one author closer than this are one run: the first
 /// carries the picture and the name, the rest only their body.
-pub const GROUP_WINDOW_MS: u64 = 5 * 60 * 1000;
+pub(crate) const GROUP_WINDOW_MS: u64 = 5 * 60 * 1000;
 
 /// Who sent a message and when, as the rows need it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -275,6 +275,16 @@ impl ChatHistory {
     /// released, the next append trims it back to [`MAX_ROWS`].
     pub fn hold_front(&mut self, hold: bool) {
         self.front_held = hold;
+    }
+
+    /// Whether a page of `limit` more messages may go in front: not when
+    /// it could take the list past [`HELD_MAX_ROWS`], where the next
+    /// live message would trim the very rows being read (review
+    /// 2026-10, P3-51). A message is at least one row, and a page adds
+    /// day dividers and split-out code blocks: two rows each, to be safe.
+    #[must_use]
+    pub fn room_for_page(&self, limit: u16) -> bool {
+        self.rows.len() + 2 * usize::from(limit) <= HELD_MAX_ROWS
     }
 
     /// The id of the oldest confirmed message still in the list: where
@@ -598,16 +608,42 @@ impl ChatHistory {
 #[must_use]
 pub fn scrub_control_chars(s: &str) -> String {
     // Newlines are legitimate since the composer went multi-line
-    // (Shift+Enter); every other control char still gets dropped —
-    // including \r, so CRLF pastes normalize to \n.
-    s.chars()
-        .filter(|c| *c == '\n' || !c.is_control())
-        .collect()
+    // (Shift+Enter), and a tab becomes four spaces so pasted code keeps
+    // its indentation (review 2026-10, P3-52); every other control char
+    // still gets dropped — including \r, so CRLF pastes normalize to \n.
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\t' => out.push_str(TAB),
+            '\n' => out.push('\n'),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
+
+/// What a tab turns into in a message.
+const TAB: &str = "    ";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_page_is_refused_where_it_would_be_trimmed() {
+        let mut h = ChatHistory::default();
+        assert!(h.room_for_page(50));
+        let rows: Vec<ChatItem> = (0..HELD_MAX_ROWS - 60)
+            .map(|i| ChatItem::DayMarker {
+                label: String::new(),
+                day: i64::try_from(i).unwrap(),
+            })
+            .collect();
+        h.prepend_rows(rows);
+        assert!(h.room_for_page(30));
+        assert!(!h.room_for_page(31));
+    }
 
     fn meta(id: u64) -> Meta {
         Meta {
@@ -941,5 +977,9 @@ mod tests {
     fn scrub_removes_control_chars() {
         assert_eq!(scrub_control_chars("a\u{16}b\u{7}c"), "abc");
         assert_eq!(scrub_control_chars("one\r\ntwo\nthree"), "one\ntwo\nthree");
+        assert_eq!(
+            scrub_control_chars("fn x() {\n\tbody\n}"),
+            "fn x() {\n    body\n}"
+        );
     }
 }

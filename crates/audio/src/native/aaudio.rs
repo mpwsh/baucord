@@ -50,6 +50,7 @@ use rtrb::{Consumer, Producer};
 use super::{
     android::{self, EchoCanceller, EchoEffect},
     pump::{CapturePump, RenderPump},
+    CaptureStartError, RenderStartError,
 };
 use crate::{
     aec::reasons, input_config::InputConfig, latch::Ring, stats::AudioStats, OPUS_SAMPLE_RATE,
@@ -129,14 +130,6 @@ pub struct NativeCapture {
     pub aec_verdict: Result<(), &'static str>,
 }
 
-/// Handed back when the stream could not be opened, so the cpal path
-/// can use the ring and the latch instead.
-pub struct CaptureStartError {
-    pub reason: String,
-    pub producer: Producer<f32>,
-    pub wake_tx: Ring,
-}
-
 struct CaptureParts {
     pump: CapturePump,
     channels: usize,
@@ -162,7 +155,7 @@ impl NativeCapture {
                 .error_callback(Box::new(move |_stream, error| {
                     // Not the real-time thread: AAudio calls this from
                     // its own, and only for disconnects and the like.
-                    failed.input_stream_failed.store(true, Ordering::Relaxed);
+                    failed.flag(crate::stats::Health::InputFailed);
                     warn!("AAudio voice capture error: {error:?}");
                 }))
                 .open_stream()
@@ -302,13 +295,6 @@ pub struct NativeRender {
     pub device_name: String,
 }
 
-/// Handed back when the stream could not be opened.
-pub struct RenderStartError {
-    pub reason: String,
-    pub consumer: Consumer<f32>,
-    pub wake_tx: Ring,
-}
-
 struct RenderParts {
     pump: RenderPump,
     channels: usize,
@@ -331,7 +317,7 @@ impl NativeRender {
         let opened = voice_builder(AudioDirection::Output).and_then(|b| {
             b.data_callback(render_callback(parts_rx))
                 .error_callback(Box::new(move |_stream, error| {
-                    failed.output_stream_failed.store(true, Ordering::Relaxed);
+                    failed.flag(crate::stats::Health::OutputFailed);
                     warn!("AAudio voice render error: {error:?}");
                 }))
                 .open_stream()
@@ -369,7 +355,7 @@ impl NativeRender {
         callback_frames.fetch_max(burst, Ordering::Relaxed);
         let device_name = format!("voice speaker (device {})", stream.device_id());
         let _ = parts_tx.send(RenderParts {
-            pump: RenderPump::new(consumer, wake_tx, stats, callback_frames),
+            pump: RenderPump::new(consumer, wake_tx, stats, Some(callback_frames)),
             channels,
         });
         Ok(Self {

@@ -26,6 +26,24 @@
 > the Rust type-checked there (desktop with the tray, and the phones'
 > `frontend`), nothing run on a device.
 
+> **2026-10-16:** chat pictures no longer go through the avatar path
+> (nor into its cache on disk); received pictures decode within
+> limits a sender can reach; Escape and Back leave Settings keeping
+> nothing, as its Close; the tab lists scroll on a short screen. Lines
+> marked **[10-16]**; `app-core`'s tests ran, the `.slint` behaviour
+> was driven headless at an iPhone SE's size and a phone on its side,
+> the Rust type-checked on Linux; nothing run on a device.
+> Later the same day, the rest of the 2026-10 review: Windows' call
+> path only in a voice room and opened by its id (AEC-SPEC E16), the
+> server's 20 s ping, a phone that stops watching in the background,
+> the question before quitting with unsaved Settings, portrait monitors
+> and the half-size DXGI path, X11 shares that read the screen only
+> when it changed, the key watcher's probation once per process, the
+> desktop's log in its config folder. Lines marked **[10-16b]**; the
+> tests and the Windows (MinGW), Android and iOS type-checks ran on
+> Linux, the quit question was driven headless; nothing run on
+> Windows, macOS or a phone.
+>
 > **2026-10-15:** Settings and the admin panel are pages over the
 > main window on every host (no more windows of their own), and the
 > admin panel works on the phones. Lines marked **[10-15]**; the real
@@ -124,7 +142,19 @@ built-in speakers is the machine that matters most.
 
 Play music in another app first, at a steady volume.
 
-- [ ] **Windows 11, speakers, Automatic** — connect. The music keeps its
+- [ ] **new [10-16b]** — **Windows 10 and Windows 11, speakers,
+  Automatic: connect and stay in the lobby.** The music keeps its
+  volume on both. Settings → Audio's echo line reads "Takes effect
+  when you join voice", and the log's `Native WASAPI` lines say
+  `category=Other`: the streams are plain until a room [AEC-SPEC E16,
+  P1-5].
+- [ ] **new [10-16b]** — the same machines, **join a room**, then
+  **watch someone's stream** there. Write down, for each Windows: is
+  the music lowered on joining? while watching? The call path's
+  streams now open the Communications device by its id, without the
+  role (E16); if neither Windows lowers the music, the amber notice
+  below (E15) can go. Leave the room: the music is back at once.
+- [ ] **Windows 11, speakers, Automatic** — join a room. The music keeps its
   volume. log: the `Native WASAPI render:` line ends `do-not-duck=
   requested, own-volume=kept, Windows during calls: …`. Write down
   what the `capture:` line says for `do-not-duck=` — that answer is
@@ -134,8 +164,9 @@ Play music in another app first, at a steady volume.
   would have ducked here.)
 - [ ] **new** — in voice, watch a stream whose sound plays on another
   output than the voice. The stream is not lowered.
-- [ ] **Windows 10, speakers, Automatic** — the music *is* lowered
-  (Windows 10 cannot be asked not to). Then:
+- [ ] **Windows 10, speakers, Automatic, in a room** — the music *is*
+  lowered (Windows 10 cannot be asked not to; unless E16's open by id
+  is enough — the line above). Then:
   - [ ] **new** — a toast says so, once; it does not come back at the
     next launch.
   - [ ] **new** — Settings → Audio shows an amber notice under the
@@ -182,6 +213,27 @@ Play music in another app first, at a steady volume.
   the pointer shows from the first change on the screen (a clock
   ticking, a hover), not before. On an HDR desktop (the screenshot
   fallback, said in the log) there is still no pointer.
+- [ ] **new [10-16b]** — share a **portrait (rotated) monitor**: the
+  viewer sees it upright, the right way round. log: `the output is
+  rotated (…): screenshots instead` — the DXGI path does not turn
+  pictures, so a rotated one goes to screenshots [P2-10].
+- [ ] **new [10-16b]** — share, then **lock the screen** (Win+L) for
+  half a minute and unlock: the share comes back by itself; the log
+  may show the screenshot fallback, and streaming tried again every
+  10 s until it holds [P2-12].
+- [ ] **new [10-16b]** — **the half-size path**: share a 4K monitor at
+  1080p (or a 1440p one at 720p — any quality at most half the
+  monitor's size): the picture is sharp and the colours right, the
+  pointer is where it is on the screen, its size right, and moves
+  smoothly while nothing else moves. The GPU halves the picture now
+  (`Halver`, mipmaps) instead of the CPU scaling the whole of it
+  [P2-46, P3-35].
+- [ ] **new [10-16b]** — share with no one watching for a minute,
+  then someone starts: they get a picture at once [P1-1].
+- [ ] **new [10-16b]** — **Linux on X11**: share a still desktop. log:
+  `X11 (GetImage on DAMAGE)`; CPU near zero while nothing moves, a
+  moving window shows smoothly, a second monitor's changes do not
+  wake the first's share [P2-43].
 
 ### 1.4 Doing nothing cheaply [P2-35, P2-37, P2-39]
 
@@ -192,6 +244,10 @@ Play music in another app first, at a steady volume.
   zero in Task Manager) and resume when the window is back [P2-39].
 - [ ] **new** — the log at its default level has no flood of `wasapi`
   lines during a call [P2-37].
+- [ ] **new [10-16b]** — **the release build's log** is `baucord.log`
+  in the config folder, beside `settings.json` (Settings → General →
+  Open config folder), not beside the exe; past 5 MB it rolls over to
+  `baucord.log.1` while the app runs [P2-47].
 
 ### 1.5 The window, the chat, the dialogs
 
@@ -310,7 +366,9 @@ Play music in another app first, at a steady volume.
   once.
 - [ ] **new [10-15]** — Settings → Keyboard: Record, press a combo:
   it is taken; Record again and press Escape: only the recording is
-  cancelled; Escape again closes Settings. The new bind works.
+  cancelled; Escape again closes Settings and keeps nothing: the old
+  bind works, not the new one. Record again and press Save and close:
+  the new bind works. **[10-16]**: Escape kept the new bind.
 - [ ] **new [10-15]** — Settings on Audio, then close the window to
   the tray: the microphone closes (Windows' microphone icon goes);
   Show from the tray: Settings is still open and the meter moves.
@@ -327,7 +385,7 @@ Play music in another app first, at a steady volume.
   the microphone and a keybind, then press Close (not Save and
   close): each goes back to what it was, at once, and after a restart
   too. Change one again and press Save and close: it stays. Escape
-  saves, as before. Pick a new picture, then Close: the old one is
+  does what Close does **[10-16]**. Pick a new picture, then Close: the old one is
   back, and nobody else saw the new one.
 - [ ] **new [10-15]** — maximize the window with Settings, then the
   panel open: the content keeps to a column beside the tabs, its
@@ -344,11 +402,40 @@ Play music in another app first, at a steady volume.
   the audit as two-line entries); under 600 px Settings and the panel
   become a list and a page with an arrow back, as on the phone.
 - [ ] **new [10-15]** — the main window's title bar and a stream
-  viewer's (which had none) show the tray's flat dog, as do their
-  taskbar buttons and Alt-Tab while the app runs; the exe in Explorer,
-  the Start menu and a pinned shortcut keep the painted icon. At 100 %
-  and 150 % scaling. (Linux on X11: the same glyph in the title bar
+  viewer's (which had none) show the tray's icon, the dog on a disc,
+  as do their taskbar buttons and Alt-Tab while the app runs; the exe
+  in Explorer, the Start menu and a pinned shortcut keep the full
+  painting. At 100 %
+  and 150 % scaling. (Linux on X11: the same icon in the title bar
   and the task list.)
+- [ ] **new [10-16]** — on a server that keeps history, with pictures
+  in General and in a DM, restart the app: the folder `avatars/`
+  beside `settings.json` is gone (`log: removed the old picture
+  cache`, once), and `avatar-cache/` holds only people's profile
+  pictures — a file per person, none of the chat's pictures, however
+  many are scrolled through. A history page of pictures comes in
+  without a stutter.
+- [ ] **new [10-16]** — from another client, send as a file (not as a
+  picture) a photo wider than 4096 px, under 10 MB: it stays a file
+  card with Save; a 12 MP phone photo (4032 px) shows as a picture.
+  An animated GIF a sender made plays as before.
+
+- [ ] **new [10-16b]** — **quitting with unsaved Settings.** Open
+  Settings, change the text size, then quit from the tray's Quit: the
+  window comes up with the question — Save and quit, Quit without
+  saving, Cancel. Cancel (or Escape): Settings is still open, the
+  change still there. Quit again → Quit without saving: next start,
+  the old size. Again → Save and quit (or Enter): next start, the new
+  size. The same from `/quit`, from the connect page's Quit, and from
+  installing an update with Settings changed. A window narrower than
+  600 px stacks the three buttons. A build without the tray: closing
+  the window asks the same and stays up until answered. Sign out of
+  Windows (or shut down) with a change on the page: next start, the
+  change is not there — nothing asked, nothing kept.
+- [ ] **new [10-16b]** — someone whose profile picture is over 512 px
+  a side (a hand-made one; the app scales its own to well under):
+  their initial shows in its place, the window does not stall, and
+  the log says `avatars: a picture refused: an avatar of …` [T2].
 
 ### 1.6 Keybinds without polling [P1-3 step 2] **[7]**
 
@@ -372,8 +459,15 @@ the same edges without the app (F7, Ctrl+F8, hold V).
   type in Notepad).
 - [ ] **new** — Task Manager, connected and idle with the keyboard at
   rest: the `key-watch` thread does nothing (it woke 83 times a second
-  in 1.2.0, 4 times a second for the first three presses of a session
-  now, then never).
+  in 1.2.0). **[10-16b]**: until three presses have been announced by
+  Windows, it looks on a heartbeat that starts at 4 a second and
+  slows to one every 4 s while nothing happens; after them, never.
+- [ ] **new [10-16b]** — press push-to-talk three times, then
+  disconnect and connect again (or rebind a key): log `Key watcher: …
+  woken by key events, proven` — the new watcher trusts the events
+  from the start — and PTT works at once. Type in another window and
+  alt-tab while holding PTT: the log still has no `a key was pressed
+  and no event said so` [P2-34].
 - [ ] *Find out* — with a window that runs as administrator in front
   (Task Manager, an elevated game) and baucord not elevated: do the
   keys reach baucord? In 1.2.0? (Windows hides input to elevated
@@ -457,6 +551,19 @@ agrees with it.
   it: the microphone opens without leaving the room.
 - [ ] **same** — a phone call during a room; ten minutes with the
   screen off; Wi-Fi to cellular and back [TST-4].
+- [ ] **new [10-16b]** — **against a server after 1.2.1**: unplugged,
+  connected in the lobby, screen off for 5 minutes; then someone sends
+  a DM. The notification comes within seconds, and the others did not
+  see you leave and come back. (The server's PING every 20 s wakes the
+  phone; against a 1.2.1 server the session ends after 30 s and the
+  phone reconnects when it wakes.) [ANDROID-SPEC D74, P1-6]
+- [ ] **new [10-16b]** — watch a stream on its page, then press Home
+  for a minute: no sound of it and, in Settings → Apps → baucord →
+  Mobile data, almost nothing used meanwhile; back in the app the
+  picture returns by itself within a couple of seconds [D74, P1-2].
+- [ ] **new [10-16b]** — on screen, out of a room: a mention plays the
+  mention chime, a DM the message chime (two different sounds); five
+  DMs from one person within a few seconds sound once [P3-12, P3-15].
 
 ### 2.1a Settings → Audio without a room **[8]** [ANDROID-SPEC D70]
 
@@ -532,6 +639,13 @@ agrees with it.
   close; Reset to defaults is the list's last row, in red, and turns
   the footer into the question. Change something, then Close: it goes
   back.
+- [ ] **new [10-16]** — Settings: change the text size, then Back
+  from the list: it goes back, as with Close; Back on a section still
+  goes to the list first. Tap Reset to defaults, then Back: only the
+  question goes. With the display size at its largest (or a short
+  phone), the list scrolls with a finger and Close and Save and close
+  stay on screen; on its side, the tab column scrolls too. The same in
+  the admin panel's list.
 - [ ] **new [10-15]** — no squares where a symbol should be: the
   dropdowns' chevrons, the dot before "Connected", the arrows by the
   transfer rates; `/users` says "now" for whoever is online and
@@ -630,6 +744,16 @@ after it is the seventh batch's.
 - [ ] **same** — connect AirPods in a room: log `plain streams`; take
   them off: back to `voice-call path`.
 - [ ] **same** — leave the room: the app still survives the background.
+- [ ] **new [10-16b]** — play music, then connect: the music keeps
+  playing in the lobby, in front and in the background. Join a room:
+  the music stops (a call); leave it: the music app may resume, and
+  the lobby keeps the app alive again [IOS-SPEC D64, P1-7].
+- [ ] **new [10-16b]** — in the lobby in the background for ten
+  minutes: the battery graph shows the app barely there (the lobby's
+  output runs long buffers now) [P1-7].
+- [ ] **new [10-16b]** — watch a stream, go to the home screen for a
+  minute: its sound stops; back in the app the picture returns by
+  itself [D64, P1-2].
 
 ### 3.1a Settings → Audio without a room **[8]** [IOS-SPEC D60]
 
@@ -680,6 +804,8 @@ after it is the seventh batch's.
   sound; tapping opens the conversation.
 - [ ] **same** — a DM with the app on screen chimes, and the
   ring/silent switch silences it.
+- [ ] **new [10-16b]** — a mention plays its own chime, not the DM's;
+  a burst of DMs from one person sounds once [P3-12, P3-15].
 
 ### 3.3 The screen, at 375 pt
 
@@ -688,6 +814,10 @@ after it is the seventh batch's.
 - [ ] **same** — watch a stream: picture, sound, pinch, rotate.
 - [ ] **new [10-15]** — the admin panel as in §2.3, the top bar's
   arrow standing in for Back.
+- [ ] **new [10-16]** — on an iPhone SE (667 pt tall): the Settings
+  list scrolls with a finger, Close and Save and close stay on screen,
+  and Reset to defaults is at the end of the scroll. The top bar's
+  arrow from the list keeps nothing, as Close.
 
 ### 3.4 The seventh batch **[7]**
 
@@ -822,6 +952,20 @@ the simulator only:
   app shows them muted within ~3 s; `server restriction lift <id>`
   unmutes it [SRV-12].
 
+**[10-16b]** — the 2026-10 review's server side:
+
+- [ ] back up first (`server backup`), then start the new server on
+  the old database: log `schema 7`; the old server refuses the
+  upgraded database (going back is restoring that backup).
+- [ ] a client killed hard (pull its network cable) leaves the roster
+  within about 50 s, not 30: the server's 20 s ping restarts its idle
+  timer [D74].
+- [ ] a 30 MB file, then pictures in the same minute: the pictures
+  still go through (pictures and files have a bucket each) [P1-11].
+- [ ] a `server.yaml` with an `authentication:` section, or a misspelt
+  section: the log names it at start (`… is not a section this server
+  reads; ignored`), and the server runs.
+
 ### 5.1 The workflows **[7]**
 
 - [ ] The next push: `pr-check` is green. It installs neither
@@ -837,6 +981,16 @@ the simulator only:
   follow it. After a published release it does.
 - [ ] The Android release: `Install cargo-ndk` takes seconds
   (`cargo-ndk 4.1.2`, prebuilt) and the Gradle build finds it [P3-48].
+- [ ] **[10-16b]** `pr-check` has two new jobs, `chat-scroll-sim` ("0
+  of the checks failed") and `windows` (clippy for
+  `x86_64-pc-windows-gnu`), and its `fmt` uses `nightly-2026-10-10`.
+  A push to `main` that only touches docs starts no "Build and
+  Release"; two quick pushes cancel the first one's run.
+- [ ] **[10-16b]** The next release: the image is built on the
+  bookworm builder and `Start the image once` passes before the push;
+  `latest` moves only if the tag is the newest stable one; the
+  `version` file is uploaded only then; the APK and AAB artifacts
+  expire after 7 days, and a dry run's APK is unsigned.
 
 ---
 

@@ -3,8 +3,8 @@
 
 `assets/icons/icon.png` is 1254 px a side: right for the phones' stores,
 but the Windows `.ico` built from it carried an uncompressed 256 px
-bitmap (726 KB). (The windows and the tray load the flat glyph that
-`scripts/tray-icons.py` draws, not this icon.) This writes:
+bitmap (726 KB). (The windows and the tray load `tray.png`, a hand-made
+64 px version on a disc, not this icon.) This writes:
 
 - `assets/icons/icon.ico`: 16–64 px as bitmaps (what old shell code
   reads) and 256 px as a PNG (Windows scales that one for the sizes in

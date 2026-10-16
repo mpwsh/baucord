@@ -15,7 +15,7 @@ import { ConnectView } from "connect.slint";
 import { StartupView } from "startup.slint";
 import { Sidebar } from "sidebar.slint";
 import { ChatPane } from "chat.slint";
-import { Btn, IconBtn, Modal, Field, FieldLabel, Hint, Dropdown, CheckRow, AvatarTile, MenuPanel, RoleGlyph, TipLayer } from "widgets.slint";
+import { Btn, IconBtn, Modal, PageRect, Field, FieldLabel, Hint, Dropdown, CheckRow, AvatarTile, MenuPanel, RoleGlyph, TipLayer } from "widgets.slint";
 import { SettingsPanel, SettingsState, SettingsLogic } from "settings.slint";
 import { AdminPanel, AdminState, AdminLogic, AdminUserRow, AdminRoleRow, AdminRestrictionRow, AdminInviteRow, AdminChannelRow, AdminBlobRow, AdminAuditRow } from "admin.slint";
 import { StreamViewerWindow, StreamViewerPanel } from "viewer.slint";
@@ -36,14 +36,24 @@ export component MainWindow inherits Window {
     preferred-height: 640px;
     min-width: 500px;
     min-height: 400px;
-    // The tray's flat glyph (scripts/tray-icons.py), which reads at a
-    // title bar's 16 px where the painted app icon was a grey blur. On
-    // Windows Slint gives it to the taskbar button and Alt-Tab too; the
-    // exe's own icon (desktop/build.rs, icon.ico) stays the painted one.
+    // The tray's icon (assets/icons/tray.png, made by hand from the app
+    // icon, on a disc). On Windows Slint gives it to the taskbar button
+    // and Alt-Tab too; the exe's own icon (desktop/build.rs, icon.ico)
+    // is the full painting.
     icon: @image-url("../../../assets/icons/tray.png");
 
     // Share-dialog local state
-    in-out property <bool> share-dialog-open: false;
+    property <bool> share-dialog-open: false;
+    // The main screen is drawn: not under an opaque page. What it
+    // shows waits while it is covered (`AppState::main_on_screen`).
+    property <bool> main-shown: State.phase == Phase.main && !State.watch-open
+        && !State.settings-open && !State.admin-open
+        // A phone's picture viewer is opaque: the chat under it was
+        // drawn every frame of a looping GIF (review 2026-10, P3-17).
+        && !(State.viewer-open && root.viewer-compact);
+    changed main-shown => {
+        if (self.main-shown) { Logic.main-screen-shown(); }
+    }
     property <int> share-monitor: State.default-monitor;
     property <int> share-quality: State.default-quality;
     property <int> share-scope: State.default-scope;   // 0 = my channel, 1 = everyone
@@ -128,6 +138,13 @@ export component MainWindow inherits Window {
     property <length> inset-bottom: Math.max(root.edge-bottom, root.keyboard-overlap);
     property <length> page-width: root.width - root.inset-left - root.inset-right;
     property <length> page-height: root.height - root.inset-top - root.inset-bottom;
+    // The same, for a dialog to centre in (`Modal.page`).
+    property <PageRect> page-rect: {
+        x: root.inset-left,
+        y: root.inset-top,
+        width: root.page-width,
+        height: root.page-height,
+    };
 
     if State.phase != Phase.connect && State.phase != Phase.main : StartupView {
         x: root.inset-left;
@@ -189,6 +206,12 @@ export component MainWindow inherits Window {
         // The capture phase, so Back is ours before any field inside
         // (a read-only message row forwards every key it gets).
         capture-key-pressed(ev) => {
+            // Back drops an edit first, as Escape does (review 2026-10,
+            // P3-18), then leaves the conversation.
+            if (ev.text == Key.Back && State.editing) {
+                Logic.edit-cancel();
+                return accept;
+            }
             if (ev.text == Key.Back && root.chat-page) {
                 State.narrow-chat-open = false;
                 return accept;
@@ -206,8 +229,7 @@ export component MainWindow inherits Window {
             // chat underneath (review P1-10). Hidden is not removed:
             // the chat pane keeps its rows and scroll, and a page
             // closing hands the focus back as before.
-            visible: State.phase == Phase.main && !State.watch-open && !State.settings-open
-                && !State.admin-open;
+            visible: root.main-shown;
             // The chat pane is a persistent instance (the shell drives
             // its scroll and composer at any time), so both pages are
             // placed by hand rather than swapped with `if`.
@@ -246,6 +268,7 @@ export component MainWindow inherits Window {
             }
             chat-pane := ChatPane {
                 narrow: root.narrow;
+                drawn: root.main-shown && State.app-shown;
                 x: root.narrow ? (1 - root.chat-shown) * parent.width : State.sidebar-width;
                 width: root.narrow ? parent.width : parent.width - State.sidebar-width;
                 height: parent.height;
@@ -283,7 +306,13 @@ export component MainWindow inherits Window {
     Timer {
         interval: 450ms;
         running: root.card-key != -1 && root.card-shown-for != root.card-key && !State.menu-open;
-        triggered => { root.card-shown-for = root.card-key; }
+        triggered => {
+            root.card-shown-for = root.card-key;
+            // An admin's card shows the last telemetry: asked for now,
+            // when the card shows, not for every row the pointer crossed
+            // (review 2026-10, P3-20).
+            if (root.card-key >= 0) { Logic.user-card-shown(root.card-key); }
+        }
     }
     if root.card-key != -1 && root.card-shown-for == root.card-key && !State.menu-open
         && (root.card-key == -2
@@ -475,7 +504,8 @@ export component MainWindow inherits Window {
     // menu (the admin panel's Actions open it), the toast and the
     // dialogs (an admin action can open the invite or channel dialog
     // over its page).
-    // Back steps back (a section → the list → out, as the arrow does),
+    // Back steps back (a section → the list → out, as the arrow does;
+    // out of Settings keeps nothing, as its Close),
     // taken in the capture phase, before any field inside sees it; so
     // does Escape on the desktop, in the bubble phase, after whatever
     // has the keyboard (a keybind being recorded, the admin panel's
@@ -593,8 +623,13 @@ export component MainWindow inherits Window {
             volume <=> State.menu-volume;
             volume-changed(v) => { Logic.menu-volume-changed(v); }
             volume-released(v) => { Logic.menu-volume-released(v); }
-            x: Math.max(Theme.gap-sm, Math.min(State.menu-x, root.width - self.width - Theme.gap-sm));
-            y: Math.max(Theme.gap-sm, Math.min(State.menu-y, root.height - self.height - Theme.gap-sm));
+            // Inside the page's rectangle: clear of a phone's status
+            // and navigation bars and of the keyboard, which the whole
+            // window is not (review 2026-10, P2-22).
+            x: Math.max(root.inset-left + Theme.gap-sm,
+                Math.min(State.menu-x, root.inset-left + root.page-width - self.width - Theme.gap-sm));
+            y: Math.max(root.inset-top + Theme.gap-sm,
+                Math.min(State.menu-y, root.inset-top + root.page-height - self.height - Theme.gap-sm));
             submenu-hovered(entry, model, y) => {
                 menu-layer.open-entry = model >= 0 ? entry : -1;
                 menu-layer.open-model = model;
@@ -604,11 +639,12 @@ export component MainWindow inherits Window {
         }
         if menu-layer.open-model >= 0 && menu-layer.open-model < State.menu-submenus.length : MenuPanel {
             entries: State.menu-submenus[menu-layer.open-model];
-            x: main-column.x + main-column.width - 4px + self.width <= root.width - Theme.gap-sm
+            x: main-column.x + main-column.width - 4px + self.width
+                    <= root.inset-left + root.page-width - Theme.gap-sm
                 ? main-column.x + main-column.width - 4px
-                : Math.max(Theme.gap-sm, main-column.x - self.width + 4px);
-            y: Math.max(Theme.gap-sm, Math.min(main-column.y + menu-layer.open-y - 4px,
-                root.height - self.height - Theme.gap-sm));
+                : Math.max(root.inset-left + Theme.gap-sm, main-column.x - self.width + 4px);
+            y: Math.max(root.inset-top + Theme.gap-sm, Math.min(main-column.y + menu-layer.open-y - 4px,
+                root.inset-top + root.page-height - self.height - Theme.gap-sm));
             activated(id) => { Logic.menu-activated(id); }
         }
     }
@@ -656,9 +692,11 @@ export component MainWindow inherits Window {
             : State.toast-kind == ToastKind.warning ? Theme.warning
             : State.toast-kind == ToastKind.success ? Theme.success
             : Theme.accent-text;
-        x: (root.width - self.width) / 2;
-        y: Theme.gap-lg;
-        width: Math.min(toast-row.preferred-width + 2 * Theme.gap-md, root.width - 2 * Theme.gap-lg);
+        // In the page, under a phone's status bar and notch, not on them
+        // (review 2026-10, P2-22).
+        x: root.inset-left + (root.page-width - self.width) / 2;
+        y: root.inset-top + Theme.gap-lg;
+        width: Math.min(toast-row.preferred-width + 2 * Theme.gap-md, root.page-width - 2 * Theme.gap-lg);
         height: toast-row.preferred-height + 2 * Theme.gap-sm + 4px;
         border-radius: Theme.radius-md;
         background: Theme.bg-tertiary;
@@ -699,6 +737,7 @@ export component MainWindow inherits Window {
 
     // ── Image send preview (modal overlay) ─────────────────────────
     if State.preview-open : Modal {
+        page: root.page-rect;
         card-width: 520px;
         dismissed => { Logic.preview-cancel(); }
         // Enter = Send, Escape = Cancel — same paths as the buttons;
@@ -906,6 +945,7 @@ export component MainWindow inherits Window {
 
     // ── Screen-share dialog (modal overlay) ────────────────────────
     if root.share-dialog-open : Modal {
+        page: root.page-rect;
         card-width: 380px;
         dismissed => { root.share-dialog-open = false; }
         Text {
@@ -944,6 +984,7 @@ export component MainWindow inherits Window {
     // saved password, or when the server answers WrongPassword. OK
     // saves the password on the server entry and retries the join.
     if State.channel-prompt-open : Modal {
+        page: root.page-rect;
         card-width: 340px;
         dismissed => { Logic.channel-password-cancel(); }
         opened => { chp-field.focus-input(); }
@@ -984,6 +1025,7 @@ export component MainWindow inherits Window {
     // code appears in the same dialog once the server minted it (and
     // is on the clipboard already). Escape closes.
     if State.invite-dialog-open : Modal {
+        page: root.page-rect;
         card-width: 400px;
         dismissed => { Logic.invite-dialog-cancel(); }
         key(ev) => {
@@ -1107,6 +1149,7 @@ export component MainWindow inherits Window {
     // stays open until the server's list update (success) or its
     // refusal, shown inline. Escape cancels, Enter in a field saves.
     if State.channel-dialog-open : Modal {
+        page: root.page-rect;
         card-width: 400px;
         dismissed => { Logic.channel-dialog-cancel(); }
         opened => { chd-name.focus-input(); }
@@ -1192,6 +1235,7 @@ export component MainWindow inherits Window {
     // Title and button repeat the consequence; Enter confirms, Escape
     // cancels. The host remembers what is being confirmed.
     if State.confirm-open : Modal {
+        page: root.page-rect;
         card-width: 360px;
         dismissed => { Logic.confirm-cancel(); }
         key(ev) => {
@@ -1217,12 +1261,57 @@ export component MainWindow inherits Window {
         }
     }
 
+    // ── Quitting with unsaved Settings changes ─────────────────────
+    // Above the Settings page it is about. Escape, Back and a click
+    // outside stay; Enter saves, as the accent button.
+    if State.quit-ask-open : Modal {
+        page: root.page-rect;
+        card-width: 460px;
+        dismissed => { Logic.quit-ask-cancel(); }
+        key(ev) => {
+            if (ev.text == Key.Return) { Logic.quit-ask-save(); return accept; }
+            reject
+        }
+        Text {
+            text: Tr.quit-unsaved-title;
+            color: Theme.text-primary;
+            font-size: Theme.font-md;
+            font-weight: 600;
+            wrap: word-wrap;
+        }
+        Hint { text: Tr.quit-unsaved-body; }
+        if !root.narrow : HorizontalLayout {
+            spacing: Theme.gap-sm;
+            Btn { text: Tr.cancel; clicked => { Logic.quit-ask-cancel(); } }
+            Rectangle { }
+            Btn { text: Tr.quit-unsaved-discard; clicked => { Logic.quit-ask-discard(); } }
+            Btn {
+                text: Tr.quit-unsaved-save;
+                accent: true;
+                clicked => { Logic.quit-ask-save(); }
+            }
+        }
+        // Three buttons side by side do not fit a phone's card: one
+        // under the other, the answer Enter gives first.
+        if root.narrow : VerticalLayout {
+            spacing: Theme.gap-sm;
+            Btn {
+                text: Tr.quit-unsaved-save;
+                accent: true;
+                clicked => { Logic.quit-ask-save(); }
+            }
+            Btn { text: Tr.quit-unsaved-discard; clicked => { Logic.quit-ask-discard(); } }
+            Btn { text: Tr.cancel; clicked => { Logic.quit-ask-cancel(); } }
+        }
+    }
+
     // ── Moderation dialog (kick / ban / disconnect / mute) ─────────
     // Opened by the shell from the roster menu. The title and the
     // confirm label repeat the consequence, so the dialog is
     // answerable without reading the body; Escape cancels, Enter in
     // the reason field confirms.
     if State.moderation-open : Modal {
+        page: root.page-rect;
         card-width: 380px;
         dismissed => { Logic.moderation-cancel(); }
         opened => { mod-reason.focus-input(); }
@@ -1273,6 +1362,7 @@ export component MainWindow inherits Window {
     // and "Also block them" is offered while they are not blocked yet.
     // Escape cancels.
     if State.report-open : Modal {
+        page: root.page-rect;
         card-width: 400px;
         dismissed => { Logic.report-cancel(); }
         Text {

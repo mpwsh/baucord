@@ -12,7 +12,8 @@ Two sources, merged into one list:
   license file under licenses/native/ (fetched from each project's own
   repository): Skia and what it bundles, FFmpeg and x264 in the desktop
   builds, libopus, the GPU encoders' headers, the Lucide icons — and
-  Slint, whose crates carry no license file.
+  Slint, whose crates carry no license file; and, on the site's page
+  only, the website's own Alpine.js.
 
 CI runs it before every build (.github/workflows/licenses.yml), so the
 releases and the site always carry the list for the commit they are
@@ -30,6 +31,7 @@ import html
 import json
 import re
 import subprocess
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -38,12 +40,18 @@ APP_JSON = ROOT / "crates" / "frontend" / "licenses.json"
 SITE_HTML = ROOT / "web" / "licenses.html"
 SOURCE = "https://github.com/mpwsh/baucord"
 
-# Our crates: not third-party. (third_party/wasapi is a patched copy of
-# someone else's crate and stays in.)
-OWN = {
-    "android", "app-core", "audio", "client", "desktop", "frontend", "i18n",
-    "ios", "protocol", "server", "transport", "ui", "video",
-}
+def own_crates() -> set[str]:
+    """Our crates, not third-party: every package under crates/. A list
+    written out by hand missed `keywatch`, which then read as someone
+    else's (review 2026-10, P3-56). (third_party/wasapi is a patched
+    copy of someone else's crate and stays in.)"""
+    return {
+        tomllib.loads(manifest.read_text(encoding="utf-8"))["package"]["name"]
+        for manifest in (ROOT / "crates").glob("*/Cargo.toml")
+    }
+
+
+OWN = own_crates()
 
 # The native code, and baucord itself first. `texts` are files under
 # licenses/native (or the repo's LICENSE), in order; `note` is the
@@ -87,7 +95,7 @@ COMPONENTS = [
         "note": (
             "Copyright © the FFmpeg developers. https://ffmpeg.org — built "
             "with --enable-gpl and libx264, which puts it under the GPL. "
-            "Source: FFmpeg 7.1.1, https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz "
+            "Source: FFmpeg 7.1.2, https://ffmpeg.org/releases/ffmpeg-7.1.2.tar.xz "
             "(Linux, macOS); FFmpeg 7.1.2 from vcpkg at commit "
             "34823ada10080ddca99b60e85f80f55e18a44eea (Windows)."
         ),
@@ -174,6 +182,14 @@ COMPONENTS = [
         "note": "https://lucide.dev",
         "texts": ["lucide.txt"],
     },
+    # `site`: on the website's page only — the apps do not contain it.
+    {
+        "name": "Alpine.js (this website)",
+        "license": "MIT License",
+        "note": "https://alpinejs.dev — version 3.15.12, served as js/alpine.min.js. Not in the apps.",
+        "texts": ["alpinejs.md"],
+        "site": True,
+    },
 ]
 
 
@@ -245,15 +261,16 @@ def build(about: dict):
         if re.match(slint_like, c["package"]["name"])
     )
 
-    components = []
-    for comp in COMPONENTS:
+    def component(comp):
         note = comp["note"].replace("CRATES", ", ".join(slint_crates))
         blocks = []
         for i, name in enumerate(comp["texts"]):
             blocks.append({"note": note if i == 0 else "", "text": texts.add(native_text(name))})
         if not blocks:
             blocks.append({"note": note, "text": None})
-        components.append({"name": comp["name"], "license": comp["license"], "blocks": blocks})
+        return {"name": comp["name"], "license": comp["license"], "blocks": blocks}
+
+    components = [component(c) for c in COMPONENTS if not c.get("site")]
 
     groups: dict[str, dict] = {}
     crate_count = len(slint_crates)
@@ -280,10 +297,14 @@ def build(about: dict):
             "blocks": [{"note": ", ".join(b["users"]), "text": b["text"]} for b in blocks],
         })
     crates.sort(key=lambda g: (-g["count"], g["name"]))
-    return components, crates, crate_count, texts
+    # The website's own parts last: their texts after every text the
+    # apps use, so the apps' list stops short of them.
+    app_texts = len(texts.raw)
+    site_components = [component(c) for c in COMPONENTS if c.get("site")]
+    return components, site_components, crates, crate_count, texts, app_texts
 
 
-def write_app_json(components, crates, crate_count, texts):
+def write_app_json(components, crates, crate_count, texts, app_texts):
     data = {
         "crate_count": crate_count,
         "components": components,
@@ -291,7 +312,7 @@ def write_app_json(components, crates, crate_count, texts):
             {"name": g["name"], "license": "", "count": g["count"], "blocks": g["blocks"]}
             for g in crates
         ],
-        "texts": [paragraphs(t) for t in texts.raw],
+        "texts": [paragraphs(t) for t in texts.raw[:app_texts]],
     }
     APP_JSON.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")) + "\n")
 
@@ -448,9 +469,9 @@ def main():
             cwd=ROOT, check=True, capture_output=True, text=True,
         ).stdout
         about = json.loads(out)
-    components, crates, crate_count, texts = build(about)
-    write_app_json(components, crates, crate_count, texts)
-    write_site(components, crates, crate_count, texts)
+    components, site_components, crates, crate_count, texts, app_texts = build(about)
+    write_app_json(components, crates, crate_count, texts, app_texts)
+    write_site(components + site_components, crates, crate_count, texts)
     print(f"{len(components)} components, {crate_count} crates under {len(crates)} licenses, "
           f"{len(texts.raw)} distinct texts → {APP_JSON.relative_to(ROOT)} "
           f"({APP_JSON.stat().st_size // 1024} KB), {SITE_HTML.relative_to(ROOT)} "

@@ -764,18 +764,18 @@ fn a_dead_peer_is_detected_by_the_idle_timeout() {
     assert!(server_saw
         .as_ref()
         .is_some_and(DisconnectReason::is_transient));
-    // The server hears nothing for the idle timeout. The client's
-    // timer starts again at the keep-alive it sends into the dead link
-    // (QUIC restarts it on the first packet sent after the last one
-    // received), so a client with nothing else to say takes the
-    // keep-alive interval longer — the price of the 5 s keep-alive
-    // (review P2-49); in a voice room it is sending all the time.
+    // Each side's timer starts again at the keep-alive it sends into
+    // the dead link (QUIC restarts it on the first packet sent after
+    // the last one received), so each takes its keep-alive interval
+    // longer than the idle timeout: the client 5 s (review P2-49; in a
+    // voice room it is sending all the time), the server 20 s since it
+    // keeps a quiet phone awake (review 2026-10, P1-6).
     let idle = Budget::client().max_idle_timeout;
     let slack = Duration::from_secs(5);
     let server_took = server_at.expect("seen") - cut_at;
     let client_took = client_at.expect("seen") - cut_at;
     assert!(
-        server_took < idle + slack,
+        server_took < idle + crate::config::SERVER_KEEP_ALIVE + slack,
         "the server took {server_took:?}"
     );
     assert!(

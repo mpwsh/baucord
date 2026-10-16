@@ -234,6 +234,63 @@ impl PeerBuffer {
     }
 }
 
+/// Each peer's volume and mute, and the peers removed, as the engine's
+/// owner sets them. The output worker keeps a copy and looks at the
+/// locks only when [`Self::generation`] moved, and then without waiting
+/// (`try_lock`): it took both every 10 ms and one per packet, on the
+/// real-time output thread (review 2026-10, P3-26).
+#[derive(Default)]
+pub struct PeerTable {
+    settings: Mutex<HashMap<u64, PeerAudioSettings>>,
+    /// Removed since the worker last looked; it sweeps their state.
+    removed: Mutex<HashSet<u64>>,
+    /// Bumped by every change.
+    generation: std::sync::atomic::AtomicU64,
+}
+
+impl PeerTable {
+    fn changed(&self) {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Set `peer`'s volume and mute.
+    pub fn set(&self, peer: u64, settings: PeerAudioSettings) {
+        if let Ok(mut s) = self.settings.lock() {
+            s.insert(peer, settings);
+        }
+        self.changed();
+    }
+
+    /// A peer joined: default settings unless it has some, and no
+    /// longer counted as removed.
+    pub fn add(&self, peer: u64) {
+        if let Ok(mut s) = self.settings.lock() {
+            s.entry(peer).or_default();
+        }
+        if let Ok(mut r) = self.removed.lock() {
+            r.remove(&peer);
+        }
+        self.changed();
+    }
+
+    /// A peer left: its settings go, and the worker drops its state.
+    pub fn remove(&self, peer: u64) {
+        if let Ok(mut r) = self.removed.lock() {
+            r.insert(peer);
+        }
+        if let Ok(mut s) = self.settings.lock() {
+            s.remove(&peer);
+        }
+        self.changed();
+    }
+
+    /// How many changes so far.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 pub struct AdaptiveJitterBuffer {
     sample_rate: usize,
     target_samples: usize,
@@ -241,9 +298,12 @@ pub struct AdaptiveJitterBuffer {
     max_samples: usize,
 
     buffers: HashMap<u64, PeerBuffer>,
-    peer_settings: Arc<Mutex<HashMap<u64, PeerAudioSettings>>>,
-    /// Peers removed via the public API; swept in `adapt()`.
-    removed_peers: Arc<Mutex<HashSet<u64>>>,
+    /// The engine owner's volumes, mutes and removals ([`PeerTable`]),
+    /// and the copy taken of them at `peers_seen`.
+    peers: Arc<PeerTable>,
+    peers_seen: Option<u64>,
+    peer_settings: HashMap<u64, PeerAudioSettings>,
+    removed_scratch: Vec<u64>,
 
     /// Self-monitor PCM (mic loopback), mixed after the peers.
     loopback: VecDeque<f32>,
@@ -290,12 +350,7 @@ pub struct AdaptiveJitterBuffer {
 }
 
 impl AdaptiveJitterBuffer {
-    pub fn new(
-        sample_rate: usize,
-        initial_target_ms: usize,
-        peer_settings: Arc<Mutex<HashMap<u64, PeerAudioSettings>>>,
-        removed_peers: Arc<Mutex<HashSet<u64>>>,
-    ) -> Self {
+    pub fn new(sample_rate: usize, initial_target_ms: usize, peers: Arc<PeerTable>) -> Self {
         #[allow(clippy::cast_precision_loss)]
         let initial_ms = initial_target_ms as f32;
         Self {
@@ -304,8 +359,10 @@ impl AdaptiveJitterBuffer {
             min_samples: (2 * sample_rate) / 1000, // 2ms floor
             max_samples: (200 * sample_rate) / 1000, // 200ms ceiling
             buffers: HashMap::new(),
-            peer_settings,
-            removed_peers,
+            peers,
+            peers_seen: None,
+            peer_settings: HashMap::new(),
+            removed_scratch: Vec::new(),
             loopback: VecDeque::with_capacity(LOOPBACK_CAP),
             scratch: Vec::new(),
             jitter_scratch: Vec::new(),
@@ -438,25 +495,25 @@ impl AdaptiveJitterBuffer {
         let peer_id = pkt.header.ssrc;
         let ts = pkt.header.timestamp;
 
-        // Check mute
-        {
-            let Ok(settings) = self.peer_settings.lock() else {
-                return;
-            };
-            if settings.get(&peer_id).is_some_and(|s| s.is_muted) {
-                if let Some(peer) = self.buffers.get_mut(&peer_id) {
-                    peer.packets.clear();
-                    peer.drift_window_dirty = true;
-                }
-                return;
+        // Muted: from the copy (`refresh_peers`), no lock per packet.
+        if self.peer_settings.get(&peer_id).is_some_and(|s| s.is_muted) {
+            if let Some(peer) = self.buffers.get_mut(&peer_id) {
+                peer.packets.clear();
+                peer.drift_window_dirty = true;
             }
+            return;
         }
 
         let peer = match self.buffers.entry(peer_id) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(v) => match PeerBuffer::new() {
-                Ok(p) => {
+                Ok(mut p) => {
                     log::info!("Adding decoder for peer {peer_id}");
+                    p.settings = self
+                        .peer_settings
+                        .get(&peer_id)
+                        .cloned()
+                        .unwrap_or_default();
                     v.insert(p)
                 }
                 // Opus init failure is near-impossible; skip this packet
@@ -582,6 +639,37 @@ impl AdaptiveJitterBuffer {
         self.loopback.extend(frame.iter().copied());
     }
 
+    /// Take a new copy of the volumes, mutes and removals if they
+    /// changed since the last, and if nobody holds the table's locks
+    /// right now (else the next call tries again). Every peer buffer
+    /// gets its settings, and a removed peer's state goes.
+    fn refresh_peers(&mut self) {
+        let generation = self.peers.generation();
+        if self.peers_seen == Some(generation) {
+            return;
+        }
+        let Ok(settings) = self.peers.settings.try_lock() else {
+            return;
+        };
+        let Ok(mut removed) = self.peers.removed.try_lock() else {
+            return;
+        };
+        self.peer_settings.clone_from(&settings);
+        self.removed_scratch.clear();
+        self.removed_scratch.extend(removed.drain());
+        drop(removed);
+        drop(settings);
+        self.peers_seen = Some(generation);
+        for id in &self.removed_scratch {
+            if self.buffers.remove(id).is_some() {
+                log::info!("Dropped decoder for removed peer {id}");
+            }
+        }
+        for (peer_id, peer) in &mut self.buffers {
+            peer.settings = self.peer_settings.get(peer_id).cloned().unwrap_or_default();
+        }
+    }
+
     /// Pull exactly `n` mixed samples, filling with silence if needed.
     ///
     /// Peers that are priming (new, or recovering from an underrun)
@@ -595,17 +683,9 @@ impl AdaptiveJitterBuffer {
         debug_assert_eq!(out.len(), n);
         out.fill(0.0);
 
-        // Volume and mute, copied out for this pass: the lock was held
-        // across every peer's decode, and the UI's slider waited for it
-        // (review P3-21).
-        {
-            let Ok(settings) = self.peer_settings.lock() else {
-                return;
-            };
-            for (peer_id, peer) in &mut self.buffers {
-                peer.settings = settings.get(peer_id).cloned().unwrap_or_default();
-            }
-        }
+        // Volume and mute from the copy, refreshed when they changed:
+        // an atomic load when they did not.
+        self.refresh_peers();
         let mut contributing_peers = 0u32;
         let mut fec = 0u64;
         let mut plc = 0u64;
@@ -878,14 +958,8 @@ impl AdaptiveJitterBuffer {
     /// **down slowly** during stable periods (over 200 ticks / 2s).
     pub fn adapt(&mut self) {
         // Drop decoder state for peers removed via the API, even if no
-        // further packet from them ever arrives.
-        if let Ok(mut removed) = self.removed_peers.lock() {
-            for id in removed.drain() {
-                if self.buffers.remove(&id).is_some() {
-                    log::info!("Dropped decoder for removed peer {id}");
-                }
-            }
-        }
+        // further packet from them ever arrives (`refresh_peers`).
+        self.refresh_peers();
 
         // Prune peers that have been silent long enough that keeping their
         // state (and letting it skew the jitter percentile) serves nothing.
@@ -1199,12 +1273,7 @@ mod tests {
         use super::super::*;
 
         fn buffer() -> AdaptiveJitterBuffer {
-            AdaptiveJitterBuffer::new(
-                48_000,
-                10,
-                Arc::new(Mutex::new(HashMap::new())),
-                Arc::new(Mutex::new(HashSet::new())),
-            )
+            AdaptiveJitterBuffer::new(48_000, 10, Arc::new(PeerTable::default()))
         }
 
         fn encoder() -> opus::Encoder {
@@ -1246,6 +1315,40 @@ mod tests {
                 (stats.fec, stats.plc, stats.lost, stats.late, stats.red),
                 (0, 0, 0, 0, 0)
             );
+        }
+
+        /// A mute and a removal set on the table reach the worker at its
+        /// next pass, with no lock taken while nothing changes.
+        #[test]
+        fn the_table_mutes_and_removes_at_the_next_pass() {
+            let table = Arc::new(PeerTable::default());
+            let mut jb = AdaptiveJitterBuffer::new(48_000, 10, table.clone());
+            let mut enc = encoder();
+            let t0 = Instant::now();
+            let mut out = vec![0.0f32; 480];
+            jb.pull_mixed(480, &mut out);
+            table.set(
+                7,
+                PeerAudioSettings {
+                    is_muted: true,
+                    ..PeerAudioSettings::default()
+                },
+            );
+            jb.pull_mixed(480, &mut out);
+            for seq in 0..5 {
+                jb.push_packet(packet(&mut enc, seq, 7), t0);
+            }
+            assert!(
+                jb.buffers.get(&7).is_none_or(|p| p.packets.is_empty()),
+                "a muted peer's packets are not kept"
+            );
+            table.set(7, PeerAudioSettings::default());
+            jb.pull_mixed(480, &mut out);
+            jb.push_packet(packet(&mut enc, 5, 7), t0);
+            assert!(jb.buffers.contains_key(&7));
+            table.remove(7);
+            jb.adapt();
+            assert!(!jb.buffers.contains_key(&7), "its state went");
         }
 
         /// Packet 2 is never delivered; packet 3 carries a RED copy of it.

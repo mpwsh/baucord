@@ -8,7 +8,7 @@
 pub const VERSION_URL: &str = "https://baucord.com/version";
 
 /// Base URL for downloads — append the platform-specific filename.
-pub const DOWNLOAD_BASE: &str = "https://baucord.com";
+pub(crate) const DOWNLOAD_BASE: &str = "https://baucord.com";
 
 /// Platform-specific zip filename suffix.
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]

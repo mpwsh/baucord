@@ -112,12 +112,6 @@ impl HeldPictures {
         Some(last + spacing.mul_f32(IDLE_SPACINGS).clamp(IDLE_MIN, IDLE_MAX))
     }
 
-    /// When the last frame was fed.
-    #[must_use]
-    pub fn last_frame(&self) -> Option<Instant> {
-        self.last_call
-    }
-
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
@@ -141,14 +135,18 @@ mod tests {
     use super::*;
     use crate::PictureFormat;
 
+    /// Picture `n`: the number is its pixels.
     fn picture(n: u64) -> DecodedFrame {
         DecodedFrame {
-            data: vec![0; 4],
+            data: n.to_le_bytes().to_vec(),
             width: 1,
-            height: 1,
-            timestamp_ms: n,
+            height: 2,
             format: PictureFormat::Rgba,
         }
+    }
+
+    fn number(p: &DecodedFrame) -> u64 {
+        u64::from_le_bytes(p.data[..8].try_into().unwrap())
     }
 
     fn ms(n: u64) -> Duration {
@@ -172,7 +170,7 @@ mod tests {
                 finished += 2;
             }
             if let Some(p) = held.hand_out() {
-                out.push(p.timestamp_ms);
+                out.push(number(&p));
             }
         }
         assert_eq!(held.passed_over(), 0);
@@ -188,8 +186,8 @@ mod tests {
             held.push(picture(n));
         }
         assert_eq!(held.passed_over(), 2);
-        assert_eq!(held.hand_out().map(|p| p.timestamp_ms), Some(2));
-        assert_eq!(held.hand_out().map(|p| p.timestamp_ms), Some(3));
+        assert_eq!(held.hand_out().as_ref().map(number), Some(2));
+        assert_eq!(held.hand_out().as_ref().map(number), Some(3));
         assert!(held.hand_out().is_none());
     }
 
@@ -220,7 +218,6 @@ mod tests {
         let at = held.idle_at().expect("frames were fed");
         assert!(!held.idle(at.checked_sub(Duration::from_micros(1)).unwrap()));
         assert!(held.idle(at));
-        assert_eq!(held.last_frame(), Some(t0 + ms(19 * 33)));
     }
 
     #[test]

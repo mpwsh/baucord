@@ -41,6 +41,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0004_safety.sql"),
     include_str!("migrations/0005_message_counter.sql"),
     include_str!("migrations/0006_file_references.sql"),
+    include_str!("migrations/0007_drop_unused.sql"),
 ];
 
 /// The schema version this build produces.
@@ -338,13 +339,12 @@ impl Sqlite {
         }
         self.conn.execute(
             "INSERT INTO blobs
-                 (blob_id, mime, declared_mime, size, name, created_by, created_at, refs)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)
+                 (blob_id, mime, size, name, created_by, created_at, refs)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)
              ON CONFLICT(blob_id) DO NOTHING",
             params![
                 blob.blob_id,
                 blob.mime,
-                blob.declared_mime,
                 i64::from(blob.size),
                 blob.name,
                 blob.created_by,
@@ -418,6 +418,21 @@ impl Sqlite {
             )?;
         }
         Ok(off.len())
+    }
+
+    /// The live rows pointing at one blob, as [`Self::recount_blob_refs`]
+    /// counts them.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn count_blob_refs(&self, blob_id: &[u8; 32]) -> Result<u32, rusqlite::Error> {
+        self.conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM messages
+                     WHERE blob_id = ?1 AND deleted_at IS NULL)
+                  + (SELECT COUNT(*) FROM users WHERE avatar_blob = ?1)",
+            params![blob_id],
+            |r| r.get(0),
+        )
     }
 
     /// A blob's bytes from disk, verified against its hash; `None`
@@ -495,8 +510,8 @@ impl Sqlite {
             let mut stmt = tx.prepare_cached(
                 "INSERT INTO telemetry_samples
                  (ts, user_id, key_hash, rtt_ms, path_loss, voice_loss, groups_behind,
-                  rung, input_device, output_device, sample)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                  rung, input_device, output_device)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?;
             for r in rows {
                 stmt.execute(params![
@@ -510,7 +525,6 @@ impl Sqlite {
                     r.rung,
                     r.input_device,
                     r.output_device,
-                    r.sample,
                 ])?;
             }
         }
@@ -524,16 +538,10 @@ impl Sqlite {
     pub fn insert_telemetry_event(&self, e: &TelemetryEventRow) -> Result<(), rusqlite::Error> {
         self.conn
             .prepare_cached(
-                "INSERT INTO telemetry_events (ts, user_id, key_hash, kind, event)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO telemetry_events (ts, user_id, key_hash, kind)
+             VALUES (?1, ?2, ?3, ?4)",
             )?
-            .execute(params![
-                ordered(e.ts),
-                e.user_id,
-                e.key_hash,
-                e.kind,
-                e.event
-            ])?;
+            .execute(params![ordered(e.ts), e.user_id, e.key_hash, e.kind])?;
         Ok(())
     }
 
@@ -1551,9 +1559,8 @@ impl Sqlite {
     pub fn upsert_channel(&self, c: &UserChannelRecord) -> Result<(), rusqlite::Error> {
         self.conn.execute(
             "INSERT INTO channels (channel_id, name, password, user_limit, min_role, permanent,
-                                   afk_after_min, is_afk, source, created_by, created_at,
-                                   position, empty_since)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 1, ?8, ?9, 0, ?10)
+                                   afk_after_min, source, created_by, created_at, empty_since)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10)
              ON CONFLICT(channel_id) DO UPDATE SET
                  name = excluded.name, password = excluded.password,
                  user_limit = excluded.user_limit, min_role = excluded.min_role,
@@ -2334,6 +2341,11 @@ pub fn cli_role_create(
         db.close();
         return Err(PersistError::RoleNameTaken(name.to_string()));
     }
+    // The panel's cap, kept here too (review 2026-10, P3-65).
+    if policy.roles.len() >= crate::policy::MAX_ROLES {
+        db.close();
+        return Err(PersistError::TooManyRoles(crate::policy::MAX_ROLES));
+    }
     let id = db.create_role(name, permissions, rank, icon, color)?;
     db.insert_audit(&AuditRow {
         ts: super::wall_now(),
@@ -2547,6 +2559,14 @@ pub fn cli_telemetry(
 pub fn cli_restrict(db_path: &Path, mut restriction: Restriction) -> Result<u64, PersistError> {
     if !db_path.is_file() {
         return Err(PersistError::Missing(db_path.to_path_buf()));
+    }
+    // The panel's cap on the reason, kept here too (review 2026-10,
+    // P3-65): it rides in every restriction list.
+    if restriction.reason.len() > protocol::MAX_ADMIN_REASON_BYTES {
+        restriction.reason = protocol::truncate_on_char_boundary(
+            &restriction.reason,
+            protocol::MAX_ADMIN_REASON_BYTES,
+        );
     }
     let (db, _) = Sqlite::open(db_path)?;
     let policy = db.load_policy()?;
@@ -2934,7 +2954,6 @@ mod tests {
         db.store_blob(&BlobRecord {
             blob_id,
             mime: "image/png".into(),
-            declared_mime: None,
             size: 64,
             name: format!("{fill}.png"),
             created_by: Some([7u8; 32]),
@@ -3369,7 +3388,6 @@ mod tests {
                 rung: None,
                 input_device: Some("mic".to_string()),
                 output_device: None,
-                sample: vec![1, 2, 3],
             })
             .collect();
         db.insert_telemetry(&rows).expect("insert");

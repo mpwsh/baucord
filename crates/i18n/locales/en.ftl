@@ -4,6 +4,10 @@ nickname = Nickname
 connect = Connect
 settings = Settings
 quit = Quit
+quit-unsaved-title = Save your changes to Settings?
+quit-unsaved-body = You changed settings and have not saved them.
+quit-unsaved-save = Save and quit
+quit-unsaved-discard = Quit without saving
 error-nickname-empty = Nickname cannot be empty
 
 # ── Missing-device warning ──────────────────────────────────────────────
@@ -143,12 +147,12 @@ stream-stats-quality = { $quality } · { $viewers } watching
 stream-stats-frame = { $kb }KB · { $ms }ms enc
 stream-stats-degraded = { $fps }% fps · loss { $loss }%
 latency-line = Audio: { $audio } | Net: { $network }
+latency-net-loss = { $rtt }ms · { $loss }% loss
 # The transfer rates' unit, after the download rate (the arrows are drawn).
 latency-unit = Mb
 
 # ── Chat ────────────────────────────────────────────────────────────────
 send = Send
-chat-disconnected = Disconnected: { $reason }
 disconnect-reason-user = User disconnected
 chat-user-joined = { $name } joined
 chat-user-joined-channel = { $name } joined { $channel }
@@ -332,6 +336,7 @@ error-refused-rate-limited = Too many failed attempts — wait a minute and try 
 error-outdated = This version of baucord doesn't match the server. Update baucord and try again.
 error-local = Couldn't start the connection: { $detail }
 error-lost-restart = The server is restarting.
+error-lost-full = The server is full right now.
 
 # ── History, progress, channels (spec §5, §6, §9) ───────────────────────
 chat-history-loaded = { $count } earlier message(s) shown{ $more ->
@@ -412,12 +417,16 @@ chat-new-messages = { $count ->
 chat-load-earlier = Load earlier messages
 chat-loading = Loading…
 chat-no-earlier = No earlier messages.
+chat-earlier-limit = This is as far back as the chat goes on screen.
 chat-edit-not-applied = The server didn't apply the edit — the message may be too old to change.
 chat-delete-not-applied = The server didn't delete the message — it may be too old to change.
 confirm-delete-message-title = Delete this message?
 confirm-delete-message-body = It is removed for everyone.
 confirm-delete-message-body-admin = It is removed for everyone; the audit log keeps a line.
 confirm-delete-message = Delete message
+confirm-clear-chat-title = Clear this chat?
+confirm-clear-chat-body = Its messages go from this device only; others keep theirs.
+confirm-clear-chat = Clear chat
 
 # ── 1.1 channels from the UI ─────────────────────────────────────────
 channel-new = New channel
@@ -542,7 +551,7 @@ chat-image-size = Images you send
 chat-image-size-hint = Larger pictures are shrunk to fit. Servers cap uploads at 10 MB.
 image-size-max = Largest (10 MB)
 privacy-header = Privacy
-privacy-note = While connected, a server sees your nickname, your key's id, your roles and level, which channel you are in, and every 10 seconds a telemetry line: round-trip time, packet loss, the names of your audio and video devices, your app version and operating system. Admins on that server can read the last line in the roster.
+privacy-note = While connected, a server sees your nickname, your key's id, your roles and level, which channel you are in, and every 10 seconds (once a minute while the connection is quiet) a telemetry line: round-trip time, packet loss, the names of your audio devices and of the video encoder you share with, your app version and operating system. Admins on that server can read the last line in the roster.
 audio-transmission = Transmission
 audio-vad = Voice activity
 audio-ptt = Push to talk
@@ -551,7 +560,7 @@ audio-ptt-hint = Hold to talk:
 audio-ptt-unbound = No key bound yet — set one on the Keyboard tab.
 audio-aec = Echo cancellation
 audio-aec-hint = Keeps others from hearing themselves through your speakers. Automatic leaves headphones alone.
-audio-aec-hint-windows = Keeps others from hearing themselves through your speakers. Automatic leaves headphones alone. On speakers, Windows may lower other apps while you talk (Sound settings → Communications).
+audio-aec-hint-windows = Keeps others from hearing themselves through your speakers. Automatic leaves headphones alone. On speakers, Windows may lower other apps while you're in a voice channel (Sound settings → Communications).
 audio-aec-hint-android = Keeps others from hearing themselves through your speaker. Automatic leaves headphones alone. On the speaker your phone treats voice as a call: the volume buttons set call volume.
 audio-aec-hint-ios = Keeps others from hearing themselves through your speaker. Automatic leaves headphones alone. On the speaker your iPhone treats voice as a call: the volume buttons set call volume, and other apps play a little quieter.
 audio-aec-auto = Automatic (speakers only)
@@ -565,9 +574,9 @@ aec-status-canceller-off = Unavailable — the echo canceller wouldn't switch on
 aec-status-refused = Unavailable — the system wouldn't open call audio. Details are in baucord.log.
 aec-status-unsupported = Not available on this system yet.
 aec-status-idle = Takes effect when you join voice.
-aec-lowering = Windows is lowering your other apps while baucord is connected, and it wouldn't let baucord turn that off. In Windows' sound settings, on the Communications tab, choose "Do nothing".
+aec-lowering = Windows is lowering your other apps while you're in a voice channel, and it wouldn't let baucord turn that off. In Windows' sound settings, on the Communications tab, choose "Do nothing".
 aec-lowering-fix = Open Windows sound settings
-aec-lowering-told = Windows is lowering your other apps while baucord is connected. Settings → Audio shows how to stop it.
+aec-lowering-told = Windows is lowering your other apps while you're in a voice channel. Settings → Audio shows how to stop it.
 ptt-tooltip = Push to talk — hold
 
 # ── Profiles on the wire (spec §7.1) ──────────────────────────────────
@@ -810,6 +819,7 @@ file-download-broken = The download of { $name } failed; try again
 file-open = Open
 file-save-again = Download again
 file-gone = That file is no longer in your Downloads folder
+file-shown-in-folder = { $name } can run programs, so its folder opens instead: start it from there if you trust it.
 file-open-error = Unable to open the file: { $error }
 file-cancel = Cancel
 admin-channel = Admin logs

@@ -1,27 +1,5 @@
 //! Stats view-model helpers shared by every shell.
 
-/// Live stream statistics for the sharer-side stats block.
-#[derive(Debug, Clone, PartialEq)]
-pub struct StreamStats {
-    pub quality: String,
-    pub avg_frame_kb: f32,
-    pub encode_ms: f32,
-    pub viewers: u32,
-    /// 100 = full rate; below 100 the sender is shedding fps for lossy viewers.
-    pub fps_scale_pct: u32,
-    /// Worst viewer loss in percent (from `StreamHealth`).
-    pub loss_pct: f32,
-}
-
-impl StreamStats {
-    /// The block turns warning-colored when adaptation kicked in — the
-    /// sharer should notice without reading numbers.
-    #[must_use]
-    pub fn degraded(&self) -> bool {
-        self.fps_scale_pct < 100
-    }
-}
-
 /// RTT → status color bucket (green / amber / red), same thresholds as
 /// the FLTK sidebar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,15 +20,21 @@ pub fn latency_grade(rtt_ms: f64) -> LatencyGrade {
     }
 }
 
-/// The network half of the latency line: `<1ms`, `23ms`, or
-/// `23ms · 1.2% loss` — loss shown the moment it's nonzero (≥0.05%),
-/// because a lossy link is the #1 cause of bad streams.
+/// The network half of the latency line: `<1ms`, `23ms`, or what
+/// `with_loss` makes of the round trip and the loss, both formatted
+/// (`23ms · 1.2% loss`, in the user's language: review 2026-10,
+/// P3-54) — loss shown the moment it's nonzero (≥0.05%), because a
+/// lossy link is the #1 cause of bad streams.
 #[must_use]
-pub fn net_str(rtt_ms: f64, loss_pct: f64) -> String {
+pub fn net_str(
+    rtt_ms: f64,
+    loss_pct: f64,
+    with_loss: impl FnOnce(String, String) -> String,
+) -> String {
     if rtt_ms < 1.0 {
         "<1ms".to_string()
     } else if loss_pct >= 0.05 {
-        format!("{rtt_ms:.0}ms · {loss_pct:.1}% loss")
+        with_loss(format!("{rtt_ms:.0}"), format!("{loss_pct:.1}"))
     } else {
         format!("{rtt_ms:.0}ms")
     }
@@ -89,8 +73,9 @@ mod tests {
 
     #[test]
     fn net_str_shows_loss_from_five_hundredths() {
-        assert_eq!(net_str(23.0, 0.0), "23ms");
-        assert_eq!(net_str(23.0, 1.2), "23ms · 1.2% loss");
-        assert_eq!(net_str(0.4, 0.0), "<1ms");
+        let loss = |rtt: String, loss: String| format!("{rtt}ms · {loss}% perda");
+        assert_eq!(net_str(23.0, 0.0, loss), "23ms");
+        assert_eq!(net_str(23.0, 1.2, loss), "23ms · 1.2% perda");
+        assert_eq!(net_str(0.4, 0.0, loss), "<1ms");
     }
 }

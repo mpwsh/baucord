@@ -86,6 +86,7 @@ impl ClampStage {
     }
 
     /// Current gain being applied (for diagnostics). 1.0 = no reduction.
+    #[cfg(test)]
     #[must_use]
     pub fn current_gain(&self) -> f32 {
         self.gain

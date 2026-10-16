@@ -61,6 +61,12 @@ use crate::{
 /// with LBRR, plus two RED copies of the same. Generous.
 const SCRATCH_BYTES: usize = 1500;
 
+/// The most a voice payload may be on the wire — the protocol's
+/// `VOICE_MAX_FRAME_SIZE`, which the client checks this against at
+/// compile time. A larger one is dropped by the relay and counted as
+/// loss.
+pub const MAX_VOICE_PAYLOAD: usize = 512;
+
 /// Redundant copies per packet when RED is on, decided by the ladder
 /// (`Decision::red_blocks`): 1 repairs any single loss; 2 also repairs
 /// back-to-back pairs, which a link dropping a third of everything
@@ -106,6 +112,8 @@ struct EncoderWorker {
     /// twelve minutes muted through a 60 % loss storm at 48 kbps, then
     /// three ticks after unmuting, 12 kbps mid-sentence.
     last_adapt: Instant,
+    /// When the last frame came (`PAUSE`).
+    last_frame: Instant,
     /// Loss-counter snapshots from the previous update, so the hint
     /// tracks the *recent* loss rate instead of the lifetime average.
     prev_received: u64,
@@ -189,6 +197,7 @@ impl EncoderWorker {
             red_distance: 1,
             controller: RateController::new(),
             last_adapt: Instant::now(),
+            last_frame: Instant::now(),
             prev_received: 0,
             prev_lost: 0,
             current_fec_hint: FEC_LOSS_FLOOR_PCT,
@@ -224,13 +233,30 @@ impl EncoderWorker {
             // (a frame still wakes it at once), where it was four
             // wakeups a second in a phone's lobby for as long as the
             // app ran (review P3-23).
+            // In a room with no frames coming (muted, alone), until the
+            // next adaptation: it was a 250 ms tick, four wakes a second
+            // that found nothing to do (review 2026-10, P3-24).
             let tick = if self.stats.in_room.load(Ordering::Relaxed) {
-                RECV_TICK
+                ADAPT_INTERVAL
+                    .saturating_sub(self.last_adapt.elapsed())
+                    .max(MIN_TICK)
             } else {
                 LOBBY_TICK
             };
             match self.rx.recv_timeout(tick) {
-                Ok(samples) => self.push_frame(&samples),
+                Ok(samples) => {
+                    // Frames stopped and started again (muted, nobody to
+                    // hear, a stalled device): the media clock did not
+                    // move meanwhile, so what the history holds would
+                    // read as the packets just before — stale audio for
+                    // a receiver to conceal a loss with. A fresh run.
+                    if self.last_frame.elapsed() > PAUSE {
+                        self.history.clear();
+                        self.accum.clear();
+                    }
+                    self.last_frame = Instant::now();
+                    self.push_frame(&samples);
+                }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
@@ -269,7 +295,12 @@ impl EncoderWorker {
         let t0 = Instant::now();
         let packet_ts = self.accum_ts;
 
-        let size = match self.encoder.encode_float(&self.accum, &mut self.scratch) {
+        // Opus keeps a packet within the room it is given: a primary
+        // never outgrows the wire on its own.
+        let size = match self
+            .encoder
+            .encode_float(&self.accum, &mut self.scratch[..MAX_VOICE_PAYLOAD])
+        {
             Ok(size) => size,
             Err(e) => {
                 error!("Encode error: {e}");
@@ -308,7 +339,17 @@ impl EncoderWorker {
                     *block = (packet_ts.wrapping_sub(*ts), data.as_slice());
                     count += 1;
                 }
-                red::encode(primary, &blocks[..count], &mut self.bundle);
+                // Nothing capped the bundle: at the 40 ms rung with two
+                // copies a VBR peak went over the wire's 512 bytes, and
+                // the relay dropped the whole packet, primary and all
+                // (review 2026-10, P2-7). The oldest copies go first.
+                let mut first = 0;
+                while first < count
+                    && red::encoded_len(primary, &blocks[first..count]) > MAX_VOICE_PAYLOAD
+                {
+                    first += 1;
+                }
+                red::encode(primary, &blocks[first..count], &mut self.bundle);
                 (PayloadType::Red, self.bundle.len())
             } else {
                 (PayloadType::Opus, size)
@@ -509,10 +550,13 @@ impl EncoderWorker {
 /// receiver-report window — change one, revisit the others.
 const ADAPT_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Bounded wait on the frame channel, so the adaptation tick runs even
-/// when the input pipeline is silent (muted). Frames normally arrive
-/// every 20 ms; this only bounds the idle case.
-const RECV_TICK: Duration = Duration::from_millis(250);
+/// The shortest wait on the frame channel when no frame is coming: an
+/// adaptation just due runs within it.
+const MIN_TICK: Duration = Duration::from_millis(50);
+
+/// A gap between frames longer than this is a pause, not jitter: frames
+/// come every 20 ms.
+const PAUSE: Duration = Duration::from_millis(100);
 
 /// The same wait out of every voice room: only how soon the thread
 /// notices it is in one again without a frame to tell it (joined

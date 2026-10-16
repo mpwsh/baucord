@@ -23,7 +23,7 @@ use std::{
 
 use log::warn;
 
-use crate::{Interest, Kick, Modifier, Source, POLL};
+use crate::{Interest, Kick, Modifier, Source, Woke, POLL};
 
 /// `kCGEventSourceStateCombinedSessionState`: every source in the
 /// login session, keyboards included.
@@ -410,10 +410,10 @@ impl Source for Keys {
         self.tap.is_some()
     }
 
-    fn wait(&mut self, timeout: Option<Duration>) -> bool {
+    fn wait(&mut self, timeout: Option<Duration>) -> Woke {
         let Some(tap) = &self.tap else {
             crate::wait_on_the_clock(timeout);
-            return false;
+            return Woke::TimedOut;
         };
         // SAFETY: the state lives as long as the tap, which `self`
         // owns.
@@ -421,14 +421,14 @@ impl Source for Keys {
         let deadline = timeout.map(|t| Instant::now() + t);
         loop {
             if state.hit.swap(false, Ordering::AcqRel) {
-                return true;
+                return Woke::Key;
             }
             let seconds = match deadline {
                 None => FOR_EVER_SECS,
                 Some(deadline) => {
                     let left = deadline.saturating_duration_since(Instant::now());
                     if left.is_zero() {
-                        return false;
+                        return Woke::TimedOut;
                     }
                     left.as_secs_f64()
                 }
@@ -440,12 +440,16 @@ impl Source for Keys {
                 // An event was served: of interest or not, look.
                 RUN_HANDLED_SOURCE => {}
                 // Time, or a kick.
-                RUN_TIMED_OUT | RUN_STOPPED => return state.hit.swap(false, Ordering::AcqRel),
+                RUN_TIMED_OUT | RUN_STOPPED if state.hit.swap(false, Ordering::AcqRel) => {
+                    return Woke::Key;
+                }
+                RUN_TIMED_OUT => return Woke::TimedOut,
+                RUN_STOPPED => return Woke::Other,
                 // Nothing left to run (the tap's source is gone): do
                 // not spin on it.
                 _ => {
                     crate::wait_on_the_clock(Some(POLL));
-                    return false;
+                    return Woke::Other;
                 }
             }
         }

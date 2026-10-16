@@ -12,9 +12,34 @@ on:
       # ever saved one and every release rebuilt FFmpeg, x264, PipeWire
       # and the workspace on all four runners (review P2-50).
       - "main"
+    # What cannot change the desktop build warms nothing (review
+    # 2026-10, P3-59).
+    paths-ignore:
+      - "**.md"
+      - "web/**"
+      - "android/**"
+      - "ios/**"
+      - "crates/android/**"
+      - "crates/ios/**"
+      - "tools/**"
+      - "config/**"
+      - "docker-compose.yaml"
+      - "Dockerfile"
+
+# A newer push to main supersedes a cache-warming build still running;
+# a release always runs to the end.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
 env:
   # FFmpeg stays on 7.1.x: ffmpeg-next 8.1 does not build against FFmpeg 8+.
   VCPKG_COMMIT: 34823ada10080ddca99b60e85f80f55e18a44eea # ffmpeg 7.1.2
+  # The Linux and macOS builds take the same release as vcpkg, checked
+  # against this digest (the tarball from https://ffmpeg.org/releases/,
+  # 2026-10-16). Must match the FFmpeg entry in scripts/licenses.py.
+  FFMPEG_VERSION: 7.1.2
+  FFMPEG_SHA256: 089bc60fb59d6aecc5d994ff530fd0dcb3ee39aa55867849a2bbc4e555f9c304
   # Must match the x264 entry in scripts/licenses.py.
   X264_COMMIT: 31e19f92f00c7003fa115047ce50978bc98c3a0d
 
@@ -36,7 +61,7 @@ jobs:
         env:
           TAG: ${{ github.event.release.tag_name }}
         run: |
-          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          VERSION=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
           if [ "$TAG" != "v$VERSION" ]; then
             echo "::error::Release tag $TAG != workspace version v$VERSION — retag or bump the version."
             exit 1
@@ -118,10 +143,13 @@ jobs:
           key: ${{ matrix.target }}
           save-if: ${{ github.event_name != 'release' }}
 
+      # Restored everywhere, saved only from main: a release's cache is
+      # scoped to its tag, where no later run can read it, and it could
+      # evict main's (review 2026-10, P2-48).
       - name: Cache PipeWire headers (Linux)
         if: runner.os == 'Linux'
         id: pipewire-cache
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
           path: ~/pw
           key: pipewire-1.0.7-ubuntu2204-container-v1
@@ -144,15 +172,22 @@ jobs:
           meson compile -C build
           meson install -C build
 
+      - name: Save PipeWire headers (Linux)
+        if: runner.os == 'Linux' && steps.pipewire-cache.outputs.cache-hit != 'true' && github.event_name != 'release'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/pw
+          key: pipewire-1.0.7-ubuntu2204-container-v1
+
       - name: Cache static FFmpeg (Linux)
         if: runner.os == 'Linux'
         id: ffmpeg-static-linux-cache
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
           path: ~/ffmpeg-static
-          key: ffmpeg-static-7.1.1-x264-${{ env.X264_COMMIT }}-${{ runner.os }}-${{ runner.arch }}-ubuntu2204-container-v4
+          key: ffmpeg-static-${{ env.FFMPEG_VERSION }}-x264-${{ env.X264_COMMIT }}-${{ runner.os }}-${{ runner.arch }}-ubuntu2204-container-v5
 
-      - name: Build static FFmpeg 7.1.1 + x264 (Linux)
+      - name: Build static FFmpeg + x264 (Linux)
         if: runner.os == 'Linux' && steps.ffmpeg-static-linux-cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
@@ -166,17 +201,26 @@ jobs:
           make -j"$(nproc)"
           make install
           cd /tmp/ffbuild
-          curl -LO https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz
-          tar xf ffmpeg-7.1.1.tar.xz
-          cd ffmpeg-7.1.1
+          curl -LO "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz"
+          echo "$FFMPEG_SHA256  ffmpeg-$FFMPEG_VERSION.tar.xz" | sha256sum -c -
+          tar xf "ffmpeg-$FFMPEG_VERSION.tar.xz"
+          cd "ffmpeg-$FFMPEG_VERSION"
           PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" ./configure \
             --prefix="$PREFIX" \
             --disable-shared --enable-static --enable-pic \
             --disable-programs --disable-doc \
             --disable-autodetect --disable-avdevice \
+            --disable-avfilter --disable-swresample \
             --enable-gpl --enable-libx264
           make -j"$(nproc)"
           make install
+
+      - name: Save static FFmpeg (Linux)
+        if: runner.os == 'Linux' && steps.ffmpeg-static-linux-cache.outputs.cache-hit != 'true' && github.event_name != 'release'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/ffmpeg-static
+          key: ffmpeg-static-${{ env.FFMPEG_VERSION }}-x264-${{ env.X264_COMMIT }}-${{ runner.os }}-${{ runner.arch }}-ubuntu2204-container-v5
 
       - name: Use static FFmpeg + built PipeWire (Linux)
         if: runner.os == 'Linux'
@@ -192,16 +236,16 @@ jobs:
       - name: Cache static FFmpeg (macOS)
         if: runner.os == 'macOS'
         id: ffmpeg-static-cache
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
           path: ~/ffmpeg-static
-          key: ffmpeg-static-7.1.1-x264-${{ env.X264_COMMIT }}-${{ runner.os }}-${{ runner.arch }}-v3
+          key: ffmpeg-static-${{ env.FFMPEG_VERSION }}-x264-${{ env.X264_COMMIT }}-${{ runner.os }}-${{ runner.arch }}-v4
 
       - name: Set macOS deployment target (11.0)
         if: runner.os == 'macOS'
         run: echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
 
-      - name: Build static FFmpeg 7.1.1 + x264 (macOS)
+      - name: Build static FFmpeg + x264 (macOS)
         if: runner.os == 'macOS' && steps.ffmpeg-static-cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
@@ -215,17 +259,26 @@ jobs:
           make -j"$(sysctl -n hw.ncpu)"
           make install
           cd /tmp/ffbuild
-          curl -LO https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz
-          tar xf ffmpeg-7.1.1.tar.xz
-          cd ffmpeg-7.1.1
+          curl -LO "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz"
+          echo "$FFMPEG_SHA256  ffmpeg-$FFMPEG_VERSION.tar.xz" | shasum -a 256 -c -
+          tar xf "ffmpeg-$FFMPEG_VERSION.tar.xz"
+          cd "ffmpeg-$FFMPEG_VERSION"
           PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" ./configure \
             --prefix="$PREFIX" \
             --disable-shared --enable-static \
             --disable-programs --disable-doc \
             --disable-autodetect --disable-avdevice \
+            --disable-avfilter --disable-swresample \
             --enable-gpl --enable-libx264 --enable-videotoolbox
           make -j"$(sysctl -n hw.ncpu)"
           make install
+
+      - name: Save static FFmpeg (macOS)
+        if: runner.os == 'macOS' && steps.ffmpeg-static-cache.outputs.cache-hit != 'true' && github.event_name != 'release'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/ffmpeg-static
+          key: ffmpeg-static-${{ env.FFMPEG_VERSION }}-x264-${{ env.X264_COMMIT }}-${{ runner.os }}-${{ runner.arch }}-v4
 
       - name: Use static FFmpeg (macOS)
         if: runner.os == 'macOS'
@@ -257,19 +310,27 @@ jobs:
         # used to build, and the iOS crate's stub binary is also named
         # `baucord` — both landed on the same path and the zip got
         # whichever linked last (review P0-5).
-        run: cargo build --profile deploy --target ${{ matrix.target }} -p desktop -p server --features desktop/tray
+        # --locked: Cargo.lock decides, as in pr-check and the image.
+        run: cargo build --locked --profile deploy --target ${{ matrix.target }} -p desktop -p server --features desktop/tray
 
       - name: Verify FFmpeg statically linked + glibc floor (Linux)
         if: runner.os == 'Linux'
         run: |
           BIN="target/${{ matrix.target }}/deploy/baucord"
           echo "── dynamic dependencies ──"
-          ldd "$BIN"
-          if ldd "$BIN" | grep -E "libav|libsw|libpostproc|libx264"; then
+          # Read once into a variable: a grep that stops early on a pipe
+          # can fail its writer under pipefail (review 2026-10, P3-58).
+          DEPS="$(ldd "$BIN")"
+          echo "$DEPS"
+          if grep -q "not found" <<<"$DEPS"; then
+            echo "::error::baucord needs a library this system does not have"
+            exit 1
+          fi
+          if grep -E "libav|libsw|libpostproc|libx264" <<<"$DEPS"; then
             echo "::error::baucord still links FFmpeg/x264 shared objects — the static build was not picked up"
             exit 1
           fi
-          if ldd "$BIN" | grep -E "=> (/home|/opt|/usr/local)/"; then
+          if grep -E "=> (/home|/opt|/usr/local)/" <<<"$DEPS"; then
             echo "::error::baucord links a library from outside the system paths — a runner dependency leaked"
             exit 1
           fi
@@ -294,7 +355,10 @@ jobs:
             echo "::error::baucord links a Homebrew library — the static FFmpeg picked up a runner dependency"
             exit 1
           fi
-          MINOS=$(otool -l "$BIN" | awk '/LC_BUILD_VERSION/{f=1} f && /minos/{print $2; exit}')
+          # From a file: awk stops at the first match, and the otool it
+          # cut off would fail the step under pipefail (P3-58).
+          otool -l "$BIN" > "$RUNNER_TEMP/loadcmds.txt"
+          MINOS=$(awk '/LC_BUILD_VERSION/{f=1} f && /minos/{print $2; exit}' "$RUNNER_TEMP/loadcmds.txt")
           echo "minos: $MINOS"
           if [ "$(printf '%s\n' "$MINOS" 11.0 | sort -V | tail -1)" != "11.0" ]; then
             echo "::error::binary targets macOS $MINOS (> 11.0) — MACOSX_DEPLOYMENT_TARGET was not honoured"
@@ -304,7 +368,7 @@ jobs:
       - name: Read version from crates/desktop
         id: version
         shell: bash
-        run: grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/' | xargs -I{} echo "version={}" >> "$GITHUB_OUTPUT"
+        run: echo "version=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)" >> "$GITHUB_OUTPUT"
 
       - name: Package zip (Linux/macOS)
         if: runner.os != 'Windows' && github.event_name == 'release'
@@ -352,9 +416,29 @@ jobs:
         with:
           tag_name: ${{ github.event.release.tag_name }}
           files: artifacts/*.zip
+      # The version file tells every client what to update to, and the
+      # site which version to offer: only the newest stable release
+      # writes it, never a backport or a rebuilt older tag (review
+      # 2026-10, P2-27).
+      - name: Is this the newest release?
+        id: newest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          set -euo pipefail
+          NEWEST=$(gh api "repos/$GITHUB_REPOSITORY/tags" --paginate --jq '.[].name' \
+            | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V | tail -1)
+          if [ "$PRERELEASE" != "true" ] && [ "$TAG" = "$NEWEST" ]; then
+            echo "newest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "newest=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$TAG is not the newest stable release ($NEWEST): the version file stays"
+          fi
       - name: Stage zips and version file for R2
         run: |
-          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          VERSION=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
           mkdir -p r2-upload r2-version
           cp artifacts/*.zip r2-upload/
           echo "$VERSION" > r2-version/version
@@ -371,6 +455,7 @@ jobs:
       # went up in the same sync as they did, in no particular order
       # (review P2-60).
       - name: Upload version file to R2
+        if: steps.newest.outputs.newest == 'true'
         uses: jakejarvis/s3-sync-action@v0.5.1
         env:
           AWS_S3_BUCKET: baucord

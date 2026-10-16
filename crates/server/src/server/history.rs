@@ -116,7 +116,20 @@ impl ChatServer {
         // wrong order, and anything over 17 KiB was dropped unread
         // (review P0-1). The newest rows stay; the rest come back with
         // the next "Load earlier".
-        let dropped = protocol::keep_suffix_that_fits(&mut page, protocol::LIST_ITEMS_BUDGET);
+        let newest = page.last().cloned();
+        let mut dropped = protocol::keep_suffix_that_fits(&mut page, protocol::LIST_ITEMS_BUDGET);
+        // Not even the newest row fits (stored before the cap on
+        // `max_chat_bytes`): it goes cut short rather than not at all.
+        // An empty page that said "more" was asked for again and again,
+        // the cursor never moving (review 2026-10, P2-26).
+        if page.is_empty()
+            && let Some(mut m) = newest
+        {
+            m.text =
+                protocol::truncate_on_char_boundary(&m.text, crate::config::MAX_CHAT_BYTES_LIMIT);
+            page.push(m);
+            dropped = rows.len() - 1;
+        }
         let rows = &rows[dropped..];
         self.send_authors(client, rows.iter().map(|r| r.user_id));
         self.send_msg(
@@ -263,7 +276,8 @@ impl ChatServer {
                 | Answer::Conversations(_)
                 | Answer::Audit(_)
                 | Answer::ReportedMessage(_)
-                | Answer::Reports(_),
+                | Answer::Reports(_)
+                | Answer::Count(_),
             ) => {
                 log::warn!("unexpected answer on a history ask; ignored");
             }

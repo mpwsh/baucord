@@ -194,7 +194,9 @@ impl AppState {
                 .and_then(|id| self.session.users.get(&id))
                 .map_or(1.0, |u| u.audio.volume);
             self.main.global::<State>().set_menu_volume(volume);
-            self.show_menu(entries, MenuTarget::User(index), x, y);
+            if let Some(client_id) = self.user_id_at(index) {
+                self.show_menu(entries, MenuTarget::User(client_id), x, y);
+            }
         }
     }
 
@@ -202,12 +204,12 @@ impl AppState {
     /// audio engine so it is heard at once; the release also persists
     /// it and refreshes the roster (the badge). The menu stays open.
     pub(super) fn menu_volume(&mut self, volume: f32, released: bool) {
-        let Some(MenuTarget::User(index)) = self.menu_target else {
+        let Some(MenuTarget::User(client_id)) = self.menu_target else {
             return;
         };
-        let Some(client_id) = self.user_id_at(index) else {
+        if self.roster_index_of(client_id).is_none() {
             return;
-        };
+        }
         if released {
             let username = self.username_of(client_id);
             self.handle_set_user_volume(client_id, &username, volume);
@@ -333,7 +335,12 @@ impl AppState {
             return;
         };
         match (target, action) {
-            (MenuTarget::User(index), action) => self.user_menu_action(index, action),
+            (MenuTarget::User(client_id), action) => {
+                // Gone since the menu opened: nothing to act on.
+                if let Some(index) = self.roster_index_of(client_id) {
+                    self.user_menu_action(index, action);
+                }
+            }
             (MenuTarget::Channel(id), A::ChannelEdit(_)) => self.channel_edit(id),
             (MenuTarget::Channel(id), A::ChannelDelete(_)) => self.channel_delete(id),
             (MenuTarget::Message { body, .. }, A::CopyText) => {
@@ -650,7 +657,7 @@ impl AppState {
                     .unwrap_or_default(),
             ))
             .ok();
-        self.settings.save();
+        self.save_settings();
         self.update_user_list();
     }
 
@@ -671,7 +678,7 @@ impl AppState {
                     .unwrap_or_default(),
             ))
             .ok();
-        self.settings.save();
+        self.save_settings();
         self.update_user_list();
     }
 
@@ -687,7 +694,7 @@ impl AppState {
                 PeerAudioSettings::default(),
             ))
             .ok();
-        self.settings.save();
+        self.save_settings();
         self.update_user_list();
     }
 
@@ -758,9 +765,9 @@ impl AppState {
                         app.screen.tx.send(ScreenControl::Watch { client_id }).ok();
                         app.network
                             .tx
-                            .send(NetworkControl::SubscribeScreen {
+                            .send(NetworkControl::Send(ClientMessage::SubscribeScreen {
                                 target_id: client_id,
-                            })
+                            }))
                             .ok();
                         app.push_activity(&t!("chat-watching", "name" => username.as_str()));
                         info!("Viewer open + subscribed to {client_id}");

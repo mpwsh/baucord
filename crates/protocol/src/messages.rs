@@ -419,7 +419,8 @@ pub struct ViewingSample {
     pub decode_us: u64,
 }
 
-/// One periodic telemetry sample (every 10 s while connected).
+/// One periodic telemetry sample: every 10 s while connected, once a
+/// minute while nothing moves (review 2026-10, P3-40).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TelemetrySample {
     pub client: ClientInfo,
@@ -1858,37 +1859,6 @@ pub fn split_to_fit<T: Serialize>(items: Vec<T>, budget: usize) -> Vec<Vec<T>> {
     runs
 }
 
-// ── Telemetry at rest ───────────────────────────────────────────────
-//
-// The server keeps each sample and event as an opaque blob next to the
-// columns worth querying (spec §9). Same codec as the wire so the
-// `server telemetry` CLI and a future viewer decode them with this
-// crate and nothing else.
-
-/// Serialize a telemetry sample for storage.
-#[must_use]
-pub fn encode_telemetry_sample(sample: &TelemetrySample) -> Option<Vec<u8>> {
-    postcard::to_allocvec(sample).ok()
-}
-
-/// Deserialize a stored telemetry sample.
-#[must_use]
-pub fn decode_telemetry_sample(bytes: &[u8]) -> Option<TelemetrySample> {
-    postcard::from_bytes(bytes).ok()
-}
-
-/// Serialize a telemetry event for storage.
-#[must_use]
-pub fn encode_telemetry_event(event: &TelemetryEvent) -> Option<Vec<u8>> {
-    postcard::to_allocvec(event).ok()
-}
-
-/// Deserialize a stored telemetry event.
-#[must_use]
-pub fn decode_telemetry_event(bytes: &[u8]) -> Option<TelemetryEvent> {
-    postcard::from_bytes(bytes).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2361,25 +2331,6 @@ mod tests {
             why: NeedInviteReason::KeyRetired,
         };
         assert_ne!(unknown.describe(), retired.describe());
-    }
-
-    #[test]
-    fn telemetry_sample_survives_storage_codec() {
-        let sample = TelemetrySample {
-            path: PathSample {
-                rtt_ms: 42,
-                ..PathSample::default()
-            },
-            ..TelemetrySample::default()
-        };
-        let bytes = encode_telemetry_sample(&sample).unwrap();
-        assert_eq!(decode_telemetry_sample(&bytes).unwrap().path.rtt_ms, 42);
-        let event = TelemetryEvent::ShareStopped;
-        let bytes = encode_telemetry_event(&event).unwrap();
-        assert!(matches!(
-            decode_telemetry_event(&bytes).unwrap(),
-            TelemetryEvent::ShareStopped
-        ));
     }
 
     #[test]

@@ -33,7 +33,10 @@
 //!   codec at the next keyframe (P-frames until then are dropped and
 //!   the jitter buffer's keyframe request does the rest).
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 
 use log::{debug, info, warn};
 use ndk::media::{
@@ -109,6 +112,13 @@ pub struct MediaCodecDecoder {
     held: HeldPictures,
     frames_in: u64,
     frames_out: u64,
+    /// When each frame still owed a picture was fed, oldest first: the
+    /// between-frame search looks for these, and gives each up after
+    /// [`POLL_WINDOW`]. It compared the counts above, which a rebuild
+    /// that lost frames (or one frame the codec dropped) left apart for
+    /// good — every frame after was searched for its whole window, 25
+    /// polls each (review 2026-10, P3-34).
+    awaited: VecDeque<Instant>,
     /// Rebuild the codec at the next keyframe.
     needs_reset: bool,
     waiting_logged: bool,
@@ -141,6 +151,7 @@ impl MediaCodecDecoder {
             held: HeldPictures::new(),
             frames_in: 0,
             frames_out: 0,
+            awaited: VecDeque::new(),
             needs_reset: false,
             waiting_logged: false,
             output_spent: Duration::ZERO,
@@ -155,6 +166,7 @@ impl MediaCodecDecoder {
         self.codec = None;
         self.layout = None;
         self.held.clear();
+        self.awaited.clear();
         let codec = MediaCodec::from_decoder_type(MIME)
             .ok_or_else(|| CodecError::DecoderInit(format!("no {MIME} decoder on this device")))?;
         let mut format = MediaFormat::new();
@@ -253,6 +265,10 @@ impl Drop for MediaCodecDecoder {
 }
 
 impl VideoDecoder for MediaCodecDecoder {
+    fn needs_keyframe(&self) -> bool {
+        self.needs_reset
+    }
+
     fn decode(&mut self, encoded: &EncodedFrame) -> Result<Option<DecodedFrame>, CodecError> {
         let started = Instant::now();
         self.output_spent = Duration::ZERO;
@@ -283,7 +299,11 @@ impl VideoDecoder for MediaCodecDecoder {
             fed = Self::feed(&self.running().codec, encoded, self.frames_in);
         }
         match fed {
-            Ok(()) => self.frames_in += 1,
+            Ok(()) => {
+                self.frames_in += 1;
+                self.awaited.retain(|fed| started < *fed + POLL_WINDOW);
+                self.awaited.push_back(started);
+            }
             Err(FeedError::Busy) => {
                 self.needs_reset = true;
                 return Err(CodecError::Decode(format!(
@@ -339,11 +359,11 @@ impl VideoDecoder for MediaCodecDecoder {
         if !self.held.is_empty() {
             return Some(idle_at);
         }
-        // Pictures still inside the codec come out a few ms after the
-        // last frame; look for them every POLL_STEP until POLL_WINDOW
-        // after it (a frame the codec dropped never comes out).
-        let last = self.held.last_frame()?;
-        if self.frames_out >= self.frames_in || now >= last + POLL_WINDOW {
+        // Pictures still inside the codec come out a few ms after their
+        // frame; look for them every POLL_STEP until POLL_WINDOW after
+        // the newest (a frame the codec dropped never comes out).
+        let newest = *self.awaited.back()?;
+        if now >= newest + POLL_WINDOW {
             return None;
         }
         Some(idle_at.max(now + POLL_STEP))
@@ -364,6 +384,7 @@ impl MediaCodecDecoder {
             color,
             held,
             frames_out,
+            awaited,
             needs_reset,
             output_spent,
             ..
@@ -387,6 +408,7 @@ impl MediaCodecDecoder {
                         match result {
                             Ok(frame) => {
                                 *frames_out += 1;
+                                awaited.pop_front();
                                 if *frames_out == 1 {
                                     info!(
                                         "MediaCodec: first picture {}x{}",
@@ -470,7 +492,6 @@ fn take_planes(
         data: out,
         width: lay.width,
         height: lay.height,
-        timestamp_ms: u64::try_from(info.presentation_time_us() / 1000).unwrap_or(0),
         format: PictureFormat::Yuv420 {
             layout: *lay,
             color: *color,

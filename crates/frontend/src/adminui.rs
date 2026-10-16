@@ -94,7 +94,19 @@ pub(crate) fn close(app: &mut AppState) {
         return;
     }
     app.admin_pending = None;
-    app.main.global::<AdminState>().set_confirm_open(false);
+    let s = app.main.global::<AdminState>();
+    s.set_confirm_open(false);
+    s.set_busy(false);
+    // What the server listed goes with the page: it was kept for the
+    // rest of the run, past the session and the server it came from
+    // (review 2026-10, P3-8). The next open asks again.
+    s.set_users(ModelRc::default());
+    s.set_restrictions(ModelRc::default());
+    s.set_invites(ModelRc::default());
+    s.set_blobs(ModelRc::default());
+    s.set_audit(ModelRc::default());
+    s.set_reports(ModelRc::default());
+    app.admin_audit_oldest = None;
     state.set_admin_open(false);
     // The page held the keyboard (see `settingsui::SettingsSurface::hide`).
     app.main.invoke_focus_composer();
@@ -381,6 +393,10 @@ pub fn refresh(app: &mut AppState, tab: i32) {
 /// An outcome the panel asked for.
 pub fn take_outcome(app: &mut AppState, tab: i32, outcome: AdminOutcome) {
     let win = &app.main;
+    // An answer to a page that closed since is for nobody.
+    if !win.global::<State>().get_admin_open() {
+        return;
+    }
     let s = win.global::<AdminState>();
     s.set_busy(false);
     match outcome {
@@ -573,7 +589,7 @@ fn report_row(r: &client::protocol::ReportSummary) -> AdminReportRow {
             .unwrap_or_default()
             .into(),
         what: what.into(),
-        reason: crate::app::report_reason_text(r.reason).into(),
+        reason: crate::app::reason_label(r.reason).into(),
         excerpt: r.excerpt.as_str().into(),
         note: r.note.as_str().into(),
         resolved: r.resolved,

@@ -121,7 +121,13 @@ impl ChatServer {
         // keeps: per client and server-wide. Checked before the store
         // makes room, so a refusal here evicts nothing. It is not the
         // day's allowance (`Quota` says that), so it answers `Refused`.
-        if !bypass && !self.allow_image(client, usize::try_from(size).unwrap_or(usize::MAX)) {
+        if !bypass
+            && !self.allow_transfer(
+                client,
+                usize::try_from(size).unwrap_or(usize::MAX),
+                super::Transfer::File,
+            )
+        {
             return Err(UploadRejectReason::Refused);
         }
         if !self.make_room_for(u64::from(size)) {

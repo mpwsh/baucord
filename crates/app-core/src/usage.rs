@@ -1,11 +1,13 @@
 //! This process's own CPU time and memory, read from the system
-//! directly: what the phones' resource line and `/mem` show.
+//! directly: what the resource line and `/mem` show, on every
+//! platform.
 //!
-//! The desktop asks `sysinfo` (which the server needs anyway, for the
-//! whole machine); a phone build carried that library for two numbers
-//! about itself (review P3-50). Here they are one `getrusage` and one
-//! read of `/proc/self/statm` (Android, Linux) or one `task_info`
-//! (iOS, macOS).
+//! Each is one call: `getrusage` (Unix) or `GetProcessTimes`
+//! (Windows) for the CPU time; `/proc/self/statm` (Android, Linux),
+//! `task_info` (iOS, macOS) or `K32GetProcessMemoryInfo` (Windows) for
+//! the memory. The phones carried `sysinfo` for these two numbers
+//! (review P3-50), and then the desktop did too, beside a second
+//! sampler of its own (review 2026-10, P3-53).
 
 // One system call each, declared by hand where `libc` has no binding.
 #![allow(unsafe_code)]
@@ -30,8 +32,9 @@ pub fn percent_of_one_core(
 
 /// The resident pages in a `/proc/<pid>/statm` line (its second
 /// field), as bytes.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
 #[must_use]
-pub fn statm_resident(statm: &str, page_bytes: u64) -> Option<u64> {
+pub(crate) fn statm_resident(statm: &str, page_bytes: u64) -> Option<u64> {
     let pages: u64 = statm.split_ascii_whitespace().nth(1)?.parse().ok()?;
     pages.checked_mul(page_bytes)
 }
@@ -62,7 +65,7 @@ impl CpuMeter {
 /// CPU time this process has used so far, in user and kernel mode.
 #[cfg(unix)]
 #[must_use]
-pub fn cpu_time() -> Option<Duration> {
+pub(crate) fn cpu_time() -> Option<Duration> {
     // SAFETY: `getrusage` fills the struct it is handed; all-zero is a
     // valid value of it (integers and two `timeval`s).
     let usage = unsafe {
@@ -80,9 +83,51 @@ pub fn cpu_time() -> Option<Duration> {
     Some(time(usage.ru_utime)? + time(usage.ru_stime)?)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 #[must_use]
-pub fn cpu_time() -> Option<Duration> {
+pub(crate) fn cpu_time() -> Option<Duration> {
+    /// `FILETIME` (minwinbase.h): 100 ns units, in two halves.
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        fn GetProcessTimes(
+            process: *mut core::ffi::c_void,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+    }
+
+    let (mut creation, mut exit) = (FileTime::default(), FileTime::default());
+    let (mut kernel, mut user) = (FileTime::default(), FileTime::default());
+    // SAFETY: four valid out-pointers; the pseudo-handle needs no close.
+    let ok = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &raw mut creation,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let ticks = |t: &FileTime| (u64::from(t.high) << 32) | u64::from(t.low);
+    let total = ticks(&kernel).checked_add(ticks(&user))?;
+    Some(Duration::from_nanos(total.checked_mul(100)?))
+}
+
+#[cfg(not(any(unix, windows)))]
+#[must_use]
+pub(crate) fn cpu_time() -> Option<Duration> {
     None
 }
 
@@ -90,7 +135,8 @@ pub fn cpu_time() -> Option<Duration> {
 /// it: resident pages on Android and Linux (`top`'s RES), the physical
 /// footprint on iOS and macOS (Activity Monitor's "Memory" — private
 /// dirty and compressed pages; resident size counts shared framework
-/// pages too and reads 1.5–2× higher). `None` where neither is had.
+/// pages too and reads 1.5–2× higher), the private working set on
+/// Windows (Task Manager's "Memory"). `None` where none is had.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[must_use]
 pub fn memory() -> Option<u64> {
@@ -176,7 +222,78 @@ pub fn memory() -> Option<u64> {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+#[cfg(windows)]
+#[must_use]
+pub fn memory() -> Option<u64> {
+    // PROCESS_MEMORY_COUNTERS_EX2 (psapi.h). The EX2 tail
+    // (PrivateWorkingSetSize) is what Task Manager's "Memory" column
+    // shows, supported on Windows 10 21H2+ / Windows 11. On older
+    // builds the EX2-sized call fails and we retry with the EX size,
+    // taking PrivateUsage (private commit) — still far closer to Task
+    // Manager than the shared-inclusive working set.
+    #[repr(C)]
+    struct ProcessMemoryCountersEx2 {
+        cb: u32,
+        _page_fault_count: u32,
+        _peak_working_set_size: usize,
+        _working_set_size: usize,
+        _quota_peak_paged_pool_usage: usize,
+        _quota_paged_pool_usage: usize,
+        _quota_peak_non_paged_pool_usage: usize,
+        _quota_non_paged_pool_usage: usize,
+        _pagefile_usage: usize,
+        _peak_pagefile_usage: usize,
+        private_usage: usize,
+        private_working_set_size: usize,
+        _shared_commit_usage: u64,
+    }
+
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        fn K32GetProcessMemoryInfo(
+            process: *mut core::ffi::c_void,
+            counters: *mut ProcessMemoryCountersEx2,
+            cb: u32,
+        ) -> i32;
+    }
+
+    // Both sizes are a few dozen bytes.
+    #[allow(clippy::cast_possible_truncation)]
+    let full = size_of::<ProcessMemoryCountersEx2>() as u32;
+    // EX layout: the two DWORDs plus nine SIZE_Ts, ending at
+    // PrivateUsage — accepted by every Windows this app can run on.
+    #[allow(clippy::cast_possible_truncation)]
+    let ex_size = (size_of::<u32>() * 2 + size_of::<usize>() * 9) as u32;
+
+    // SAFETY: all-integer struct, so zeroed is a valid value; each call
+    // is told a size no larger than the struct; the pseudo-handle needs
+    // no close.
+    unsafe {
+        let mut counters: ProcessMemoryCountersEx2 = std::mem::zeroed();
+        let process = GetCurrentProcess();
+
+        counters.cb = full;
+        if K32GetProcessMemoryInfo(process, &raw mut counters, full) != 0
+            && counters.private_working_set_size != 0
+        {
+            return u64::try_from(counters.private_working_set_size).ok();
+        }
+
+        counters = std::mem::zeroed();
+        counters.cb = ex_size;
+        if K32GetProcessMemoryInfo(process, &raw mut counters, ex_size) != 0 {
+            return u64::try_from(counters.private_usage).ok();
+        }
+    }
+    None
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    windows
+)))]
 #[must_use]
 pub fn memory() -> Option<u64> {
     None

@@ -338,7 +338,7 @@ No admin yet. Bootstrap invite (admin, 1 use, 1 h): code K7FQ-2MX9-ABCD for …<
       <h2 id="docker">On a Linux host with Docker</h2>
       <p>
         Docker Compose on a Linux VPS, with the published image
-        <code>mpwsh/baucord:latest</code>, updated with every release. It
+        <code>mpwsh/baucord:latest</code>, moved to each new release. It
         is distroless and runs as uid <code>10000</code>. Everything you
         need is on this page: four small files and the image, which
         Docker downloads by itself.
@@ -687,7 +687,8 @@ sudo docker compose up -d</code></pre>
         </li>
         <li>
           <code>telemetry: &lt;user&gt;: …</code>: the app's own numbers
-          every 10 seconds: connection, audio quality steps, the encoder's
+          every 10 seconds (once a minute from an idle connection):
+          connection, audio quality steps, the encoder's
           step and frame rate while sharing, decoding while watching.
         </li>
       </ul>

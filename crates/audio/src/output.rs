@@ -4,10 +4,9 @@
 //! that cannot do 48 kHz get a resampler on this path.
 
 use std::{
-    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     thread,
     time::{Duration, Instant},
@@ -25,14 +24,16 @@ use rtrb::{Consumer, Producer, RingBuffer};
 use rubato::{Async, Resampler};
 
 use crate::{
-    config::PeerAudioSettings,
     latch::{Ring, Wait},
     loopback::{LoopbackDelay, LOOPBACK_DELAY},
     processor::limiter::Limiter,
     resampler::build_output_resampler,
     sounds::{SoundBank, SoundType},
     stats::AudioStats,
-    transport::{jitter_buffer::AdaptiveJitterBuffer, packet::AudioPacket},
+    transport::{
+        jitter_buffer::{AdaptiveJitterBuffer, PeerTable},
+        packet::AudioPacket,
+    },
     PcmFrame, OPUS_SAMPLE_RATE,
 };
 
@@ -48,11 +49,6 @@ const BASE_FILL_MS: usize = 20;
 /// the time it has to wake up and refill after each one.
 const REFILL_MARGIN_MS: usize = 10;
 
-/// Largest single playback callback we serve from the scratch buffer.
-/// Anything bigger is served in pieces (never happens with a 10–20 ms
-/// device period, but cpal does not promise one).
-const CALLBACK_SCRATCH: usize = 8192;
-
 /// The jitter buffer's bookkeeping cadence: `adapt()` is tuned for one
 /// call per 10 ms of wall time.
 const ADAPT_TICK: Duration = Duration::from_millis(10);
@@ -61,17 +57,17 @@ const ADAPT_TICK: Duration = Duration::from_millis(10);
 const MAX_CATCH_UP_TICKS: u32 = 20;
 
 pub struct AudioOutput {
-    /// cpal's device and the config it opens at. Resolved in `new()`,
-    /// but on Windows, where the native backend finds its device by
-    /// itself and cpal — only its fallback — is asked in `start_cpal`.
-    /// Asked first, a cpal failure kept the native path from ever being
+    /// cpal's device and the config it opens at: asked in `start_cpal`,
+    /// only when the cpal path runs — a native backend (Windows, a
+    /// phone's call path) finds its device by itself, and resolving it
+    /// was a device enumeration per open on the phones (review 2026-10,
+    /// P2-49). Asked first, a cpal failure kept the native path from ever being
     /// tried: after a device change, cpal's default-device activation
     /// failed on every retry ("Cannot change thread mode after it is
     /// set") until the app restarted (PRODUCTION-PLAN.md CLI-12).
     cpal: Option<(Device, SupportedStreamConfig)>,
     /// The user's device selection (`None` = follow the OS default), for
     /// the native backend's own device lookup (and cpal's, late).
-    #[cfg(windows)]
     device_name: Option<String>,
     /// Windows: no device picked means the Default Communications
     /// Device (`communications_default` in lib.rs), else the console
@@ -96,9 +92,16 @@ pub struct AudioOutput {
         allow(dead_code)
     )]
     voice: bool,
+    /// An output that only keeps the app alive and plays chimes (the
+    /// iPhone's lobby): opened with long buffers (`set_quiet`).
+    quiet: bool,
     packet_rx: Option<Receiver<(AudioPacket, Instant)>>,
     loopback_rx: Option<Receiver<PcmFrame>>,
     sound_rx: Option<Receiver<SoundType>>,
+    /// The chimes, decoded once per engine (`VoiceChat`): every open
+    /// built the 630 KB bank again, a phone at each join and leave (review
+    /// 2026-10, P3-25).
+    sounds: Arc<SoundBank>,
 
     ring_producer: Option<Producer<f32>>,
     ring_consumer: Option<Consumer<f32>>,
@@ -120,8 +123,8 @@ pub struct AudioOutput {
     should_stop: Arc<AtomicBool>,
 
     // Settings
-    peer_settings: Arc<Mutex<HashMap<u64, PeerAudioSettings>>>,
-    removed_peers: Arc<Mutex<HashSet<u64>>>,
+    /// Each peer's volume and mute, and who left (`PeerTable`).
+    peers: Arc<PeerTable>,
     /// Master output gain (f32 bits). Applied after mixing.
     output_gain: Arc<AtomicU32>,
     /// When true, the worker pushes silence instead of decoding/mixing.
@@ -133,26 +136,23 @@ pub struct AudioOutput {
 
 impl AudioOutput {
     #[allow(clippy::too_many_arguments)]
-    // Windows opens nothing here (see the `cpal` field).
-    #[cfg_attr(windows, allow(clippy::unnecessary_wraps))]
+    // Opens nothing (see the `cpal` field): the `Result` is the callers'.
+    #[allow(clippy::unnecessary_wraps)]
     pub fn new(
         device_name: Option<&str>,
         packet_rx: Receiver<(AudioPacket, Instant)>,
         loopback_rx: Receiver<PcmFrame>,
         sound_rx: Receiver<SoundType>,
-        peer_settings: Arc<Mutex<HashMap<u64, PeerAudioSettings>>>,
-        removed_peers: Arc<Mutex<HashSet<u64>>>,
+        sounds: Arc<SoundBank>,
+        peers: Arc<PeerTable>,
         stats: Arc<AudioStats>,
         output_gain: f32,
         voice: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        #[cfg(windows)]
+        // Asked by `start_cpal` only (see the field). The native backends
+        // run at 48 kHz (the engine converts); `start_cpal` grows the
+        // ring if cpal's rate needs more.
         let cpal: Option<(Device, SupportedStreamConfig)> = None;
-        #[cfg(not(windows))]
-        let cpal = Some(open_cpal(device_name)?);
-        // The native backend runs at 48 kHz (the engine converts); cpal
-        // at the rate it chose — `start_cpal` grows the ring on Windows
-        // if that one needs more.
         let ring_size = ring_size_for(
             cpal.as_ref()
                 .map_or(OPUS_SAMPLE_RATE, |(_, config)| config.sample_rate()),
@@ -164,7 +164,6 @@ impl AudioOutput {
 
         Ok(Self {
             cpal,
-            #[cfg(windows)]
             device_name: device_name.map(String::from),
             #[cfg(windows)]
             communications_default: false,
@@ -174,6 +173,7 @@ impl AudioOutput {
             #[cfg(any(target_os = "android", target_os = "ios"))]
             native_voice: None,
             voice,
+            quiet: false,
             ring_producer: Some(ring_producer),
             ring_consumer: Some(ring_consumer),
             ring_capacity: ring_size,
@@ -183,14 +183,14 @@ impl AudioOutput {
             callback_frames: Arc::new(AtomicUsize::new(0)),
             worker_thread: None,
             should_stop: Arc::new(AtomicBool::new(false)),
-            peer_settings,
-            removed_peers,
+            peers,
             output_gain: Arc::new(AtomicU32::new(output_gain.to_bits())),
             deafened: Arc::new(AtomicBool::new(false)),
             stats,
             packet_rx: Some(packet_rx),
             loopback_rx: Some(loopback_rx),
             sound_rx: Some(sound_rx),
+            sounds,
         })
     }
 
@@ -213,6 +213,12 @@ impl AudioOutput {
     #[cfg(windows)]
     pub fn set_communications_default(&mut self, on: bool) {
         self.communications_default = on;
+    }
+
+    /// Long buffers for an output nothing listens to closely: the
+    /// lobby's on a phone that keeps one open (D51). Before `start`.
+    pub fn set_quiet(&mut self, quiet: bool) {
+        self.quiet = quiet;
     }
 
     /// Windows: this stream is a call to the system, and Windows would
@@ -248,7 +254,15 @@ impl AudioOutput {
         #[cfg(windows)]
         {
             match self.start_native() {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    RENDER_FALLBACK_SAID.store(false, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(());
+                }
+                // Once a streak: a device that is not there is tried
+                // again and again (review 2026-10, P2-38).
+                Err(e) if RENDER_FALLBACK_SAID.swap(true, std::sync::atomic::Ordering::Relaxed) => {
+                    log::debug!("Native WASAPI render unavailable ({e}); using cpal");
+                }
                 Err(e) => log::warn!("Native WASAPI render unavailable ({e}); using cpal"),
             }
         }
@@ -331,12 +345,28 @@ impl AudioOutput {
     }
 
     fn start_cpal(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        // Windows asks cpal only now, the native backend having failed
-        // (see the `cpal` field) — and its rate can want a bigger ring
-        // than the 48 kHz one `new()` made. Nothing holds the ring yet.
-        #[cfg(windows)]
+        // cpal is asked only now (see the `cpal` field) — and its rate
+        // can want a bigger ring than the 48 kHz one `new()` made.
+        // Nothing holds the ring yet.
         if self.cpal.is_none() {
-            let (device, config) = open_cpal(self.device_name.as_deref())?;
+            // cpal's default is the console one; with "Default" meaning
+            // the communications device (`communications_default`) this
+            // fallback opened another device than voice follows, and the
+            // echo report described streams that were not there (review
+            // 2026-10, P3-31). That device, by name — cpal brings COM up
+            // on this thread before it is asked.
+            #[cfg(windows)]
+            let name = self.device_name.clone().or_else(|| {
+                self.communications_default
+                    .then(|| {
+                        let _ = cpal::default_host().default_output_device();
+                        crate::native::wasapi::communications_default_name(false)
+                    })
+                    .flatten()
+            });
+            #[cfg(not(windows))]
+            let name = self.device_name.clone();
+            let (device, config) = open_cpal(name.as_deref())?;
             let size = ring_size_for(config.sample_rate());
             if size > self.ring_capacity
                 && self.ring_producer.is_some()
@@ -407,10 +437,10 @@ impl AudioOutput {
                 packet_rx,
                 loopback_rx,
                 sound_rx,
+                sounds: self.sounds.clone(),
                 wake_rx,
                 callback_frames: self.callback_frames.clone(),
-                peer_settings: self.peer_settings.clone(),
-                removed_peers: self.removed_peers.clone(),
+                peers: self.peers.clone(),
                 stats: self.stats.clone(),
                 should_stop: self.should_stop.clone(),
                 ring_capacity: self.ring_capacity,
@@ -437,27 +467,32 @@ impl AudioOutput {
             sample_rate,
             // ~10 ms when the device advertises a supported range;
             // untouched (Default) when it doesn't. See platform.rs.
-            buffer_size: crate::platform::request_low_latency_buffer(
-                device_config.buffer_size(),
-                sample_rate,
-            ),
+            buffer_size: if self.quiet {
+                crate::platform::request_quiet_buffer(device_config.buffer_size())
+            } else {
+                crate::platform::request_low_latency_buffer(
+                    device_config.buffer_size(),
+                    sample_rate,
+                )
+            },
         };
 
-        let mut ring_consumer = self
-            .ring_consumer
-            .take()
-            .ok_or("Ring consumer already taken")?;
-        let wake_tx = self.wake_tx.take().ok_or("Wake sender already taken")?;
-        let stats = self.stats.clone();
+        // The worker keeps at least one callback queued: the pump tells
+        // it when the device starts asking for more (AAudio picks its
+        // own callback size, and may vary it). Its scratch is allocated
+        // here, outside the callback.
+        let mut pump = crate::native::pump::RenderPump::new(
+            self.ring_consumer
+                .take()
+                .ok_or("Ring consumer already taken")?,
+            self.wake_tx.take().ok_or("Wake sender already taken")?,
+            self.stats.clone(),
+            Some(self.callback_frames.clone()),
+        );
         let stats_err = self.stats.clone();
         let ch = channels as usize;
-        let callback_frames = self.callback_frames.clone();
-        let mut largest_callback = 0usize;
-        // Allocated once, outside the callback.
-        let mut mono = vec![0.0f32; CALLBACK_SCRATCH];
         // cpal's render thread runs our callback; promote it on first entry.
         let mut promoted = false;
-        let mut last_err_log: Option<Instant> = None;
 
         let stream = device.build_output_stream(
             config,
@@ -467,78 +502,25 @@ impl AudioOutput {
                     #[allow(clippy::cast_possible_truncation)]
                     crate::platform::promote_callback_thread(HOP as u32, sample_rate);
                 }
-                let mut rms_acc = 0.0f32;
-                let mut frames_done = 0usize;
-                let frames_total = data.len() / ch;
-                // The worker must keep at least this much queued; tell
-                // it when the device starts asking for more (AAudio
-                // picks its own callback size, and may vary it).
-                if frames_total > largest_callback {
-                    largest_callback = frames_total;
-                    callback_frames.store(frames_total, Ordering::Relaxed);
-                }
-
-                while frames_done < frames_total {
-                    let want = (frames_total - frames_done).min(mono.len());
-                    // One chunked read instead of a pop per sample. Whatever
-                    // the ring cannot supply is an underrun and plays as
-                    // silence. The signal was limited to ±0.99 upstream, so
-                    // no per-sample clamp here.
-                    let (_popped, missing) = ring_consumer.pop_partial_slice(&mut mono[..want]);
-                    if !missing.is_empty() {
-                        stats.output_underruns.fetch_add(1, Ordering::Relaxed);
-                        missing.fill(0.0);
-                    }
-                    for (frame_idx, &sample) in mono[..want].iter().enumerate() {
-                        rms_acc += sample * sample;
-                        let base = (frames_done + frame_idx) * ch;
-                        let s = T::from_sample(sample);
-                        // Mono → the front pair only. On 5.1/7.1 endpoints
-                        // (gaming headsets with virtual surround report 8
-                        // channels) the remaining channels are centre, LFE,
-                        // rear and side; feeding them a copy of the voice
-                        // makes the driver's binaural fold-down bass-heavy
-                        // and smeared. Standard channel order puts FL, FR
-                        // first on WASAPI, CoreAudio and ALSA; cpal doesn't
-                        // expose the mask, so that order is assumed.
-                        data[base] = s;
-                        if ch > 1 {
-                            data[base + 1] = s;
-                        }
-                        for slot in &mut data[base + 2.min(ch)..base + ch] {
-                            *slot = T::EQUILIBRIUM;
-                        }
-                    }
-                    frames_done += want;
-                }
-
-                // Output level for VU meter
-                if frames_total > 0 {
-                    #[allow(clippy::cast_precision_loss)]
-                    let rms = (rms_acc / frames_total as f32).sqrt();
-                    let scaled = (rms * 3.0).clamp(0.0, 1.0);
-                    stats
-                        .output_level
-                        .store(scaled.to_bits(), Ordering::Relaxed);
-                }
-
-                // Ring space just freed — wake the worker to refill.
-                wake_tx.ring();
+                // The ring into the buffer, the voice on the front pair
+                // (cpal does not expose the channel mask: the standard
+                // order is assumed), the meter, and the worker woken
+                // (`pump`).
+                pump.pull_mono(data.len() / ch, |i, sample| {
+                    crate::native::pump::front_pair(
+                        &mut data[i * ch..(i + 1) * ch],
+                        T::from_sample(sample),
+                        T::EQUILIBRIUM,
+                    );
+                });
             },
+            // Counted, not logged, and not as underruns (see the same
+            // closure in `input.rs`; review 2026-10, P3-33).
             move |err| {
                 if matches!(err.kind(), cpal::ErrorKind::DeviceNotAvailable) {
-                    stats_err
-                        .output_stream_failed
-                        .store(true, Ordering::Relaxed);
-                }
-                stats_err.output_underruns.fetch_add(1, Ordering::Relaxed);
-                let now = Instant::now();
-                if last_err_log.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
-                    last_err_log = Some(now);
-                    error!(
-                        "Output stream error: {err} (total {})",
-                        stats_err.output_underruns.load(Ordering::Relaxed)
-                    );
+                    stats_err.flag(crate::stats::Health::OutputFailed);
+                } else {
+                    stats_err.output_errors.fetch_add(1, Ordering::Relaxed);
                 }
             },
             None,
@@ -559,10 +541,10 @@ struct WorkerParts {
     packet_rx: Receiver<(AudioPacket, Instant)>,
     loopback_rx: Receiver<PcmFrame>,
     sound_rx: Receiver<SoundType>,
+    sounds: Arc<SoundBank>,
     wake_rx: Wait,
     callback_frames: Arc<AtomicUsize>,
-    peer_settings: Arc<Mutex<HashMap<u64, PeerAudioSettings>>>,
-    removed_peers: Arc<Mutex<HashSet<u64>>>,
+    peers: Arc<PeerTable>,
     stats: Arc<AudioStats>,
     should_stop: Arc<AtomicBool>,
     ring_capacity: usize,
@@ -580,10 +562,10 @@ fn worker_loop(parts: WorkerParts) {
         packet_rx,
         loopback_rx,
         sound_rx,
+        sounds,
         wake_rx,
         callback_frames,
-        peer_settings,
-        removed_peers,
+        peers,
         stats,
         should_stop,
         ring_capacity,
@@ -599,11 +581,10 @@ fn worker_loop(parts: WorkerParts) {
         crate::stream::mix::BUS.mixer()
     });
 
-    let mut jitter_buffer =
-        AdaptiveJitterBuffer::new(OPUS_SAMPLE_RATE as usize, 10, peer_settings, removed_peers);
+    let mut jitter_buffer = AdaptiveJitterBuffer::new(OPUS_SAMPLE_RATE as usize, 10, peers);
 
-    // Decode all notification sounds once at startup
-    let sound_bank = SoundBank::new();
+    // Decoded once per engine, shared by every output it opens.
+    let sound_bank = &*sounds;
 
     // Currently playing notification: (which, cursor into the bank's PCM)
     let mut playing: Option<(SoundType, usize)> = None;
@@ -945,6 +926,12 @@ impl Drop for AudioOutput {
         }
     }
 }
+
+/// The native render stream would not open and the warning was given;
+/// it is said again once one has opened.
+#[cfg(windows)]
+static RENDER_FALLBACK_SAID: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
 mod tests {

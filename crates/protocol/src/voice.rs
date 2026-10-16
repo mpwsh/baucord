@@ -57,9 +57,10 @@ pub const VOICE_FLAGS_KNOWN: u8 = VOICE_FLAG_RED;
 pub const VOICE_HEADER_SIZE: usize = 10;
 
 /// Maximum payload we will send or relay. A 20 ms voice frame at 48 kbit/s
-/// is ~120 bytes; the largest RED bundle the audio crate produces (32 kbit/s,
-/// two copies, headers) is ~250 bytes. 512 leaves headroom while bounding
-/// hostile input.
+/// is ~120 bytes; a RED bundle at the 40 ms rung with two copies averages
+/// ~370 bytes, and its VBR peaks went over: the audio crate now drops the
+/// oldest copy while a bundle is over this (`audio::MAX_VOICE_PAYLOAD`,
+/// checked equal in the client). It bounds hostile input too.
 pub const VOICE_MAX_FRAME_SIZE: usize = 512;
 
 /// Maximum total voice packet size accepted by the relay
@@ -104,16 +105,30 @@ pub fn pack_voice_with_flags(
     flags: u8,
     payload: &[u8],
 ) -> Option<Vec<u8>> {
-    if payload.is_empty() || payload.len() > VOICE_MAX_FRAME_SIZE {
-        return None;
-    }
     let mut out = Vec::with_capacity(VOICE_HEADER_SIZE + payload.len());
+    pack_voice_into(&mut out, seq, timestamp, flags, payload).then_some(out)
+}
+
+/// [`pack_voice_with_flags`] into `out`, which is cleared first: a
+/// sender reusing one buffer allocates nothing per packet. `false` (and
+/// `out` empty) for a payload of the wrong size.
+pub fn pack_voice_into(
+    out: &mut Vec<u8>,
+    seq: u32,
+    timestamp: u32,
+    flags: u8,
+    payload: &[u8],
+) -> bool {
+    out.clear();
+    if payload.is_empty() || payload.len() > VOICE_MAX_FRAME_SIZE {
+        return false;
+    }
     out.push(VOICE_PROTOCOL_VERSION);
     out.push(flags & VOICE_FLAGS_KNOWN);
     out.extend_from_slice(&seq.to_le_bytes());
     out.extend_from_slice(&timestamp.to_le_bytes());
     out.extend_from_slice(payload);
-    Some(out)
+    true
 }
 
 /// Parse a voice packet from untrusted bytes.

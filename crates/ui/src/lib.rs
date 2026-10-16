@@ -243,23 +243,11 @@ pub mod convert {
             );
             return slint::Image::default();
         }
-        let mut buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(width, height);
-        buf.make_mut_bytes().copy_from_slice(rgba);
-        slint::Image::from_rgba8(buf)
-    }
-
-    /// Decode PNG/JPEG/GIF-first-frame bytes → `slint::Image` +
-    /// dimensions. Wire bytes only — a received picture, or one of ours
-    /// already through `load_image_bytes` — so it takes app-core's
-    /// received-picture decoder: bomb limits, and no other format
-    /// (review P1-20).
-    pub fn decode_to_image(
-        bytes: &[u8],
-    ) -> Result<(slint::Image, u32, u32), app_core::images::ImageError> {
-        let decoded = app_core::images::decode_received(bytes)?;
-        let rgba = decoded.into_rgba8();
-        let (w, h) = (rgba.width(), rgba.height());
-        Ok((rgba_image(rgba.as_raw(), w, h), w, h))
+        // One copy: `new` would zero the buffer first, only to have it
+        // overwritten (review 2026-10, P3-6).
+        slint::Image::from_rgba8(slint::SharedPixelBuffer::clone_from_slice(
+            rgba, width, height,
+        ))
     }
 
     /// The chat-row image box's longest side, in logical pixels
@@ -300,7 +288,10 @@ pub mod convert {
     /// them), but the texture is downscaled to `max_edge` (see
     /// [`preview_max_edge`]) — a 1280² PNG is 6.5 MB of RGBA, drawn at
     /// 360 px. The full resolution is decoded only while the gallery
-    /// viewer is open. PNG, JPEG and GIF only, as [`decode_to_image`].
+    /// viewer is open. Wire bytes only — a received picture, or one of
+    /// ours already through `load_image_bytes` — so it takes app-core's
+    /// received-picture decoder: bomb limits, and PNG, JPEG and GIF
+    /// only (review P1-20).
     pub fn decode_to_preview(
         bytes: &[u8],
         max_edge: u32,

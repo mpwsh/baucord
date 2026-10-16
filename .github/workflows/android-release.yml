@@ -50,7 +50,9 @@ jobs:
           set -eu
           CRATE="$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)"
           if [ "${TAG#v}" != "$CRATE" ]; then
-            echo "::error::release tag $TAG, but Cargo.toml says $CRATE — bump `[workspace.package]`, then tag v$CRATE"
+            # No backticks inside these quotes: they would run a command
+            # (review 2026-10, P3-58).
+            echo "::error::release tag $TAG, but Cargo.toml says $CRATE — bump [workspace.package], then tag v$CRATE"
             exit 1
           fi
           echo "version $CRATE"
@@ -88,10 +90,15 @@ jobs:
           rustup target add aarch64-linux-android
           rustup show active-toolchain
 
+      # Restored on every run, saved by none: every run here is a
+      # release or a dispatch, whose cache is scoped to its tag or
+      # branch where no later run reads it, and it could evict main's
+      # (review 2026-10, P2-48).
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
           key: android-release-arm64
+          save-if: false
 
       # A pinned, prebuilt cargo-ndk (its own release binaries, through
       # cargo-binstall). `cargo install` compiled whatever was newest
@@ -138,7 +145,9 @@ jobs:
           RELEASE_KEY_PASS="${RELEASE_KEY_PASS:-$RELEASE_KS_PASS}"
           export RELEASE_KS_PASS RELEASE_KEY_PASS
           "$BT/zipalign" -P 16 -f 4 "$APK_IN" aligned.apk
-          if [ -n "$RELEASE_KS_B64" ]; then
+          # The release key signs a release tag's build only: a dry run
+          # from any branch stays unsigned (review 2026-10, P3-62).
+          if [ -n "$RELEASE_KS_B64" ] && [[ "$TAG" == v* ]]; then
             printf '%s' "$RELEASE_KS_B64" | tr -d ' \r\n' | base64 -d > "$KS"
             APK="baucord-${TAG}-android-arm64.apk"
             "$BT/apksigner" sign --ks "$KS" --ks-key-alias "$KEY_ALIAS" \
@@ -150,18 +159,21 @@ jobs:
           else
             APK="baucord-${TAG}-android-arm64-unsigned.apk"
             cp aligned.apk "$APK"
-            echo "::warning::no release key: the APK is unsigned (artifact only)"
+            echo "::warning::no release key, or not a release tag: the APK is unsigned (artifact only)"
           fi
           rm -f aligned.apk
           "$BT/zipalign" -c -P 16 4 "$APK"
           echo "name=$APK" >> "$GITHUB_OUTPUT"
 
+      # A week: the release carries the APK; a bundle for Play is
+      # rebuilt from its tag (a dispatch with the tag) if it is missed.
       - name: Upload APK artifact
         uses: actions/upload-artifact@v7
         with:
           path: ${{ steps.apk.outputs.name }}
           archive: false
           if-no-files-found: error
+          retention-days: 7
 
       - name: Attach APK to release
         if: ${{ env.SIGNED == '1' && (github.event_name == 'release' || startsWith(env.TAG, 'v')) }}
@@ -203,7 +215,7 @@ jobs:
           trap 'rm -f "$KS"' EXIT
           RELEASE_KEY_PASS="${RELEASE_KEY_PASS:-$RELEASE_KS_PASS}"
           export RELEASE_KS_PASS RELEASE_KEY_PASS
-          if [ -n "$RELEASE_KS_B64" ]; then
+          if [ -n "$RELEASE_KS_B64" ] && [[ "$TAG" == v* ]]; then
             printf '%s' "$RELEASE_KS_B64" | tr -d ' \r\n' | base64 -d > "$KS"
             AAB="baucord-${TAG}-android.aab"
             cp "$AAB_IN" "$AAB"
@@ -215,7 +227,7 @@ jobs:
           else
             AAB="baucord-${TAG}-android-unsigned.aab"
             cp "$AAB_IN" "$AAB"
-            echo "::warning::no release key: the bundle is unsigned (Play refuses it)"
+            echo "::warning::no release key, or not a release tag: the bundle is unsigned (Play refuses it)"
           fi
           if ! unzip -l "$AAB" | grep -q "BUNDLE-METADATA/com.android.tools.build.debugsymbols/"; then
             echo "::warning::no native debug symbols in the bundle"
@@ -228,3 +240,4 @@ jobs:
           path: ${{ steps.aab.outputs.name }}
           archive: false
           if-no-files-found: error
+          retention-days: 7

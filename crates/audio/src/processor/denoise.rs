@@ -13,7 +13,6 @@
 //!
 //! ## Context interaction
 //!
-//! - **Reads**: `ctx.denoise_enabled` (bypass when `false`)
 //! - **Writes**: `ctx.rnnoise_vad_prob` (0.0–1.0, used by the speaking indicator)
 
 use nnnoiseless::DenoiseState;
@@ -79,12 +78,6 @@ impl Denoiser {
 
 impl AudioProcessor for Denoiser {
     fn process(&mut self, samples: &mut [f32], ctx: &mut FrameContext) {
-        if !ctx.denoise_enabled {
-            // Assume speech when denoise is off — no RNNoise VAD available;
-            // the gate alone decides downstream.
-            ctx.rnnoise_vad_prob = 1.0;
-            return;
-        }
         let mut vad = 0.0f32;
         for block in samples.chunks_exact_mut(DenoiseState::FRAME_SIZE) {
             vad = vad.max(self.process_block(block));

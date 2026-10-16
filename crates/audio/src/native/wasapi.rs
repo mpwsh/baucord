@@ -64,6 +64,10 @@ use windows::Win32::Media::{
     Audio::AUDIO_EFFECT_STATE_ON, KernelStreaming::AUDIO_EFFECT_TYPE_ACOUSTIC_ECHO_CANCELLATION,
 };
 
+use super::{
+    pump::{CapturePump, RenderPump},
+    CaptureStartError, RenderStartError,
+};
 use crate::{
     aec::{self, OutputKind},
     input_config::InputConfig,
@@ -81,23 +85,6 @@ const RENDER_BUFFER_HNS: i64 = 20 * 10_000;
 const EVENT_WAIT_MS: u32 = 100;
 /// Consecutive engine errors before a pump gives up and flags the stream.
 const MAX_CONSECUTIVE_ERRORS: u32 = 10;
-
-// ── Errors ──────────────────────────────────────────────────────────────
-
-/// Native capture could not start. Carries the ring and latch back so the
-/// caller can hand them to the cpal fallback untouched.
-pub struct CaptureStartError {
-    pub reason: String,
-    pub producer: Producer<f32>,
-    pub wake_tx: Ring,
-}
-
-/// Native render could not start; same idea as [`CaptureStartError`].
-pub struct RenderStartError {
-    pub reason: String,
-    pub consumer: Consumer<f32>,
-    pub wake_tx: Ring,
-}
 
 // ── Opened stream description ───────────────────────────────────────────
 
@@ -215,13 +202,34 @@ fn find_device(
     }
 }
 
+/// The communications default's name, for the device lists' default
+/// mark (`voice_default_name` in lib.rs). On a thread where COM is up —
+/// cpal's listing on the same thread brings it up first.
+pub fn communications_default_name(input: bool) -> Option<String> {
+    let enumerator = DeviceEnumerator::new().ok()?;
+    let direction = if input {
+        Direction::Capture
+    } else {
+        Direction::Render
+    };
+    enumerator
+        .get_default_device_for_role(&direction, &Role::Communications)
+        .ok()?
+        .get_friendlyname()
+        .ok()
+}
+
 /// The device a stream opens: `name`, or the default `communications`
 /// chooses ([`role_for`]). Windows counts every stream opened on the
 /// device object it hands out for the Communications role as a call,
 /// whatever its category, and lowers the other apps for as long as it
-/// runs. A plain stream (`voice` false: headphones under Automatic)
-/// must not do that (AEC-SPEC.md D3, E14), so it looks the same
-/// endpoint up again by its id, which carries no role.
+/// runs. No stream of ours should do that (AEC-SPEC.md D3, E14, E16),
+/// so the same endpoint is looked up again by its id, which carries no
+/// role. A plain stream (headphones under Automatic) did so since E14;
+/// a call-path one (`voice`) too since E16: its Communications category
+/// is what turns the canceller on, and the role only told Windows to
+/// turn the other apps down — on Windows 11 too, where the capture
+/// stream cannot ask not to (E11).
 fn stream_device(
     enumerator: &DeviceEnumerator,
     direction: Direction,
@@ -230,7 +238,7 @@ fn stream_device(
     voice: bool,
 ) -> Result<wasapi::Device, String> {
     let device = find_device(enumerator, direction, name, role_for(communications))?;
-    if voice || !communications || name.is_some() {
+    if !communications || name.is_some() {
         return Ok(device);
     }
     match device.get_id().and_then(|id| enumerator.get_device(&id)) {
@@ -238,7 +246,8 @@ fn stream_device(
         Err(e) => {
             warn!(
                 "{direction}: the communications default would not open by its id ({e}); \
-                 Windows may lower other apps"
+                 Windows may lower other apps{}",
+                if voice { " during the call" } else { "" }
             );
             Ok(device)
         }
@@ -944,11 +953,17 @@ fn run_capture(
     should_stop: &AtomicBool,
 ) {
     let CaptureParts {
-        mut producer,
+        producer,
         wake_tx,
         stats,
         config,
     } = parts;
+    let mut pump = CapturePump {
+        producer,
+        wake_tx,
+        stats: stats.clone(),
+        config,
+    };
     let mut packet_buf: Vec<u8> = Vec::new();
     let mut consecutive_errors = 0u32;
     let ch = negotiated.channels;
@@ -959,14 +974,14 @@ fn run_capture(
             Ok(()) => {}
             Err(WasapiError::EventTimeout) => {
                 if stopped_signalling(client, "capture") {
-                    stats.input_stream_failed.store(true, Ordering::Relaxed);
+                    stats.flag(crate::stats::Health::InputFailed);
                     break;
                 }
                 continue;
             }
             Err(e) => {
                 error!("Native capture event wait failed: {e}");
-                stats.input_stream_failed.store(true, Ordering::Relaxed);
+                stats.flag(crate::stats::Health::InputFailed);
                 break;
             }
         }
@@ -980,7 +995,7 @@ fn run_capture(
                     consecutive_errors += 1;
                     if is_device_gone(&e) || consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
                         error!("Native capture lost the device: {e}");
-                        stats.input_stream_failed.store(true, Ordering::Relaxed);
+                        stats.flag(crate::stats::Health::InputFailed);
                         return;
                     }
                     break;
@@ -996,7 +1011,7 @@ fn run_capture(
                     consecutive_errors += 1;
                     if is_device_gone(&e) || consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
                         error!("Native capture read failed: {e}");
-                        stats.input_stream_failed.store(true, Ordering::Relaxed);
+                        stats.flag(crate::stats::Health::InputFailed);
                         return;
                     }
                     break;
@@ -1017,41 +1032,22 @@ fn run_capture(
                 stats.input_overruns.fetch_add(1, Ordering::Relaxed);
             }
 
-            if config.silenced() {
-                continue;
-            }
-
-            // Downmix into the ring in one chunked write. A SILENT packet
-            // may hold garbage per the WASAPI docs: push zeros instead so
-            // the sample count — and therefore the encoder's timeline —
-            // stays continuous.
-            let want = got.min(producer.slots());
-            if want < got {
-                stats.input_overruns.fetch_add(1, Ordering::Relaxed);
-            }
-            if want == 0 {
-                continue;
-            }
-            let Ok(chunk) = producer.write_chunk_uninit(want) else {
-                continue;
-            };
+            // Downmixed into the ring (`pump`). A SILENT packet may hold
+            // garbage per the WASAPI docs: zeros instead, so the sample
+            // count — and therefore the encoder's timeline — stays
+            // continuous.
             let silent = info.flags.silent;
             let layout = negotiated.layout;
-            {
-                let mut it = packet_buf[..got * bpf]
-                    .chunks_exact(bpf)
-                    .take(want)
-                    .map(|frame| {
-                        if silent {
-                            0.0
-                        } else {
-                            layout.frame_to_mono(frame, ch)
-                        }
-                    });
-                chunk.fill_from_iter(&mut it);
-            }
-
-            wake_tx.ring();
+            pump.push_mono(
+                got,
+                packet_buf[..got * bpf].chunks_exact(bpf).map(|frame| {
+                    if silent {
+                        0.0
+                    } else {
+                        layout.frame_to_mono(frame, ch)
+                    }
+                }),
+            );
         }
     }
 }
@@ -1262,7 +1258,7 @@ fn run_render(
     should_stop: &AtomicBool,
 ) {
     let RenderParts {
-        mut consumer,
+        consumer,
         wake_tx,
         stats,
     } = parts;
@@ -1270,7 +1266,9 @@ fn run_render(
     let bpf = negotiated.bytes_per_frame;
     let bps = negotiated.layout.bytes_per_sample();
     let layout = negotiated.layout;
-    let mut mono: Vec<f32> = Vec::new();
+    // The worker sizes its queue from the engine buffer, not from a
+    // callback size: none is reported.
+    let mut pump = RenderPump::new(consumer, wake_tx, stats.clone(), None);
     let mut out: Vec<u8> = Vec::new();
     let mut consecutive_errors = 0u32;
     let mut last_err_log: Option<Instant> = None;
@@ -1280,14 +1278,14 @@ fn run_render(
             Ok(()) => {}
             Err(WasapiError::EventTimeout) => {
                 if stopped_signalling(client, "render") {
-                    stats.output_stream_failed.store(true, Ordering::Relaxed);
+                    stats.flag(crate::stats::Health::OutputFailed);
                     break;
                 }
                 continue;
             }
             Err(e) => {
                 error!("Native render event wait failed: {e}");
-                stats.output_stream_failed.store(true, Ordering::Relaxed);
+                stats.flag(crate::stats::Health::OutputFailed);
                 break;
             }
         }
@@ -1298,7 +1296,7 @@ fn run_render(
                 consecutive_errors += 1;
                 if is_device_gone(&e) || consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
                     error!("Native render lost the device: {e}");
-                    stats.output_stream_failed.store(true, Ordering::Relaxed);
+                    stats.flag(crate::stats::Health::OutputFailed);
                     return;
                 }
                 continue;
@@ -1308,32 +1306,17 @@ fn run_render(
             continue;
         }
 
-        // Pull what the engine can take; whatever the ring can't supply is
-        // an underrun and plays as silence.
-        mono.resize(space, 0.0);
-        let (_popped, missing) = consumer.pop_partial_slice(&mut mono[..]);
-        if !missing.is_empty() {
-            stats.output_underruns.fetch_add(1, Ordering::Relaxed);
-            missing.fill(0.0);
-        }
-
-        // Fan out: FL and FR carry the voice, every other channel silence.
+        // What the engine can take, from the ring (`pump`): FL and FR
+        // carry the voice, every other channel silence (zero bytes).
         out.clear();
         out.resize(space * bpf, 0);
-        let mut rms_acc = 0.0f32;
-        for (i, &s) in mono[..space].iter().enumerate() {
-            rms_acc += s * s;
+        pump.pull_mono(space, |i, s| {
             let base = i * bpf;
             layout.write_sample(s, &mut out[base..base + bps]);
             if ch > 1 {
                 layout.write_sample(s, &mut out[base + bps..base + 2 * bps]);
             }
-        }
-        #[allow(clippy::cast_precision_loss)]
-        let rms = (rms_acc / space as f32).sqrt();
-        stats
-            .output_level
-            .store((rms * 3.0).clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+        });
 
         match render.write_to_device(space, &out, None) {
             Ok(()) => consecutive_errors = 0,
@@ -1345,14 +1328,11 @@ fn run_render(
                     error!("Native render write failed: {e}");
                 }
                 if is_device_gone(&e) || consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                    stats.output_stream_failed.store(true, Ordering::Relaxed);
+                    stats.flag(crate::stats::Health::OutputFailed);
                     return;
                 }
             }
         }
-
-        // Ring space freed — the worker refills on this ring alone.
-        wake_tx.ring();
     }
 }
 
@@ -1447,20 +1427,31 @@ fn register(
             }
             debug!("default {direction} device changed ({role}): {id:?}");
             match direction {
-                Direction::Capture => stats.default_input_changed.store(true, Ordering::Relaxed),
-                Direction::Render => stats.default_output_changed.store(true, Ordering::Relaxed),
+                Direction::Capture => stats.flag(crate::stats::Health::DefaultInputChanged),
+                Direction::Render => stats.flag(crate::stats::Health::DefaultOutputChanged),
+            }
+        });
+    }
+    // A device going away needs no word of its own: the side using it
+    // fails and says so, and a default it was moves with its own event.
+    // Raising both "default changed" flags here reopened every stream
+    // that follows the default on any removal at all (review 2026-10,
+    // P3-32). A device coming (back) is news for a side waiting on one:
+    // its retry wait starts over (`Health::DeviceArrived`).
+    {
+        let stats = stats.clone();
+        callbacks.set_device_state_callback(move |id, state| {
+            if matches!(state, wasapi::DeviceState::Active) {
+                debug!("audio device active: {id}");
+                stats.flag(crate::stats::Health::DeviceArrived);
             }
         });
     }
     {
         let stats = stats.clone();
-        callbacks.set_device_removed_callback(move |id| {
-            debug!("audio device removed: {id}");
-            // Whichever side was using it fails on its next engine call
-            // and raises its own flag; this just makes the supervisor
-            // look sooner.
-            stats.default_input_changed.store(true, Ordering::Relaxed);
-            stats.default_output_changed.store(true, Ordering::Relaxed);
+        callbacks.set_device_added_callback(move |id| {
+            debug!("audio device added: {id}");
+            stats.flag(crate::stats::Health::DeviceArrived);
         });
     }
     let registration = enumerator

@@ -85,7 +85,12 @@ impl SpeakingFlag {
 pub struct SpeakingIndicator {
     is_speaking: Arc<SpeakingFlag>,
     hold_remaining: u32,
-    last_transition: Instant,
+    /// The last frame of speech: the light goes out [`STOP_COOLDOWN`]
+    /// after it. It counted from the light's rising edge, so a phrase
+    /// pause past 1.5 s into a long sentence put it out and the next
+    /// word lit it again — an edge a second, each fanned out by the
+    /// server and redrawn on every client (review 2026-10, P2-8).
+    last_speech: Instant,
 }
 
 impl Default for SpeakingIndicator {
@@ -107,7 +112,7 @@ impl SpeakingIndicator {
         Self {
             is_speaking: flag,
             hold_remaining: 0,
-            last_transition: Instant::now(),
+            last_speech: Instant::now(),
         }
     }
 
@@ -125,14 +130,12 @@ impl SpeakingIndicator {
     }
 
     /// Publish the speaking indicator with a slow-fall cooldown for UI.
-    fn update_ui_indicator(&mut self, should_speak: bool) {
-        let was_speaking = self.is_speaking.get();
-        if should_speak && !was_speaking {
+    fn update_ui_indicator(&mut self, should_speak: bool, now: Instant) {
+        if should_speak {
+            self.last_speech = now;
             self.is_speaking.set(true);
-            self.last_transition = Instant::now();
-        } else if !should_speak && was_speaking && self.last_transition.elapsed() > STOP_COOLDOWN {
+        } else if now.duration_since(self.last_speech) > STOP_COOLDOWN {
             self.is_speaking.set(false);
-            self.last_transition = Instant::now();
         }
     }
 }
@@ -141,7 +144,7 @@ impl AudioProcessor for SpeakingIndicator {
     fn process(&mut self, _samples: &mut [f32], ctx: &mut FrameContext) {
         let is_speech = self.classify(ctx.gate_open, ctx.rnnoise_vad_prob);
         ctx.is_speech = is_speech;
-        self.update_ui_indicator(is_speech);
+        self.update_ui_indicator(is_speech, Instant::now());
     }
 
     fn reset(&mut self) {
@@ -183,6 +186,29 @@ mod tests {
         }
         s.process(&mut [], &mut ctx);
         assert!(!ctx.is_speech, "hold expired");
+    }
+
+    /// The light stays on through a sentence's pauses: out only
+    /// [`STOP_COOLDOWN`] after the last speech, however long ago it lit.
+    #[test]
+    fn the_light_goes_out_after_the_last_speech_not_the_first() {
+        let (flag, ring) = SpeakingFlag::new();
+        let mut s = SpeakingIndicator::with_flag(flag.clone());
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        s.update_ui_indicator(true, at(0));
+        assert!(flag.get());
+        // Speaking on and off for three seconds, pauses under the cooldown.
+        for ms in (100..3_000).step_by(100) {
+            s.update_ui_indicator(ms % 700 != 0, at(ms));
+        }
+        s.update_ui_indicator(false, at(3_100));
+        assert!(flag.get(), "1.6 s after it lit, 0.2 s after the last word");
+        s.update_ui_indicator(false, at(4_401));
+        assert!(!flag.get());
+        // One ring for on, one for off: none in between.
+        assert!(ring.try_recv().is_ok());
+        assert!(ring.try_recv().is_err());
     }
 
     /// The owner hears each change once, never a set that changed

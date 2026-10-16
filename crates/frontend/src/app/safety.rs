@@ -19,8 +19,9 @@ pub(super) struct PendingReport {
     author: Option<client::UserId>,
 }
 
-/// The localized name of a report reason, for the dialog's picker.
-fn reason_label(reason: ReportReason) -> String {
+/// A report reason in words: the report dialog's picker, the admin
+/// panel's Reports tab, `/reports`.
+pub(crate) fn reason_label(reason: ReportReason) -> String {
     t!(match reason {
         ReportReason::Spam => "report-reason-spam",
         ReportReason::Harassment => "report-reason-harassment",
@@ -33,11 +34,6 @@ fn reason_label(reason: ReportReason) -> String {
     })
 }
 
-/// The reason a report's row in the admin panel shows.
-pub(crate) fn reason_text(reason: ReportReason) -> String {
-    reason_label(reason)
-}
-
 impl AppState {
     // ── Who is blocked ──────────────────────────────────────────────
 
@@ -47,6 +43,11 @@ impl AppState {
 
     /// The account behind a session, when the server said
     /// (`UserDetails`, or `Authors` for someone in the lobby).
+    /// The session account `user` is online with, if any.
+    pub(crate) fn session_of(&self, user: &client::UserId) -> Option<u64> {
+        self.session.account_sessions.get(user).copied()
+    }
+
     pub(super) fn account_of(&self, client_id: u64) -> Option<client::UserId> {
         self.session
             .details
@@ -141,7 +142,7 @@ impl AppState {
         }
         // Their DM: out of the list, its rows dropped; it is fetched
         // again if they are unblocked and it is opened.
-        self.session.chat.parked.remove(&Some(*user));
+        self.drop_parked(Some(*user));
         self.session.chat.dm_order.retain(|u| u != user);
         if let Some(meta) = self.session.chat.dm_meta.get_mut(user) {
             meta.fetched = false;
@@ -414,7 +415,7 @@ impl AppState {
             entry.channel_passwords.clear();
             entry.invite_code = None;
         }
-        self.settings.save();
+        self.save_settings();
         crate::settingsui::refresh_servers(self);
         crate::settingsui::refresh_safety(self);
     }

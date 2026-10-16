@@ -72,6 +72,10 @@ pub const INITIAL_MTU: u16 = 1200;
 /// was tried first and made that 40 s: too slow to notice.
 pub const CLIENT_KEEP_ALIVE: Duration = Duration::from_secs(5);
 
+/// How long the server lets a connection go quiet before it sends a
+/// PING ([`Budget::server`]).
+pub const SERVER_KEEP_ALIVE: Duration = Duration::from_secs(20);
+
 impl Budget {
     /// The desktop / mobile client: small buffers, keeps the connection
     /// alive itself.
@@ -107,7 +111,15 @@ impl Budget {
         Self {
             // Matches the client; QUIC uses the smaller of the two.
             max_idle_timeout: Duration::from_secs(30),
-            keep_alive_interval: None,
+            // A PING after 20 s of quiet. A phone in the lobby with its
+            // screen off sleeps through its own 5 s keep-alive, and a
+            // 1.2.1 server sends a quiet session nothing (ANDROID-SPEC.md
+            // D68): both sides timed out at 30 s and the phone lost its
+            // session. This wakes it, refreshes its NAT mapping and
+            // resets both timers — one small packet every 20 s, where
+            // the server's reports every 2 s did it before 1.2.1
+            // (review 2026-10, P1-6; D74).
+            keep_alive_interval: Some(SERVER_KEEP_ALIVE),
             max_ack_delay: Duration::from_millis(25),
             datagram_receive_buffer: 256 * 1024,
             datagram_send_buffer: 256 * 1024,
@@ -173,8 +185,12 @@ mod tests {
     }
 
     #[test]
-    fn client_keeps_alive_and_server_does_not() {
-        assert!(Budget::client().keep_alive_interval.is_some());
-        assert!(Budget::server().keep_alive_interval.is_none());
+    fn both_sides_keep_alive_inside_the_idle_timeout() {
+        for budget in [Budget::client(), Budget::server()] {
+            let every = budget.keep_alive_interval.expect("a keep-alive");
+            assert!(every < budget.max_idle_timeout, "{every:?}");
+        }
+        // The server's is the rarer one: a phone pays for each.
+        assert!(Budget::server().keep_alive_interval > Budget::client().keep_alive_interval);
     }
 }

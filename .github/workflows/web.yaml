@@ -21,6 +21,39 @@ on:
     types: [completed]
 
 jobs:
+  # A release's deploy names its version on the site: only the newest
+  # stable release's, never a backport's or a rebuilt older tag's
+  # (review 2026-10, P2-27). A push to main always deploys.
+  newest:
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'release' &&
+      github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    outputs:
+      deploy: ${{ steps.check.outputs.deploy }}
+    steps:
+      - name: Is this the newest release?
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # A release run's head branch is its tag.
+          TAG: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" != "workflow_run" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          NEWEST=$(gh api "repos/$GITHUB_REPOSITORY/tags" --paginate --jq '.[].name' \
+            | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V | tail -1)
+          if [ "$TAG" = "$NEWEST" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$TAG is not the newest stable release ($NEWEST): the site stays"
+          fi
+
   licenses:
     if: >-
       github.event_name == 'push' ||
@@ -31,12 +64,9 @@ jobs:
       ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.ref }}
 
   deploy:
-    needs: licenses
+    needs: [newest, licenses]
     runs-on: ubuntu-latest
-    if: >-
-      github.event_name == 'push' ||
-      (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'release' &&
-      github.event.workflow_run.conclusion == 'success')
+    if: needs.newest.outputs.deploy == 'true'
     steps:
       - name: Check out source
         uses: actions/checkout@v7
@@ -49,7 +79,7 @@ jobs:
           path: .
       - name: Stamp version into pages
         run: |
-          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          VERSION=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
           sed -i "s/__VERSION__/$VERSION/g" web/index.html web/i18n/*.json
       - name: Stage hosting guide files
         run: |

@@ -21,12 +21,7 @@ use crate::{
 
 /// How long the panel waits for the audit read.
 const AUDIT_DEADLINE: Duration = Duration::from_secs(2);
-/// Most roles a server holds, built-in ones included. Every session
-/// gets the whole list as one `RoleList`, which a few hundred roles
-/// would push past the 17 KiB a message may be — and then nobody gets
-/// roles at all. A hundred at the longest names is under half of it
-/// (the test below).
-const MAX_ROLES: usize = 100;
+use crate::policy::MAX_ROLES;
 
 impl ChatServer {
     /// `AuditLog`: ask the store; the answer goes out as the command's

@@ -77,12 +77,12 @@ impl AppState {
     /// to show inline; bigger ones stay a card with Save.
     pub(super) fn want_picture(
         &mut self,
-        a: &client::protocol::Attachment,
+        file: &app_core::chat::FileMeta,
         conv: Option<client::UserId>,
         msg_id: u64,
     ) {
-        let inline = a.mime.starts_with("image/")
-            && usize::try_from(a.size).is_ok_and(|s| s <= client::MAX_CHAT_IMAGE_BYTES);
+        let inline = file.mime.starts_with("image/")
+            && usize::try_from(file.size).is_ok_and(|s| s <= client::MAX_CHAT_IMAGE_BYTES);
         if !inline {
             return;
         }
@@ -90,17 +90,17 @@ impl AppState {
             .session
             .transfers
             .pending_pictures
-            .contains_key(&a.blob_id);
+            .contains_key(&file.blob);
         self.session
             .transfers
             .pending_pictures
-            .entry(a.blob_id)
+            .entry(file.blob)
             .or_default()
             .push((conv, msg_id));
         if fresh {
             self.network
                 .tx
-                .send(NetworkControl::FetchBlob { blob_id: a.blob_id })
+                .send(NetworkControl::FetchBlob { blob_id: file.blob })
                 .ok();
         }
     }
@@ -131,22 +131,37 @@ impl AppState {
             .transfers
             .shown
             .insert((None, placeholder), (1, 0));
-        self.session.transfers.image_upload = Some(placeholder);
         let shown =
             self.with_conversation(None, |app| media::push_image_row(app, &meta, png.clone()));
         if !shown {
             self.session.transfers.shown.remove(&(None, placeholder));
-            self.session.transfers.image_upload = None;
+            return;
         }
-        self.network.tx.send(NetworkControl::SendImage(png)).ok();
+        self.session.transfers.image_uploads.push_back(placeholder);
+        self.network
+            .tx
+            .send(NetworkControl::SendImage {
+                token: placeholder,
+                data: png,
+            })
+            .ok();
     }
 
-    /// Our image came back from the server: the card it replaces goes
-    /// (its picture and player with it) before the real row is pushed.
-    pub(super) fn drop_image_card(&mut self) {
-        let Some(placeholder) = self.session.transfers.image_upload.take() else {
-            return;
-        };
+    /// Our oldest image on its way came back from the server: its card
+    /// goes before the real row is pushed.
+    pub(super) fn drop_oldest_image_card(&mut self) {
+        if let Some(placeholder) = self.session.transfers.image_uploads.pop_front() {
+            self.drop_image_card(placeholder);
+        }
+    }
+
+    /// The card of our image `placeholder` goes (its picture and player
+    /// with it): it came back, or it was cancelled.
+    pub(super) fn drop_image_card(&mut self, placeholder: u64) {
+        self.session
+            .transfers
+            .image_uploads
+            .retain(|p| *p != placeholder);
         self.session.transfers.shown.remove(&(None, placeholder));
         self.with_conversation(None, |app| {
             let at = app
@@ -402,7 +417,25 @@ impl AppState {
             self.show_toast(ToastKind::Warning, &t!("file-gone"));
             return;
         }
-        if let Err(e) = crate::host::open_target(&path) {
+        // A program, a script or a shortcut is shown in its folder, not
+        // run on one click (review 2026-10, P1-9): what to do with it is
+        // then the person's own act, with the system's warning.
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let target = if cfg!(feature = "desktop") && app_core::files::is_runnable_name(&name) {
+            self.show_toast(
+                ToastKind::Info,
+                &t!("file-shown-in-folder", "name" => name.as_str()),
+            );
+            path.parent()
+                .map_or_else(|| path.clone(), std::path::Path::to_path_buf)
+        } else {
+            path
+        };
+        if let Err(e) = crate::host::open_target(&target) {
             self.show_error(&t!("file-open-error", "error" => e));
         }
     }
@@ -429,9 +462,12 @@ impl AppState {
             .get(&(conv, msg_id))
             .map(|t| t.0)
         {
-            Some(1) if self.session.transfers.image_upload == Some(msg_id) => {
-                self.network.tx.send(NetworkControl::CancelImage).ok();
-                self.drop_image_card();
+            Some(1) if self.session.transfers.image_uploads.contains(&msg_id) => {
+                self.network
+                    .tx
+                    .send(NetworkControl::CancelImage { token: msg_id })
+                    .ok();
+                self.drop_image_card(msg_id);
             }
             Some(1) => {
                 if let Some((upload_id, _)) = self
@@ -536,6 +572,11 @@ impl AppState {
         if self.session.chat.history_page_pending.is_some() {
             return;
         }
+        // As far back as the list keeps (P3-51).
+        if !self.history.room_for_page(limit) {
+            self.push_system_here(&t!("chat-earlier-limit"));
+            return;
+        }
         self.session.chat.history_page_pending = Some(self.session.chat.active_dm);
         self.main.global::<State>().set_history_loading(true);
         self.network
@@ -627,10 +668,26 @@ impl AppState {
         s.set_confirm_open(true);
     }
 
+    /// Clear chat: at once with a pointer, which aims; after a question
+    /// on a touch host.
+    pub(super) fn ask_clear_chat(&mut self) {
+        if !self.main.global::<State>().get_touch_host() {
+            self.clear_chat();
+            return;
+        }
+        self.session.chat.pending_confirm = Some(Confirm::ClearChat);
+        let s = self.main.global::<State>();
+        s.set_confirm_title(t!("confirm-clear-chat-title").into());
+        s.set_confirm_body(t!("confirm-clear-chat-body").into());
+        s.set_confirm_label(t!("confirm-clear-chat").into());
+        s.set_confirm_open(true);
+    }
+
     pub(super) fn confirm_accept(&mut self) {
         let s = self.main.global::<State>();
         s.set_confirm_open(false);
         match self.session.chat.pending_confirm.take() {
+            Some(Confirm::ClearChat) => self.clear_chat(),
             Some(Confirm::DeleteMessage { msg_id, by_admin }) => {
                 if by_admin {
                     self.send_admin(AdminCommand::DeleteMessage { msg_id }, PendingAdmin::Show);
@@ -875,39 +932,41 @@ impl AppState {
         }
     }
 
-    /// Start the 33 ms animation ticker if it isn't already running.
+    /// Start the animation ticker if it isn't already running: a
+    /// single shot, set again by each tick for the next frame due.
     pub fn ensure_gif_ticker(&mut self) {
         if self.gif_ticker.running() {
             return;
         }
+        self.gif_last_tick = None;
+        self.arm_gif_ticker(Duration::from_millis(16));
+    }
+
+    fn arm_gif_ticker(&mut self, after: Duration) {
         let weak = APP.with(|a| a.borrow().as_ref().map(Rc::downgrade));
         if let Some(weak) = weak {
-            self.gif_ticker.start(
-                slint::TimerMode::Repeated,
-                Duration::from_millis(33),
-                move || with_app(&weak, AppState::gif_tick),
-            );
+            self.gif_ticker
+                .start(slint::TimerMode::SingleShot, after, move || {
+                    with_app(&weak, AppState::gif_tick);
+                });
         }
     }
 
     /// One animation tick: advance every playing chat GIF and the
-    /// overlay GIF; stop the ticker when nothing is playing.
+    /// overlay GIF by the time since the last tick, then set the ticker
+    /// for the next frame due — none when nothing plays. It used to fire
+    /// every 33 ms whatever the GIFs asked for (review 2026-10, P3-6).
     pub(super) fn gif_tick(&mut self) {
         use crate::media::GifStep;
-        const DT_MS: f64 = 33.0;
 
         // The gallery's and the send preview's player: the next frame
         // to show, if one is due. A stream that ended for good hands
         // back its first frame and stops.
-        fn step_overlay(slot: &mut Option<GifPlayer>) -> Option<slint::Image> {
+        fn step_overlay(slot: &mut Option<GifPlayer>, dt_ms: f64) -> Option<slint::Image> {
             let player = slot.as_mut()?;
-            match player.step(DT_MS) {
+            match player.step(dt_ms) {
                 GifStep::Idle => None,
-                GifStep::Blit {
-                    rgba,
-                    width,
-                    height,
-                } => Some(ui::convert::rgba_image(&rgba, width, height)),
+                GifStep::Blit(pixels) => Some(slint::Image::from_rgba8(pixels)),
                 GifStep::Freeze { first } => {
                     *slot = None;
                     Some(first)
@@ -928,23 +987,31 @@ impl AppState {
             self.gif_ticker.stop();
             return;
         }
+        let now = Instant::now();
+        #[allow(clippy::cast_precision_loss)]
+        let dt_ms = self
+            .gif_last_tick
+            .map_or(16.0, |last| now.duration_since(last).as_secs_f64() * 1000.0);
+        self.gif_last_tick = Some(now);
+        // The chat's rows are under a page (Settings, the admin panel,
+        // a stream): their GIFs wait, as when the window is hidden.
+        let rows_shown = self.main_on_screen();
 
-        let mut any_playing = false;
         let mut blits: Vec<(i32, slint::Image)> = Vec::new();
-        for (&row_id, player) in &mut self.gifs {
-            match player.step(DT_MS) {
-                GifStep::Idle => {}
-                GifStep::Blit {
-                    rgba,
-                    width,
-                    height,
-                } => blits.push((row_id, ui::convert::rgba_image(&rgba, width, height))),
-                GifStep::Freeze { first } => blits.push((row_id, first)),
+        if rows_shown {
+            for (&row_id, player) in &mut self.gifs {
+                match player.step(dt_ms) {
+                    GifStep::Idle => {}
+                    GifStep::Blit(pixels) => {
+                        blits.push((row_id, slint::Image::from_rgba8(pixels)));
+                    }
+                    GifStep::Freeze { first } => blits.push((row_id, first)),
+                }
             }
-            any_playing |= player.playing();
         }
         for (row_id, image) in blits {
-            for i in 0..self.chat_model.row_count() {
+            // The GIFs that play are near the bottom: look from there.
+            for i in (0..self.chat_model.row_count()).rev() {
                 if let Some(mut row) = self.chat_model.row_data(i)
                     && row.row_id == row_id
                 {
@@ -955,16 +1022,23 @@ impl AppState {
             }
         }
 
-        if let Some(img) = step_overlay(&mut self.gallery_gif) {
+        if let Some(img) = step_overlay(&mut self.gallery_gif, dt_ms) {
             self.main.global::<State>().set_viewer_image(img);
         }
-        if let Some(img) = step_overlay(&mut self.preview_gif) {
+        if let Some(img) = step_overlay(&mut self.preview_gif, dt_ms) {
             self.main.global::<State>().set_preview_image(img);
         }
-        any_playing |= self.gallery_gif.is_some() || self.preview_gif.is_some();
 
-        if !any_playing {
-            self.gif_ticker.stop();
+        let rows = self.gifs.values().filter(|_| rows_shown);
+        let next = rows
+            .chain(self.gallery_gif.iter())
+            .chain(self.preview_gif.iter())
+            .filter_map(GifPlayer::due_in_ms)
+            .reduce(f64::min);
+        match next {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            Some(ms) => self.arm_gif_ticker(Duration::from_millis(ms.clamp(16.0, 1000.0) as u64)),
+            None => self.gif_ticker.stop(),
         }
     }
 

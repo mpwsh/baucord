@@ -143,6 +143,9 @@ fn knock(name: Name<'static>) -> io::Result<()> {
     conn.flush()
 }
 
+/// How long a knock's line may take to arrive.
+const KNOCK_WAIT: Duration = Duration::from_secs(1);
+
 /// Accept knocks for the program's life.
 fn serve(listener: Listener, on_show: impl Fn() + Send + 'static) {
     std::thread::Builder::new()
@@ -157,8 +160,15 @@ fn serve(listener: Listener, on_show: impl Fn() + Send + 'static) {
                         continue;
                     }
                 };
+                // A knock is one short line, said at once: a peer that
+                // says more, or nothing, is not waited on (review
+                // 2026-10, P3-9). Any local user can reach the socket on
+                // Linux, and the guard serves one knock at a time.
+                let _ = conn.set_recv_timeout(Some(KNOCK_WAIT));
                 line.clear();
-                if BufReader::new(conn).read_line(&mut line).is_ok() && line.trim() == "show" {
+                if BufReader::new(conn).take(16).read_line(&mut line).is_ok()
+                    && line.trim() == "show"
+                {
                     on_show();
                 }
             }

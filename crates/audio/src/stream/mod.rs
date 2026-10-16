@@ -11,4 +11,6 @@ pub(crate) mod pace;
 #[cfg(target_os = "windows")]
 mod process_loopback;
 
-pub use decoder::{OutputSelection, StreamAudioPacket, StreamAudioStats, StreamDecoder};
+pub use decoder::{
+    OutputSelection, StreamAudioPacket, StreamAudioSender, StreamAudioStats, StreamDecoder,
+};

@@ -27,22 +27,23 @@ fn main() {
 
     #[cfg(not(debug_assertions))]
     {
-        use std::fs::OpenOptions;
-
         use env_logger::Target;
+        use frontend::logfile::{FileSink, SinkWriter};
 
-        // Single append-mode log: every run keeps writing baucord.log.
-        match OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("baucord.log")
-        {
-            Ok(log_file) => {
-                logger().target(Target::Pipe(Box::new(log_file))).init();
-                // Settings → Debug shows, sends and clears it.
-                if let Ok(dir) = std::env::current_dir() {
-                    frontend::logfile::set_path(dir.join("baucord.log"));
-                }
+        // baucord.log in the config folder (beside settings.json),
+        // rolled over to baucord.log.1 past 5 MB like the phones'. It
+        // was appended to for ever in the working folder (review
+        // 2026-10, P2-47). `open` names it for Settings → Debug, which
+        // shows, sends and clears it.
+        let dir = client::config::settings_file_path()
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        let _ = std::fs::create_dir_all(&dir);
+        match FileSink::open(&dir) {
+            Ok(sink) => {
+                let writer = SinkWriter(std::sync::Arc::new(sink));
+                logger().target(Target::Pipe(Box::new(writer))).init();
             }
             Err(e) => {
                 // Read-only install dir etc. — run without file logging

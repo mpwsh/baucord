@@ -8,13 +8,13 @@
 // Lists are filled by the host from the matching `AdminOutcome`;
 // `AdminState.busy` is the tab's refresh in flight.
 
-import { ScrollView } from "std-widgets.slint";
-import { Icon, IconSet, IconDisplay } from "@lucide";
+import { ListView, ScrollView } from "std-widgets.slint";
+import { IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
 import { State } from "globals.slint";
-import { Btn, IconBtn, Field, FieldLabel, Hint, Sep, Dropdown, CheckRow, RoleGlyph } from "widgets.slint";
-import { NavItem, PanelHeader } from "settings.slint";
+import { Btn, IconBtn, Field, FieldLabel, Hint, Sep, Dropdown, CheckRow, RoleGlyph, Modal } from "widgets.slint";
+import { NavItem, NavScroll, PanelHeader } from "settings.slint";
 
 export struct AdminUserRow {
     user-id: string,        // hex, the target for actions
@@ -416,12 +416,20 @@ component UserCard inherits Row {
     }
 }
 
+// The people are a list a server can make long: they scroll in a
+// ListView under the tab's head, which builds only the rows in view
+// (every row, with its pickers, was built at once; review 2026-10,
+// P3-23).
 component UsersTab inherits VerticalLayout {
     in property <bool> compact;
+    in property <length> pad;
+    padding: root.pad;
     spacing: Theme.gap-md;
     TabHead { title: Tr.admin-users; lead: Tr.admin-users-lead; tab: 0; }
     if AdminState.users.length == 0 && !AdminState.busy : Empty { text: Tr.admin-none; }
-    VerticalLayout {
+    ListView {
+        vertical-stretch: 1;
+        mouse-drag-pan-enabled: State.touch-host;
         for u in AdminState.users : VerticalLayout {
             if !root.compact : UserLine { u: u; }
             if root.compact : UserCard { u: u; }
@@ -794,17 +802,24 @@ component AuditCard inherits Row {
     }
 }
 
+// The audit grows a page at a time: a ListView too, its column heads
+// and "load more" outside it (P3-23).
 component AuditTab inherits VerticalLayout {
     in property <bool> compact;
+    in property <length> pad;
+    padding: root.pad;
     spacing: Theme.gap-md;
     TabHead { title: Tr.admin-audit; lead: Tr.admin-audit-lead; tab: 6; }
     if AdminState.audit.length == 0 && !AdminState.busy : Empty { text: Tr.admin-none; }
-    if root.compact && AdminState.audit.length > 0 : VerticalLayout {
+    if root.compact && AdminState.audit.length > 0 : ListView {
+        vertical-stretch: 1;
+        mouse-drag-pan-enabled: State.touch-host;
         for e in AdminState.audit : AuditCard { e: e; }
     }
     // A table: fixed columns for when, who and what; the target and
     // the details share the rest. Headers say what each is.
     if !root.compact && AdminState.audit.length > 0 : VerticalLayout {
+        vertical-stretch: 1;
         HorizontalLayout {
             height: 28px;
             padding-left: Theme.gap-xs;
@@ -817,25 +832,29 @@ component AuditTab inherits VerticalLayout {
             ColHead { text: Tr.admin-col-detail; horizontal-stretch: 1; }
         }
         Rectangle { height: 1px; background: Theme.border; }
-        for e in AdminState.audit : Row {
-            row-height: 44px;
-            HorizontalLayout {
-                padding-left: Theme.gap-xs;
-                padding-right: Theme.gap-xs;
-                spacing: Theme.gap-sm;
-                Muted { text: e.when; width: 84px; }
-                Cell { text: e.actor; font-weight: 600; width: 96px; }
-                Cell { text: e.action; color: Theme.accent-text; width: 132px; }
-                Cell { text: e.target; color: Theme.text-secondary; width: 116px; }
-                // Two lines when it needs them, elided past that.
-                Text {
-                    text: e.detail;
-                    color: Theme.text-secondary;
-                    font-size: Theme.font-xs;
-                    vertical-alignment: center;
-                    wrap: word-wrap;
-                    overflow: elide;
-                    horizontal-stretch: 1;
+        ListView {
+            vertical-stretch: 1;
+            mouse-drag-pan-enabled: State.touch-host;
+            for e in AdminState.audit : Row {
+                row-height: 44px;
+                HorizontalLayout {
+                    padding-left: Theme.gap-xs;
+                    padding-right: Theme.gap-xs;
+                    spacing: Theme.gap-sm;
+                    Muted { text: e.when; width: 84px; }
+                    Cell { text: e.actor; font-weight: 600; width: 96px; }
+                    Cell { text: e.action; color: Theme.accent-text; width: 132px; }
+                    Cell { text: e.target; color: Theme.text-secondary; width: 116px; }
+                    // Two lines when it needs them, elided past that.
+                    Text {
+                        text: e.detail;
+                        color: Theme.text-secondary;
+                        font-size: Theme.font-xs;
+                        vertical-alignment: center;
+                        wrap: word-wrap;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
                 }
             }
         }
@@ -976,28 +995,33 @@ component AdminNav inherits VerticalLayout {
     if root.narrow : Rectangle { }
 }
 
-/// The selected tab, scrolling: the wide panel's right column, the
-/// narrow page's second page.
-component AdminContent inherits ScrollView {
+/// The selected tab: the wide panel's right column, the narrow page's
+/// second page. The long lists (people, the audit) scroll in a list of
+/// their own under the tab's head; the other tabs scroll whole.
+component AdminContent inherits Rectangle {
     in property <int> tab;
     in property <bool> compact;
     in property <length> pad: Theme.gap-xl;
     vertical-stretch: 1;
-    // Fluent's ScrollView does not pan on a drag; a finger needs it to
-    // (ANDROID-SPEC.md D27).
-    mouse-drag-pan-enabled: State.touch-host;
-    VerticalLayout {
-        padding: root.pad;
-        alignment: start;
-        if root.tab == 0 : UsersTab { compact: root.compact; }
-        if root.tab == 1 : RolesTab { compact: root.compact; }
-        if root.tab == 2 : RestrictionsTab { compact: root.compact; }
-        if root.tab == 3 : InvitesTab { }
-        if root.tab == 4 : ChannelsTab { }
-        if root.tab == 5 : FilesTab { }
-        if root.tab == 6 : AuditTab { compact: root.compact; }
-        if root.tab == 7 : ServerTab { compact: root.compact; }
-        if root.tab == 8 : ReportsTab { compact: root.compact; }
+    if root.tab == 0 : UsersTab { compact: root.compact; pad: root.pad; }
+    if root.tab == 6 : AuditTab { compact: root.compact; pad: root.pad; }
+    if root.tab != 0 && root.tab != 6 : ScrollView {
+        width: 100%;
+        height: 100%;
+        // Fluent's ScrollView does not pan on a drag; a finger needs it
+        // to (ANDROID-SPEC.md D27).
+        mouse-drag-pan-enabled: State.touch-host;
+        VerticalLayout {
+            padding: root.pad;
+            alignment: start;
+            if root.tab == 1 : RolesTab { compact: root.compact; }
+            if root.tab == 2 : RestrictionsTab { compact: root.compact; }
+            if root.tab == 3 : InvitesTab { }
+            if root.tab == 4 : ChannelsTab { }
+            if root.tab == 5 : FilesTab { }
+            if root.tab == 7 : ServerTab { compact: root.compact; }
+            if root.tab == 8 : ReportsTab { compact: root.compact; }
+        }
     }
 }
 
@@ -1039,9 +1063,13 @@ export component AdminPanel inherits Rectangle {
         Rectangle {
             width: 188px;
             background: Theme.surface;
-            AdminNav {
-                tab: root.tab;
-                picked(t) => { root.open-tab(t); }
+            NavScroll {
+                width: 100%;
+                height: 100%;
+                AdminNav {
+                    tab: root.tab;
+                    picked(t) => { root.open-tab(t); }
+                }
             }
         }
         VerticalLayout {
@@ -1093,13 +1121,15 @@ export component AdminPanel inherits Rectangle {
                 }
             }
         }
-        if !root.section-open : AdminNav {
+        if !root.section-open : NavScroll {
             vertical-stretch: 1;
-            narrow: true;
-            tab: root.tab;
-            picked(t) => {
-                root.open-tab(t);
-                root.section-open = true;
+            AdminNav {
+                narrow: true;
+                tab: root.tab;
+                picked(t) => {
+                    root.open-tab(t);
+                    root.section-open = true;
+                }
             }
         }
         if root.section-open : AdminContent {
@@ -1112,66 +1142,47 @@ export component AdminPanel inherits Rectangle {
     // ── Confirmation (every action that bites goes through it) ─────
     // What it is about, what it does, a reason when the action takes
     // one (kept in the audit and shown to the person), Escape, Back or
-    // Cancel to back out (the page's key handler hands Back here).
-    if AdminState.confirm-open : Rectangle {
-        background: Theme.scrim;
-        TouchArea { clicked => { AdminLogic.confirm-cancel(); } }
-        confirm-keys := FocusScope {
-            init => { self.focus(); }
-            key-pressed(ev) => {
-                if (ev.text == Key.Escape) { AdminLogic.confirm-cancel(); return accept; }
-                reject
+    // Cancel to back out (the page's key handler hands Back here). The
+    // app's own dialog, as every other one (review 2026-10, P3-21):
+    // centred in the panel, which is the page.
+    if AdminState.confirm-open : Modal {
+        card-width: 420px;
+        dismissed => { AdminLogic.confirm-cancel(); }
+        key(ev) => {
+            if (ev.text == Key.Return) { AdminLogic.confirm-accept(); return accept; }
+            reject
+        }
+        Text {
+            text: AdminState.confirm-title;
+            color: Theme.text-primary;
+            font-size: Theme.font-md;
+            font-weight: 600;
+            wrap: word-wrap;
+        }
+        Text {
+            text: AdminState.confirm-text;
+            color: Theme.text-secondary;
+            font-size: Theme.font-sm;
+            wrap: word-wrap;
+        }
+        if AdminState.confirm-asks-reason : VerticalLayout {
+            spacing: Theme.gap-xs;
+            FieldLabel { text: Tr.admin-reason; }
+            Field {
+                text <=> AdminState.confirm-reason;
+                placeholder: Tr.admin-reason-placeholder;
+                accepted => { AdminLogic.confirm-accept(); }
             }
-            Rectangle {
-                x: (parent.width - self.width) / 2;
-                y: (parent.height - self.height) / 2;
-                width: Math.min(420px, root.width - 48px);
-                height: confirm-col.preferred-height;
-                border-radius: Theme.radius-md;
-                background: Theme.bg-secondary;
-                border-width: 1px;
-                border-color: Theme.border;
-                drop-shadow-color: #00000088;
-                drop-shadow-blur: 16px;
-                drop-shadow-offset-y: 6px;
-                TouchArea { }
-                confirm-col := VerticalLayout {
-                    padding: Theme.gap-lg;
-                    spacing: Theme.gap-md;
-                    Text {
-                        text: AdminState.confirm-title;
-                        color: Theme.text-primary;
-                        font-size: Theme.font-md;
-                        font-weight: 600;
-                        wrap: word-wrap;
-                    }
-                    Text {
-                        text: AdminState.confirm-text;
-                        color: Theme.text-secondary;
-                        font-size: Theme.font-sm;
-                        wrap: word-wrap;
-                    }
-                    if AdminState.confirm-asks-reason : VerticalLayout {
-                        spacing: Theme.gap-xs;
-                        FieldLabel { text: Tr.admin-reason; }
-                        Field {
-                            text <=> AdminState.confirm-reason;
-                            placeholder: Tr.admin-reason-placeholder;
-                            accepted => { AdminLogic.confirm-accept(); }
-                        }
-                    }
-                    HorizontalLayout {
-                        spacing: Theme.gap-sm;
-                        Rectangle { }
-                        Btn { text: Tr.cancel; clicked => { AdminLogic.confirm-cancel(); } }
-                        Btn {
-                            text: AdminState.confirm-label;
-                            danger: AdminState.confirm-danger;
-                            accent: !AdminState.confirm-danger;
-                            clicked => { AdminLogic.confirm-accept(); }
-                        }
-                    }
-                }
+        }
+        HorizontalLayout {
+            spacing: Theme.gap-sm;
+            Rectangle { }
+            Btn { text: Tr.cancel; clicked => { AdminLogic.confirm-cancel(); } }
+            Btn {
+                text: AdminState.confirm-label;
+                danger: AdminState.confirm-danger;
+                accent: !AdminState.confirm-danger;
+                clicked => { AdminLogic.confirm-accept(); }
             }
         }
     }

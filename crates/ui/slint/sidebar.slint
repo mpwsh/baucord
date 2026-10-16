@@ -96,10 +96,8 @@ component UserRowView inherits Rectangle {
                     State.card-y = root.absolute-position.y;
                     State.card-anchor-h = root.height;
                     State.card-index = root.index;
-                    Logic.user-hovered(root.index, true);
                 } else if (State.card-index == root.index) {
                     State.card-index = -1;
-                    Logic.user-hovered(root.index, false);
                 }
             }
         }

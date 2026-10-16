@@ -226,7 +226,10 @@ fun cargoNdkArgs(release: Boolean): List<String> {
         "build",
         "-p", "android",
     )
-    if (release) args += "--release"
+    // A release build takes Cargo.lock as written, like the desktop's
+    // and the server's (review 2026-10, P2-29); a debug build may still
+    // update it after a manifest edit.
+    if (release) args += listOf("--release", "--locked")
     if (cargoFeatures.isNotBlank()) {
         args += listOf("--no-default-features", "--features", cargoFeatures)
     }

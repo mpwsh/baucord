@@ -61,6 +61,11 @@ pub struct AudioStats {
     /// dropped before we saw it) plus ring overflows on our side.
     pub input_overruns: AtomicU64,
     pub output_underruns: AtomicU64,
+    /// Errors a cpal stream reported that were not its device going
+    /// away (an xrun, a backend hiccup): counted apart from overruns
+    /// and underruns, which the data path counts.
+    pub input_errors: AtomicU64,
+    pub output_errors: AtomicU64,
 
     // ── Device health (see `VoiceChat::service`) ────────────────────────
     /// The capture stream hit an unrecoverable error (device removed,
@@ -72,6 +77,16 @@ pub struct AudioStats {
     pub default_input_changed: AtomicBool,
     /// The OS default playback device changed since we opened ours.
     pub default_output_changed: AtomicBool,
+    /// A device came or came back (Windows): a side waiting for one is
+    /// tried again soon. Taken by `VoiceChat::service`.
+    pub device_arrived: AtomicBool,
+    /// Rung by [`Self::flag`] with each of the four above: the engine's
+    /// owner waits on it instead of looking at them every second
+    /// (review 2026-10, P2-41). One token; rings it has not seen are one.
+    trouble: (
+        crossbeam_channel::Sender<()>,
+        crossbeam_channel::Receiver<()>,
+    ),
     /// Automatic stream restarts performed so far (both sides).
     pub stream_restarts: AtomicU64,
 
@@ -160,7 +175,39 @@ impl Default for AudioStats {
         Self::new()
     }
 }
+/// The device-health flags of [`AudioStats`], for [`AudioStats::flag`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Health {
+    InputFailed,
+    OutputFailed,
+    DefaultInputChanged,
+    DefaultOutputChanged,
+    DeviceArrived,
+}
+
 impl AudioStats {
+    /// Raise a device-health flag and ring [`Self::trouble`]. From the
+    /// streams' error paths and the device watcher: not from inside a
+    /// real-time callback's every pass (the ring may take a lock when
+    /// the owner is parked).
+    pub fn flag(&self, health: Health) {
+        let flag = match health {
+            Health::InputFailed => &self.input_stream_failed,
+            Health::OutputFailed => &self.output_stream_failed,
+            Health::DefaultInputChanged => &self.default_input_changed,
+            Health::DefaultOutputChanged => &self.default_output_changed,
+            Health::DeviceArrived => &self.device_arrived,
+        };
+        flag.store(true, Ordering::Relaxed);
+        let _ = self.trouble.0.try_send(());
+    }
+
+    /// Rings when a device-health flag was raised.
+    #[must_use]
+    pub fn trouble(&self) -> crossbeam_channel::Receiver<()> {
+        self.trouble.1.clone()
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -177,10 +224,14 @@ impl AudioStats {
             fec_loss_hint_pct: AtomicU32::new(0),
             input_overruns: AtomicU64::new(0),
             output_underruns: AtomicU64::new(0),
+            input_errors: AtomicU64::new(0),
+            output_errors: AtomicU64::new(0),
             input_stream_failed: AtomicBool::new(false),
             output_stream_failed: AtomicBool::new(false),
             default_input_changed: AtomicBool::new(false),
             default_output_changed: AtomicBool::new(false),
+            device_arrived: AtomicBool::new(false),
+            trouble: crossbeam_channel::bounded(1),
             stream_restarts: AtomicU64::new(0),
             link_rtt_ms: AtomicU32::new(0),
             send_bitrate_bps: AtomicU32::new(0),
@@ -301,7 +352,7 @@ impl AudioStats {
 
         format!(
             "Audio ({}s) | Sent {} Recv {} Lost {} ({:.1}%) Late {} | \
-             FEC {} RED {} PLC {} (hint {}%, uplink {}%) | Rate {}k/{}ms{} | Overruns {} Underruns {} Drop {} | Jitter {}ms (target {}ms) | Drift {}/{} | \
+             FEC {} RED {} PLC {} (hint {}%, uplink {}%) | Rate {}k/{}ms{} | Overruns {} Underruns {} Errors {}/{} Drop {} | Jitter {}ms (target {}ms) | Drift {}/{} | \
              BW ↑{:.1}kbps ↓{:.1}kbps | Pkt {}B (avg {:.0}B) | \
              Enc {}µs Dec {}µs | Encode errors {} | Device restarts {} | aec: {}",
             elapsed,
@@ -320,6 +371,8 @@ impl AudioStats {
             if self.red_active.load(Ordering::Relaxed) { "+RED" } else { "" },
             self.input_overruns.load(Ordering::Relaxed),
             self.output_underruns.load(Ordering::Relaxed),
+            self.input_errors.load(Ordering::Relaxed),
+            self.output_errors.load(Ordering::Relaxed),
             self.outgoing_dropped.load(Ordering::Relaxed),
             self.jitter_buffer_occupancy_ms.load(Ordering::Relaxed),
             self.jitter_buffer_target_ms.load(Ordering::Relaxed),

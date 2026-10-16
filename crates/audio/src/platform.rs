@@ -287,6 +287,17 @@ pub fn request_low_latency_buffer(supported: &SupportedBufferSize, sample_rate: 
     }
 }
 
+/// A buffer for an output that only keeps an app alive and plays a
+/// chime (the iPhone's lobby, D51): 4096 frames, about 85 ms, inside
+/// what the device allows — not 10 ms, about 100 callbacks a second for
+/// hours in the background (review 2026-10, P1-7).
+pub fn request_quiet_buffer(supported: &SupportedBufferSize) -> BufferSize {
+    match supported {
+        SupportedBufferSize::Range { min, max } => BufferSize::Fixed(4096u32.clamp(*min, *max)),
+        SupportedBufferSize::Unknown => BufferSize::Fixed(4096),
+    }
+}
+
 // ── Worker wakeups ──────────────────────────────────────────────────────
 
 /// How long a worker blocked on its device latch waits before looking

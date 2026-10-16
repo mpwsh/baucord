@@ -13,6 +13,17 @@ pub enum NoticeKind {
     Activity,
 }
 
+impl NoticeKind {
+    /// The name a host files it under (Android's channels).
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Message => "message",
+            Self::Activity => "activity",
+        }
+    }
+}
+
 /// One notification.
 #[derive(Debug, Clone)]
 pub struct Notice {
@@ -35,6 +46,27 @@ pub struct Notice {
     /// plays an alert chime under its ring/silent switch
     /// ([`ChimeRoute::System`]). Android never gets one.
     pub on_screen: bool,
+    /// Which chime it sounds: a mention used to ring with the DM's
+    /// (review 2026-10, P3-12).
+    pub tone: Tone,
+}
+
+/// The alert chimes a phone plays through the system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    DirectMessage,
+    Mention,
+}
+
+impl Tone {
+    /// The name a host files the chime's sound under.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::DirectMessage => "message",
+            Self::Mention => "mention",
+        }
+    }
 }
 
 /// How an alert chime (a DM, a mention) plays on this host.

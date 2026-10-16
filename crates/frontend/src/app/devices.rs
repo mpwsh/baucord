@@ -18,6 +18,49 @@ impl AppState {
     ) {
         use app_core::devices::{self, DeviceNotice};
 
+        // With nothing picked the engine follows the default by itself
+        // (the watcher on Windows, its own poll elsewhere): this only
+        // says so. It also told the engine to reopen on the default, a
+        // second reopen after every change, and on Windows it compared
+        // the console default while voice followed the communications
+        // one (review 2026-10, P2-9). A picked device that went away
+        // used to be erased from Settings; now the default stands in
+        // until it is back, and the pick is kept.
+        // Every poll, not only a changed one: a pick missing at start
+        // has its stand-in from the first.
+        let present =
+            |devices: &[(String, bool)], name: &str| devices.iter().any(|(n, _)| n == name);
+        // An empty list is a listing that failed, as often as not: no
+        // stand-in on its word.
+        if !new_input.is_empty()
+            && let Some(pick) = self.settings.audio.input.device.clone()
+        {
+            let here = present(&new_input, &pick);
+            if here == self.input_standin {
+                self.input_standin = !here;
+                self.voice
+                    .tx
+                    .send(VoiceControl::SetInputDevice(here.then_some(pick)))
+                    .ok();
+            }
+        }
+        // A phone's outputs are routes the engine follows by itself
+        // (audio::route): a picked headset that went away is stood in
+        // for by Automatic there.
+        if !SINGLE_WINDOW_HOST
+            && !new_output.is_empty()
+            && let Some(pick) = self.settings.audio.output.device.clone()
+        {
+            let here = present(&new_output, &pick);
+            if here == self.output_standin {
+                self.output_standin = !here;
+                self.voice
+                    .tx
+                    .send(VoiceControl::SetOutputDevice(here.then_some(pick)))
+                    .ok();
+                self.sync_stream_output();
+            }
+        }
         let diff = devices::diff(
             &self.last_input_devices,
             &new_input,
@@ -58,23 +101,10 @@ impl AppState {
             self.push_activity(&text);
         }
 
-        if diff.rebuild_input {
-            self.settings.audio.input.device = None;
-            self.voice.tx.send(VoiceControl::SetInputDevice(None)).ok();
-        }
-        // A phone's outputs are routes the engine follows by itself
-        // (audio::route): a picked headset that went away is stood in
-        // for by Automatic until it is back, so the pick is kept.
-        if diff.rebuild_output && !SINGLE_WINDOW_HOST {
-            self.settings.audio.output.device = None;
-            self.voice.tx.send(VoiceControl::SetOutputDevice(None)).ok();
-            self.sync_stream_output();
-            // WASAPI loopback captures from the default output device,
-            // so when that device changes the capture stream dies too.
-            // Restart it if a screen share is currently active.
-            if self.screen.shared.is_sharing.load(Ordering::Relaxed) {
-                self.screen.tx.send(ScreenControl::RestartSystemAudio).ok();
-            }
+        // The share's sound is the system mix, not one device's; a
+        // restart is cheap insurance when the output it plays to moves.
+        if diff.output_moved && self.screen.shared.is_sharing.load(Ordering::Relaxed) {
+            self.screen.tx.send(ScreenControl::RestartSystemAudio).ok();
         }
 
         // The pickers in Settings show what is there now, with the
@@ -118,6 +148,7 @@ impl AppState {
 
     pub fn set_input_device(&mut self, device: Option<String>) {
         self.settings.audio.input.device.clone_from(&device);
+        self.input_standin = false;
         self.voice
             .tx
             .send(VoiceControl::SetInputDevice(device))
@@ -127,6 +158,7 @@ impl AppState {
 
     pub fn set_output_device(&mut self, device: Option<String>) {
         self.settings.audio.output.device.clone_from(&device);
+        self.output_standin = false;
         self.voice
             .tx
             .send(VoiceControl::SetOutputDevice(device))
@@ -142,7 +174,37 @@ impl AppState {
         self.screen
             .shared
             .stream_output
-            .set(self.settings.audio.output.device.as_deref());
+            .set(self.engine_output().as_deref());
+    }
+
+    /// The microphone the engine is told to use: the pick, or the
+    /// default while the pick is unplugged (`input_standin`).
+    pub(super) fn engine_input(&self) -> Option<String> {
+        self.settings
+            .audio
+            .input
+            .device
+            .clone()
+            .filter(|_| !self.input_standin)
+    }
+
+    /// The output, likewise.
+    pub(super) fn engine_output(&self) -> Option<String> {
+        self.settings
+            .audio
+            .output
+            .device
+            .clone()
+            .filter(|_| !self.output_standin)
+    }
+
+    /// The configuration a new engine starts with: the stand-ins
+    /// applied.
+    pub(super) fn engine_config(&self) -> audio::VoiceChatConfig {
+        let mut config = client::voice::engine_config(&self.settings);
+        config.input_device = self.engine_input();
+        config.output_device = self.engine_output();
+        config
     }
 
     pub fn voice_tx(&self) -> &crossbeam_channel::Sender<VoiceControl> {
@@ -172,7 +234,7 @@ impl AppState {
             return;
         }
         self.settings.audio.lowering_told = true;
-        self.settings.save();
+        self.save_settings();
         let text = t!("aec-lowering-told");
         self.push_activity(&text);
         self.show_toast(ToastKind::Warning, &text);
@@ -185,38 +247,62 @@ impl AppState {
     }
 
     pub fn apply_reset_defaults(&mut self) {
+        let before = self.settings.clone();
         self.settings.reset();
         let _ = std::fs::remove_file(client::config::avatar_path());
         self.forget_avatar_blob();
+        // The picture went with the file: the rows stop showing it.
+        self.reload_own_avatar();
         self.profile_dirty = true;
-        self.apply_settings_live();
+        self.apply_settings_live(&before);
     }
 
-    /// Push every setting the Settings page edits to the running app,
-    /// so it behaves as the settings say at once: after Reset to
-    /// defaults, and after the page's Close puts back what it changed
-    /// (`settingsui::discard_and_close`).
-    pub(crate) fn apply_settings_live(&mut self) {
+    /// Push the settings the Settings page edits to the running app, so
+    /// it behaves as they say at once: after Reset to defaults, and
+    /// after the page's Close puts back what it changed
+    /// (`settingsui::discard_and_close`). `before` is what the app ran
+    /// with until now: only an audio setting that differs goes to the
+    /// voice engine — every Close used to reopen the microphone and the
+    /// output, a gap in the call — and the connect view keeps a verdict
+    /// it shows (review 2026-10, P2-2).
+    pub(crate) fn apply_settings_live(&mut self, before: &client::config::Settings) {
         self.apply_text_scale();
         self.push_ui_prefs();
         self.apply_push_to_talk();
-        let audio = &self.settings.audio;
-        for control in [
-            VoiceControl::SetGateThreshold(audio.gate_threshold),
-            VoiceControl::SetInputGain(audio.input.gain),
-            VoiceControl::SetOutputGain(audio.output.gain),
-            VoiceControl::SetInputDevice(audio.input.device.clone()),
-            VoiceControl::SetOutputDevice(audio.output.device.clone()),
-            VoiceControl::SetEchoCancellation(audio.echo_cancellation),
-        ] {
+        let (now, was) = (&self.settings.audio, &before.audio);
+        let mut controls = Vec::new();
+        if now.gate_threshold.to_bits() != was.gate_threshold.to_bits() {
+            controls.push(VoiceControl::SetGateThreshold(now.gate_threshold));
+        }
+        if now.input.gain.to_bits() != was.input.gain.to_bits() {
+            controls.push(VoiceControl::SetInputGain(now.input.gain));
+        }
+        if now.output.gain.to_bits() != was.output.gain.to_bits() {
+            controls.push(VoiceControl::SetOutputGain(now.output.gain));
+        }
+        if now.input.device != was.input.device {
+            controls.push(VoiceControl::SetInputDevice(now.input.device.clone()));
+        }
+        if now.output.device != was.output.device {
+            controls.push(VoiceControl::SetOutputDevice(now.output.device.clone()));
+        }
+        if now.echo_cancellation != was.echo_cancellation {
+            controls.push(VoiceControl::SetEchoCancellation(now.echo_cancellation));
+        }
+        for control in controls {
             self.voice.tx.send(control).ok();
         }
         self.sync_stream_output();
         self.refresh_hotkeys();
         super::apply_log_level(&self.settings);
-        i18n::set_locale(self.settings.language.as_deref());
-        self.push_tr();
-        self.push_connect_fields();
+        if self.settings.language != before.language {
+            i18n::set_locale(self.settings.language.as_deref());
+            self.push_tr();
+            self.relabel_for_language();
+        }
+        self.main
+            .global::<State>()
+            .set_nickname(self.settings.user.nickname.as_str().into());
         self.push_connect_servers();
         // Our name's colour and style, in the roster and our own rows.
         self.update_user_list();
@@ -232,6 +318,21 @@ impl AppState {
         // rebuild views for this.)
         self.push_tr();
         self.push_connect_fields();
+        self.relabel_for_language();
+    }
+
+    /// What Rust words itself, outside `Tr`, in the new language: the
+    /// admin channel's name, the roster (its headers and fallbacks) and
+    /// the tray's menu. They stayed in the old one until something else
+    /// redrew them (review 2026-10, P3-1).
+    pub(crate) fn relabel_for_language(&mut self) {
+        if let Some(meta) = self.session.chat.dm_meta.get_mut(&ADMIN_CHANNEL_KEY) {
+            meta.name = t!("admin-channel");
+        }
+        self.rebuild_dms_model();
+        self.update_user_list();
+        self.sync_tray();
+        crate::settingsui::relabel_licenses(self);
     }
 
     pub fn set_keybind(&mut self, action: BindableAction, bind: String) {
@@ -265,6 +366,7 @@ impl AppState {
     /// merely behind others or minimized (the tray's "Show", a second
     /// launch of the binary): `show()` alone would leave it there.
     pub fn show_main(&self) {
+        self.set_app_shown(true);
         self.main_repaint_arm.set(true);
         let _ = self.main.show();
         self.place_main_once();

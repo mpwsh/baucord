@@ -7,8 +7,9 @@ name: PR check
 # PipeWire, which is the environment these exact commands were last run
 # in by hand (PRODUCTION-PLAN §8). It is a check, not a release build:
 # release.yml's ubuntu:22.04 container, static FFmpeg and glibc floor
-# are not reproduced here. Windows-, macOS-, Android- and iOS-only code
-# is not compiled by this workflow.
+# are not reproduced here. Windows-only code is type-checked by a cross
+# check from Linux (`windows`); macOS-, Android- and iOS-only code is
+# not compiled by this workflow.
 on:
   pull_request:
   push:
@@ -30,17 +31,20 @@ env:
 
 jobs:
   # ── Formatting: seconds ────────────────────────────────────────────
-  # rustfmt.toml uses options only the nightly rustfmt has, so this is
-  # `cargo +nightly fmt`, as on a developer's machine.
+  # .rustfmt.toml uses options only the nightly rustfmt has, so this is
+  # a nightly's `cargo fmt`, as on a developer's machine. A dated one:
+  # a rustfmt that changed overnight failed every open pull request
+  # (review 2026-10, P3-59). Move it on purpose, with a format commit.
   fmt:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-10
           components: rustfmt
       - name: Format check
-        run: cargo +nightly fmt --all -- --check
+        run: cargo +nightly-2026-10-10 fmt --all -- --check
 
   # ── Everything else ────────────────────────────────────────────────
   check:
@@ -93,18 +97,17 @@ jobs:
 
       # --locked: a change to a Cargo.toml without its Cargo.lock fails
       # here instead of resolving silently.
-      - name: Check the desktop build
-        # The workspace's default members: every crate but the phone
-        # hosts (`android`, `ios`), which build only for their targets.
-        run: cargo check --locked --all-targets
+      - name: Lints
+        # The workspace's default members (every crate but the phone
+        # hosts, `android` and `ios`, which build only for their
+        # targets), all targets: the type-check, once — a separate
+        # `cargo check` ran the same compile again (P3-59). Warnings are
+        # reported; only what the workspace denies fails.
+        run: cargo clippy --locked --all-targets
       - name: Check the desktop with the release feature set
         run: cargo check --locked -p desktop --features tray
       - name: Check the phones' shared code
         run: cargo check --locked -p frontend --no-default-features
-
-      - name: Lints
-        # Warnings are reported; only what the workspace denies fails.
-        run: cargo clippy --locked --all-targets
 
       - name: Tests
         # Every crate whose tests need no display. `--no-fail-fast`: one
@@ -113,3 +116,86 @@ jobs:
           cargo test --locked --no-fail-fast
           -p protocol -p transport -p server -p client
           -p app-core -p audio -p video -p i18n -p keywatch
+
+  # ── The chat pane's scrolling ──────────────────────────────────────
+  # The real `ChatPane` driven frame by frame (ANDROID-SPEC D66): the
+  # checks the hand-run harness made, on every change (P3-59). Its own
+  # workspace and lock file, with Slint's software renderer only.
+  chat-scroll-sim:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libfontconfig1-dev
+      - name: Read the pinned Rust toolchain
+        id: toolchain
+        run: |
+          echo "channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: chat-scroll-sim
+          workspaces: tools/chat-scroll-sim
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Run the checks
+        run: cargo run --locked --manifest-path tools/chat-scroll-sim/Cargo.toml
+
+  # ── Windows-only code, type-checked from Linux ─────────────────────
+  # MinGW's headers stand in for the Windows SDK and Debian's FFmpeg
+  # headers for the release's; nothing is linked or run. It catches
+  # what does not compile in WASAPI, DXGI, Media Foundation, Raw Input
+  # and the rest before a release build on Windows does (T6).
+  windows:
+    runs-on: ubuntu-24.04
+    container: debian:13
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: System dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git curl ca-certificates \
+            build-essential pkg-config cmake nasm python3 \
+            clang libclang-dev \
+            gcc-mingw-w64-x86-64-posix g++-mingw-w64-x86-64-posix \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+            libavfilter-dev libswresample-dev
+      - uses: actions/checkout@v7
+      - name: Read the pinned Rust toolchain
+        id: toolchain
+        run: |
+          echo "channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: x86_64-pc-windows-gnu
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-gnu-check
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: FFmpeg headers for bindgen
+        # Only FFmpeg's own folders: the whole multiarch include folder
+        # would bring glibc's headers into a Windows build.
+        run: |
+          set -euo pipefail
+          FF="$RUNNER_TEMP/ffmpeg-headers"
+          mkdir -p "$FF/include" "$FF/lib"
+          for dir in /usr/include/x86_64-linux-gnu/libav* /usr/include/x86_64-linux-gnu/libsw*; do
+            ln -s "$dir" "$FF/include/"
+          done
+          echo "FFMPEG_DIR=$FF" >> "$GITHUB_ENV"
+          echo "BINDGEN_EXTRA_CLANG_ARGS=--sysroot=/usr/x86_64-w64-mingw32 -I/usr/x86_64-w64-mingw32/include" >> "$GITHUB_ENV"
+      - name: Type-check and lint for Windows
+        # The frontend is not here: Skia has no prebuilt for windows-gnu.
+        run: >
+          cargo clippy --locked --target x86_64-pc-windows-gnu
+          -p protocol -p transport -p server -p client
+          -p app-core -p audio -p video -p keywatch

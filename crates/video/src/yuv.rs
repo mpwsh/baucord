@@ -323,7 +323,7 @@ fn to_rgba(
         out.clear();
         out.resize(len, 0);
     }
-    to_rgba_into(src, layout, spec, out, 1)
+    to_rgba_into(src, layout, spec, out, None)
 }
 
 /// Rows per band handed to a thread by [`to_rgba_into`]: small enough
@@ -331,13 +331,113 @@ fn to_rgba(
 /// enough that handing them out costs nothing.
 const BAND_ROWS: usize = 32;
 
+/// Threads parked between pictures, each taking bands of rows of the
+/// next one as [`to_rgba_into`] hands them out. Started once: a scope
+/// per picture started (and joined) up to three threads per frame, 180
+/// a second at 60 fps (review 2026-10, P2-35). Parked on a channel,
+/// they cost nothing between pictures; dropping the pool ends them.
+pub struct BandPool {
+    jobs: Vec<std::sync::mpsc::Sender<Job>>,
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+/// A picture's band loop, borrowed for the length of one
+/// [`BandPool::run`], which does not return before every worker has
+/// said it is finished with it.
+struct Job(*const (dyn Fn() + Sync));
+
+// SAFETY: the closure is `Sync`, and `BandPool::run` keeps it alive
+// until every worker it was sent to is done with it.
+unsafe impl Send for Job {}
+
+impl BandPool {
+    /// A pool converting on `threads` threads, the caller's included:
+    /// `threads - 1` are started here. `None` when one thread is all
+    /// there is.
+    #[must_use]
+    pub fn new(threads: usize) -> Option<Self> {
+        if threads < 2 {
+            return None;
+        }
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let mut jobs = Vec::with_capacity(threads - 1);
+        for i in 1..threads {
+            let (tx, rx) = std::sync::mpsc::channel::<Job>();
+            let done_tx = done_tx.clone();
+            let started = std::thread::Builder::new()
+                .name(format!("yuv-band-{i}"))
+                .spawn(move || {
+                    while let Ok(job) = rx.recv() {
+                        // SAFETY: see `Job`: `run` is still waiting.
+                        let work = unsafe { &*job.0 };
+                        // A panic leaves its band unconverted, and the
+                        // thread parked for the next picture.
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+                        if done_tx.send(()).is_err() {
+                            break;
+                        }
+                    }
+                });
+            if started.is_ok() {
+                jobs.push(tx);
+            }
+        }
+        (!jobs.is_empty()).then_some(Self { jobs, done })
+    }
+
+    /// Threads a picture is spread over, the caller's included.
+    #[must_use]
+    pub fn threads(&self) -> usize {
+        self.jobs.len() + 1
+    }
+
+    /// Run `work` on every pooled thread and on this one, returning once
+    /// all of them have finished — also when this thread's run panics.
+    fn run(&self, work: &(dyn Fn() + Sync)) {
+        struct WaitForAll<'a> {
+            done: &'a std::sync::mpsc::Receiver<()>,
+            sent: usize,
+        }
+        impl Drop for WaitForAll<'_> {
+            fn drop(&mut self) {
+                for _ in 0..self.sent {
+                    // A worker gone is a worker no longer using `work`.
+                    if self.done.recv().is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let work_ptr: *const (dyn Fn() + Sync + '_) = work;
+        // SAFETY: only the lifetime is erased; `WaitForAll` keeps `work`
+        // borrowed until every worker sent it has reported back.
+        // A cast cannot lengthen a trait object's lifetime; a transmute
+        // between the two pointer types is the way.
+        #[allow(clippy::transmute_ptr_to_ptr)]
+        let work_ptr = unsafe {
+            std::mem::transmute::<*const (dyn Fn() + Sync + '_), *const (dyn Fn() + Sync + 'static)>(
+                work_ptr,
+            )
+        };
+        let mut wait = WaitForAll {
+            done: &self.done,
+            sent: 0,
+        };
+        for jobs in &self.jobs {
+            if jobs.send(Job(work_ptr)).is_ok() {
+                wait.sent += 1;
+            }
+        }
+        work();
+    }
+}
+
 /// Convert the visible rectangle of `src` (laid out as `layout` says)
 /// into tightly packed RGBA in `out`, of exactly `width × height × 4`
-/// bytes — the buffer the picture will be drawn from — on up to
-/// `threads` threads (the caller's included), which take bands of rows
-/// as they come free. A 1080p picture is ~2 M pixels: on a mid-range phone one
-/// core takes ~25 ms over it (2026-10-08, MOB-18), more than a 60 fps
-/// frame has.
+/// bytes — the buffer the picture will be drawn from — on this thread
+/// and those of `pool`, which take bands of rows as they come free. A
+/// 1080p picture is ~2 M pixels: on a mid-range phone one core takes
+/// ~25 ms over it (2026-10-08, MOB-18), more than a 60 fps frame has.
 ///
 /// # Errors
 /// The source is too small for the layout (or a stride is zero), or
@@ -348,7 +448,7 @@ pub fn to_rgba_into(
     layout: &Yuv420Layout,
     spec: ColorSpec,
     out: &mut [u8],
-    threads: usize,
+    pool: Option<&BandPool>,
 ) -> Result<(), String> {
     let need = layout.required_len();
     if src.len() < need {
@@ -376,18 +476,16 @@ pub fn to_rgba_into(
     }
     let co = Coeffs::new(spec);
     let row_bytes = width * 4;
-    let threads = threads.clamp(1, height.div_ceil(BAND_ROWS));
-    if threads == 1 {
+    let Some(pool) = pool.filter(|_| height > BAND_ROWS) else {
         convert_rows(src, layout, &co, 0, out);
         return Ok(());
-    }
-    let bands: Vec<(usize, &mut [u8])> = out
+    };
+    let bands = out
         .chunks_mut(BAND_ROWS * row_bytes)
         .enumerate()
-        .map(|(i, band)| (i * BAND_ROWS, band))
-        .collect();
-    let queue = std::sync::Mutex::new(bands.into_iter());
-    let work = || loop {
+        .map(|(i, band)| (i * BAND_ROWS, band));
+    let queue = std::sync::Mutex::new(bands);
+    pool.run(&|| loop {
         let next = match queue.lock() {
             Ok(mut q) => q.next(),
             Err(poisoned) => poisoned.into_inner().next(),
@@ -396,12 +494,6 @@ pub fn to_rgba_into(
             break;
         };
         convert_rows(src, layout, &co, first_row, band);
-    };
-    std::thread::scope(|scope| {
-        for _ in 1..threads {
-            scope.spawn(work);
-        }
-        work();
     });
     Ok(())
 }
@@ -902,9 +994,16 @@ mod tests {
         let src = noise(&layout);
         let mut one = vec![0u8; 1280 * 722 * 4];
         let mut four = vec![0u8; 1280 * 722 * 4];
-        to_rgba_into(&src, &layout, ColorSpec::default(), &mut one, 1).unwrap();
-        to_rgba_into(&src, &layout, ColorSpec::default(), &mut four, 4).unwrap();
+        let pool = BandPool::new(4).unwrap();
+        assert_eq!(pool.threads(), 4);
+        to_rgba_into(&src, &layout, ColorSpec::default(), &mut one, None).unwrap();
+        to_rgba_into(&src, &layout, ColorSpec::default(), &mut four, Some(&pool)).unwrap();
         assert!(one == four);
+        // The parked threads take the next picture too.
+        four.fill(0);
+        to_rgba_into(&src, &layout, ColorSpec::default(), &mut four, Some(&pool)).unwrap();
+        assert!(one == four);
+        assert!(BandPool::new(1).is_none());
     }
 
     #[test]
@@ -912,6 +1011,6 @@ mod tests {
         let layout = Yuv420Layout::planar(16, 16, 16, 16);
         let src = vec![0u8; layout.required_len()];
         let mut out = vec![0u8; 16 * 15 * 4];
-        assert!(to_rgba_into(&src, &layout, ColorSpec::default(), &mut out, 2).is_err());
+        assert!(to_rgba_into(&src, &layout, ColorSpec::default(), &mut out, None).is_err());
     }
 }

@@ -30,7 +30,7 @@ use objc2_avf_audio::{
     AVAudioSessionPortBluetoothA2DP, AVAudioSessionPortBluetoothHFP, AVAudioSessionPortBluetoothLE,
     AVAudioSessionPortBuiltInReceiver, AVAudioSessionPortBuiltInSpeaker,
     AVAudioSessionPortCarAudio, AVAudioSessionPortHDMI, AVAudioSessionPortHeadphones,
-    AVAudioSessionPortOverride, AVAudioSessionPortUSBAudio,
+    AVAudioSessionPortOverride, AVAudioSessionPortUSBAudio, AVAudioSessionSetActiveOptions,
 };
 use objc2_foundation::{
     NSNotification, NSNotificationCenter, NSNumber, NSObjectProtocol, NSString,
@@ -43,11 +43,21 @@ use crate::{
 
 /// The host's category options (`crates/ios/src/session.rs`), set again
 /// with the mode: the loudspeaker rather than the earpiece, a Bluetooth
-/// headset with its microphone or as output only.
-fn options() -> AVAudioSessionCategoryOptions {
-    AVAudioSessionCategoryOptions::DefaultToSpeaker
+/// headset with its microphone or as output only — and, out of a call,
+/// mixed with other apps. Since D51 the session is active from connect
+/// for the lobby's output, which only keeps the app alive: unmixed, it
+/// stopped music or a podcast at connect and kept it stopped in the
+/// lobby (review 2026-10, P1-7; MOB-19). In a call, voice chat takes
+/// the audio as a call does.
+fn options(voice: bool) -> AVAudioSessionCategoryOptions {
+    let base = AVAudioSessionCategoryOptions::DefaultToSpeaker
         | AVAudioSessionCategoryOptions::AllowBluetoothHFP
-        | AVAudioSessionCategoryOptions::AllowBluetoothA2DP
+        | AVAudioSessionCategoryOptions::AllowBluetoothA2DP;
+    if voice {
+        base
+    } else {
+        base | AVAudioSessionCategoryOptions::MixWithOthers
+    }
 }
 
 /// `voiceChat` (the voice-call path) or `default`. Call with no stream
@@ -72,7 +82,7 @@ pub fn set_voice_mode(voice: bool) {
         return;
     };
     // SAFETY: valid category, mode and options for the shared session.
-    match unsafe { session.setCategory_mode_options_error(category, mode, options()) } {
+    match unsafe { session.setCategory_mode_options_error(category, mode, options(voice)) } {
         Ok(()) => info!("audio session: mode {mode}"),
         Err(e) => warn!("audio session mode {mode}: {}", e.localizedDescription()),
     }
@@ -95,6 +105,38 @@ pub fn prefer_voice_io() {
             "audio session: preferred buffer: {}",
             e.localizedDescription()
         );
+    }
+}
+
+/// Out of a room: the session's preferred IO buffer back to a long one
+/// for the lobby's silent output. The 10 ms a voice unit asked for
+/// stayed, about 100 callbacks and worker passes a second for hours in
+/// the background (review 2026-10, P1-7).
+pub fn prefer_quiet_io() {
+    // SAFETY: the shared session; a plain setter.
+    let session = unsafe { AVAudioSession::sharedInstance() };
+    if let Err(e) = unsafe { session.setPreferredIOBufferDuration_error(0.1) } {
+        debug!(
+            "audio session: preferred buffer: {}",
+            e.localizedDescription()
+        );
+    }
+}
+
+/// A call ended (its voice unit closed, no stream open yet): let go of
+/// the session for a moment, telling an app the call interrupted (a
+/// podcast) that it may resume. The lobby's output activates it again,
+/// mixed with others ([`options`]).
+pub fn end_call() {
+    // SAFETY: the shared session; no stream of ours is running.
+    let session = unsafe { AVAudioSession::sharedInstance() };
+    if let Err(e) = unsafe {
+        session.setActive_withOptions_error(
+            false,
+            AVAudioSessionSetActiveOptions::NotifyOthersOnDeactivation,
+        )
+    } {
+        debug!("audio session: deactivate: {}", e.localizedDescription());
     }
 }
 
@@ -241,8 +283,8 @@ impl SessionWatch {
                 info!("voice processing: interrupted (a call, Siri, an alarm)");
             } else {
                 info!("voice processing: interruption over; reopening");
-                failed.input_stream_failed.store(true, Ordering::Relaxed);
-                failed.output_stream_failed.store(true, Ordering::Relaxed);
+                failed.flag(crate::stats::Health::InputFailed);
+                failed.flag(crate::stats::Health::OutputFailed);
             }
         });
         if let Some(name) = interruption {
@@ -262,8 +304,8 @@ impl SessionWatch {
         let failed = stats.clone();
         let was_reset = RcBlock::new(move |_note: NonNull<NSNotification>| {
             warn!("voice processing: the media services were reset; reopening");
-            failed.input_stream_failed.store(true, Ordering::Relaxed);
-            failed.output_stream_failed.store(true, Ordering::Relaxed);
+            failed.flag(crate::stats::Health::InputFailed);
+            failed.flag(crate::stats::Health::OutputFailed);
         });
         if let Some(name) = reset {
             // SAFETY: as above.

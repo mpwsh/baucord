@@ -9,7 +9,7 @@ workspace = true
 
 [dependencies]
 log.workspace = true
-thiserror = "2"
+thiserror.workspace = true
 
 # Desktop-only backends. iOS/Android builds get stub implementations
 # whose constructors fail cleanly (see src/capture.rs, src/codec_stub.rs);
@@ -92,10 +92,17 @@ xcap = "0.9.8"
 # macOS-14 symbol crashed 1.1.5 on Ventura), x11grab/xcbgrab (which
 # linked Homebrew's X11 into the same binary), dshow/Media Foundation
 # on Windows. Not linking it is what makes the release static for real.
+# Nor libavfilter or libswresample: the share encodes and scales,
+# nothing more (review 2026-10, P3-38). `format` stays only because
+# ffmpeg-next's `codec` module does not compile without it (8.1 names
+# `crate::format` unconditionally); nothing calls libavformat.
 ffmpeg-next = { version = "8", default-features = false, features = [
   "codec",
-  "filter",
   "format",
-  "software-resampling",
   "software-scaling",
 ] }
+
+# X11 sharing reads the screen only where DAMAGE says it changed
+# (`src/x11.rs`); already in the tree through keywatch and arboard.
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", features = ["damage"] }

@@ -22,16 +22,21 @@
 //! lasted, about 83 wakes a second (review P1-3).
 //!
 //! The events are trusted only once they have shown they arrive. A
-//! fresh watcher also reads on a slow clock ([`HEARTBEAT`]): a press
-//! that the clock finds and no event announced means the events do
-//! not reach this process (another registration took them, a tap that
-//! delivers nothing), and the watcher reads every [`POLL`] from then
-//! on, as it always did. After [`PROVEN_PRESSES`] presses that events
-//! did announce, the clock stops.
+//! fresh watcher also reads on a slow clock ([`HEARTBEAT`], backing
+//! off to [`HEARTBEAT_MAX`] while nothing happens): a press that the
+//! clock finds — the full timeout passed, nothing woke the thread —
+//! and no event announced means the events do not reach this process
+//! (another registration took them, a tap that delivers nothing), and
+//! the watcher reads every [`POLL`] from then on, as it always did.
+//! After [`PROVEN_PRESSES`] presses that events did announce, the
+//! clock stops, for every later watcher of the process too: a rebind
+//! or a reconnect starts a new one, and default keys are pressed
+//! rarely enough that each one sat at 4 Hz for most of a session
+//! (review 2026-10, P2-34).
 
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         mpsc, Arc,
     },
     thread::JoinHandle,
@@ -62,18 +67,45 @@ pub use keys::platform_key;
 
 /// How often the bound keys are read while one is held, right after a
 /// key event, and always where there are no events to wait for.
-pub const POLL: Duration = Duration::from_millis(12);
+pub(crate) const POLL: Duration = Duration::from_millis(12);
 
 /// Reads after a key event (and at the start), [`POLL`] apart: the
 /// event can reach this thread before the state it announces does.
 const SETTLE_PASSES: u8 = 3;
 
 /// The slow clock a fresh watcher also reads on, until its events have
-/// proven themselves.
+/// proven themselves: this long after a key event (or the start), and
+/// twice as long after each quiet beat, up to [`HEARTBEAT_MAX`].
 const HEARTBEAT: Duration = Duration::from_millis(250);
+
+/// The heartbeat's longest sleep. A press found on it is still
+/// reported, up to this late, where the events fail.
+const HEARTBEAT_MAX: Duration = Duration::from_secs(4);
 
 /// Presses announced by an event before the heartbeat stops.
 const PROVEN_PRESSES: u8 = 3;
+
+/// The presses events announced in this process so far, over every
+/// watcher; [`PROVEN_PRESSES`] or more and a new watcher trusts its
+/// events from the start.
+static ANNOUNCED: AtomicU8 = AtomicU8::new(0);
+
+/// What ended a [`Source::wait`].
+// Where there are no key events (`none.rs`) only `Other` is made.
+#[cfg_attr(
+    not(any(target_os = "windows", target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Woke {
+    /// A key of interest changed.
+    Key,
+    /// The whole timeout passed, and nothing else woke the thread.
+    TimedOut,
+    /// Anything else: a kick, another key, a message for someone
+    /// else, a wait that failed. Says nothing about the events.
+    Other,
+}
 
 /// One binding as the watcher reads it.
 // The three parts of a chord and the kind of binding: a yes or no each.
@@ -143,10 +175,11 @@ pub(crate) trait Source {
     fn modifier_down(&self, modifier: Modifier) -> bool;
     /// Whether [`Self::wait`] can be woken by a key event.
     fn has_events(&self) -> bool;
-    /// Sleep until a key of interest changes (`true`), or `timeout`
-    /// passes or the watcher is kicked (`false`). `None` waits for as
-    /// long as it takes; only asked of a source that has events.
-    fn wait(&mut self, timeout: Option<Duration>) -> bool;
+    /// Sleep until a key of interest changes, `timeout` passes, or
+    /// something else wakes the thread (the watcher is kicked, say).
+    /// `None` waits for as long as it takes; only asked of a source
+    /// that has events.
+    fn wait(&mut self, timeout: Option<Duration>) -> Woke;
 }
 
 /// Wakes a [`Source::wait`] from another thread.
@@ -203,7 +236,7 @@ impl Watcher {
                 if ready_tx.send(Some((kick, source.has_events()))).is_err() {
                     return;
                 }
-                watch(&mut source, &bindings, &stop, &report);
+                watch(&mut source, &bindings, &stop, &ANNOUNCED, &report);
             }
         });
         let thread = match spawned {
@@ -266,26 +299,31 @@ enum Trust {
 }
 
 /// The watcher thread's loop: read the bound keys, report the edges,
-/// sleep until there is a reason to read again.
+/// sleep until there is a reason to read again. `announced` is the
+/// process's count of presses its events announced ([`ANNOUNCED`]).
 fn watch<A: Copy>(
     source: &mut impl Source,
     bindings: &[Binding<A>],
     stop: &AtomicBool,
+    announced: &AtomicU8,
     report: &impl Fn(A, bool) -> bool,
 ) {
     let mut down = vec![false; bindings.len()];
     let mut trust = if source.has_events() {
-        Trust::Probation(0)
+        match announced.load(Ordering::Relaxed) {
+            n if n >= PROVEN_PRESSES => Trust::Events,
+            n => Trust::Probation(n),
+        }
     } else {
         Trust::Clock
     };
     info!(
         "Key watcher: {} binding(s), {}",
         bindings.len(),
-        if trust == Trust::Clock {
-            "read on a clock"
-        } else {
-            "woken by key events"
+        match trust {
+            Trust::Clock => "read on a clock",
+            Trust::Probation(_) => "woken by key events",
+            Trust::Events => "woken by key events, proven",
         }
     );
     // Passes left of the reads that follow a key event, and whether
@@ -294,6 +332,7 @@ fn watch<A: Copy>(
     // are read like an event's.
     let mut settle = SETTLE_PASSES;
     let mut on_heartbeat = false;
+    let mut beat = HEARTBEAT;
     'watching: while !stop.load(Ordering::Acquire) {
         if !source.refresh() {
             warn!("Key watcher: the key state stopped answering; keybinds are off until reconnect");
@@ -312,17 +351,21 @@ fn watch<A: Copy>(
                 break 'watching;
             }
         }
-        if pressed_now && let Trust::Probation(announced) = trust {
+        if pressed_now && let Trust::Probation(announced_here) = trust {
             trust = if on_heartbeat {
                 warn!(
                     "Key watcher: a key was pressed and no event said so; reading on a clock \
                      from here on"
                 );
                 Trust::Clock
-            } else if settle > 0 && announced + 1 >= PROVEN_PRESSES {
-                Trust::Events
             } else if settle > 0 {
-                Trust::Probation(announced + 1)
+                let count = announced_here + 1;
+                announced.fetch_max(count, Ordering::Relaxed);
+                if count >= PROVEN_PRESSES {
+                    Trust::Events
+                } else {
+                    Trust::Probation(count)
+                }
             } else {
                 trust
             };
@@ -331,14 +374,26 @@ fn watch<A: Copy>(
         let timeout = match trust {
             Trust::Clock => Some(POLL),
             _ if held || settle > 0 => Some(POLL),
-            Trust::Probation(_) => Some(HEARTBEAT),
+            Trust::Probation(_) => Some(beat),
             Trust::Events => None,
         };
-        on_heartbeat = !held && settle == 0 && matches!(trust, Trust::Probation(_));
+        let resting = !held && settle == 0 && matches!(trust, Trust::Probation(_));
         settle = settle.saturating_sub(1);
-        if source.wait(timeout) {
-            settle = SETTLE_PASSES;
-            on_heartbeat = false;
+        on_heartbeat = false;
+        match source.wait(timeout) {
+            Woke::Key => {
+                settle = SETTLE_PASSES;
+                beat = HEARTBEAT;
+            }
+            // Only a beat that ran its course found what it finds on
+            // its own: Windows also wakes for messages that are not
+            // the key's, and a press read then, its event still on the
+            // way, sent the watcher to the clock for good.
+            Woke::TimedOut if resting => {
+                on_heartbeat = true;
+                beat = (beat * 2).min(HEARTBEAT_MAX);
+            }
+            Woke::TimedOut | Woke::Other => {}
         }
     }
     // Stopped (a disconnect, a rebind) with a hold held: let it go, or

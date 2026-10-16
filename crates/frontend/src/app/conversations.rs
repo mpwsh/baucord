@@ -11,7 +11,7 @@ use super::*;
 impl AppState {
     /// Mirror a history delta into the `VecModel` (drop from front, append
     /// the converted new rows).
-    pub(super) fn sync_history_tail(&mut self, delta: &app_core::chat::HistoryDelta) {
+    pub(crate) fn sync_history_tail(&mut self, delta: &app_core::chat::HistoryDelta) {
         for _ in 0..delta.dropped_front {
             if self.chat_model.row_count() > 0 {
                 self.evict_row(0);
@@ -104,7 +104,7 @@ impl AppState {
                     own: Some(m.user_id) == self.session.our_user_id,
                     pending: false,
                 };
-                (meta, app_core::emoji::replace_shortcodes(&m.text), m.edited)
+                (meta, app_core::emoji::for_display(&m.text), m.edited)
             })
             .collect();
         if key == self.session.chat.active_dm {
@@ -172,6 +172,12 @@ impl AppState {
     /// a parked one in and back out around it. The pane keeps showing
     /// the real active conversation: only `switch_conversation` moves
     /// `State.chat`.
+    /// A conversation other than the shown one is swapped in for a
+    /// moment (`with_conversation`).
+    pub(crate) fn conversation_borrowed(&self) -> bool {
+        self.borrowed_conversation
+    }
+
     pub(super) fn with_conversation<R>(
         &mut self,
         key: Option<client::UserId>,
@@ -230,8 +236,10 @@ impl AppState {
             let s = self.main.global::<State>();
             s.set_chat(ModelRc::from(self.chat_model.clone()));
             s.set_history_more(self.session.chat.history_more);
-            s.set_history_loading(false);
-            self.session.chat.history_page_pending = None;
+            // A page still in flight for another conversation stays
+            // owed to it: forgetting it here made that page arrive as
+            // the replay, appended at the bottom (review 2026-10, P2-4).
+            s.set_history_loading(self.session.chat.history_page_pending == Some(key));
         }
         let s = self.main.global::<State>();
         match key {
@@ -284,13 +292,26 @@ impl AppState {
         self.main.invoke_focus_composer();
     }
 
+    /// A parked conversation goes from memory, its pictures and GIF
+    /// players with it: they stayed in the picture store until the next
+    /// connect, 10–40 MB a picture-heavy DM (review 2026-10, P2-31).
+    pub(super) fn drop_parked(&mut self, key: Option<client::UserId>) {
+        let Some(conversation) = self.session.chat.parked.remove(&key) else {
+            return;
+        };
+        for row in conversation.model.iter().filter(|row| row.kind == 2) {
+            crate::pictures::remove(row.row_id);
+            self.gifs.remove(&row.row_id);
+        }
+    }
+
     /// Hide a DM from the list. Nothing is deleted: the server keeps
     /// the conversation, and the next message brings it back.
     pub(super) fn close_dm(&mut self, user: client::UserId) {
         if self.session.chat.active_dm == Some(user) {
             self.switch_conversation(None);
         }
-        self.session.chat.parked.remove(&Some(user));
+        self.drop_parked(Some(user));
         self.session.chat.dm_meta.remove(&user);
         self.session.chat.dm_order.retain(|u| *u != user);
         self.set_dm_hidden(user, true);
@@ -313,7 +334,7 @@ impl AppState {
         } else {
             return;
         }
-        self.settings.save();
+        self.save_settings();
     }
 
     pub(super) fn dm_hidden(&self, user: &client::UserId) -> bool {
@@ -401,12 +422,7 @@ impl AppState {
             .filter_map(|user| {
                 let meta = self.session.chat.dm_meta.get(user)?;
                 total += meta.unread;
-                let client = self
-                    .session
-                    .details
-                    .iter()
-                    .find(|(_, (u, _))| u == user)
-                    .map(|(c, _)| *c);
+                let client = self.session_of(user);
                 let name = client
                     .and_then(|c| self.session.users.get(&c))
                     .map_or(meta.name.clone(), |u| u.username.clone());
@@ -435,7 +451,19 @@ impl AppState {
                 Some(row)
             })
             .collect();
-        self.dms_model.set_vec(rows);
+        // Most calls change nothing, or one row (presence, a picture,
+        // an unread count): only those rows are written, and only a
+        // list of another length is replaced. Each call used to
+        // re-instantiate every row (review 2026-10, P2-32).
+        if rows.len() == self.dms_model.row_count() {
+            for (i, row) in rows.into_iter().enumerate() {
+                if self.dms_model.row_data(i).as_ref() != Some(&row) {
+                    self.dms_model.set_row_data(i, row);
+                }
+            }
+        } else {
+            self.dms_model.set_vec(rows);
+        }
         let s = self.main.global::<State>();
         s.set_dm_unread_total(i32::try_from(total).unwrap_or(i32::MAX));
         if let Some(user) = self.session.chat.active_dm {
@@ -504,10 +532,13 @@ impl AppState {
             self.with_conversation(Some(from), |app| {
                 match &body {
                     Incoming::Text(text) => {
-                        let text = app_core::emoji::replace_shortcodes(text);
+                        let text = app_core::emoji::for_display(text);
                         app.push_message_here(&meta, &text, false);
                     }
-                    Incoming::File(file) => app.push_file_here(&meta, file.clone()),
+                    Incoming::File(file) => {
+                        app.want_picture(file, Some(from), id);
+                        app.push_file_here(&meta, file.clone());
+                    }
                 }
                 app.session.oldest_history_id.get_or_insert(id);
             });
@@ -523,7 +554,7 @@ impl AppState {
         }
         // The chime on screen; a notification off screen on a phone.
         let text = match &body {
-            Incoming::Text(text) => app_core::emoji::replace_shortcodes(text),
+            Incoming::Text(text) => app_core::emoji::for_display(text),
             Incoming::File(file) => t!("notif-dm-file", "name" => file.name.as_str()),
         };
         self.alert_direct_message(from, username, &text);
@@ -554,7 +585,7 @@ impl AppState {
             own: true,
             pending: true,
         };
-        let body = app_core::emoji::replace_shortcodes(&text);
+        let body = app_core::emoji::for_display(&text);
         self.push_message_here(&meta, &body, false);
         self.session
             .chat
@@ -688,10 +719,5 @@ impl AppState {
             }
         }
         row
-    }
-
-    /// Public mirror-sync for media.rs (image rows).
-    pub fn sync_delta(&mut self, delta: &app_core::chat::HistoryDelta) {
-        self.sync_history_tail(delta);
     }
 }

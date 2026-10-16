@@ -64,9 +64,8 @@ use std::{
 
 use ffmpeg::{
     codec::{self, encoder, packet::Packet},
-    format::Pixel,
     software::scaling::{Context as SwsContext, Flags},
-    util::frame::video::Video as VideoFrame,
+    util::{format::Pixel, frame::video::Video as VideoFrame},
     Dictionary, Rational,
 };
 
@@ -249,11 +248,21 @@ impl FfmpegEncoder {
     /// preset's nominal resolution so "no usable encoder" is reported
     /// here, up front, rather than mid-stream.
     pub fn new(quality: Quality) -> Result<Self, CodecError> {
+        Self::new_without(quality, &[])
+    }
+
+    /// [`Self::new`], passing over the encoders in `skip`: the one that
+    /// kept failing mid-share is not taken again (review 2026-10,
+    /// P2-11).
+    ///
+    /// # Errors
+    /// As [`Self::new`].
+    pub fn new_without(quality: Quality, skip: &[&str]) -> Result<Self, CodecError> {
         ffmpeg::init().map_err(|e| CodecError::EncoderInit(e.to_string()))?;
 
         let mut errors: Vec<String> = Vec::new();
 
-        for &name in ENCODER_PRIORITY {
+        for &name in ENCODER_PRIORITY.iter().filter(|n| !skip.contains(n)) {
             let Some(codec) = encoder::find_by_name(name) else {
                 errors.push(format!("{name}: not in FFmpeg build"));
                 continue;
@@ -580,11 +589,25 @@ impl FfmpegEncoder {
     }
 }
 
+impl FfmpegEncoder {
+    /// A failed encode lets go of its session: the next frame opens a
+    /// new one (a driver reset or a sleep leaves the old one dead). It
+    /// used to be kept, and every frame after failed — the share sent
+    /// nothing (review 2026-10, P2-11).
+    fn after_encode(&mut self, encoded: &Result<Vec<EncodedFrame>, CodecError>) {
+        if encoded.is_err() {
+            self.session = None;
+        }
+    }
+}
+
 impl VideoEncoder for FfmpegEncoder {
     /// Encode one RGBA frame. See [`VideoEncoder::encode`] for the output
     /// contract (zero or more access units, one `EncodedFrame` each).
     fn encode(&mut self, frame: &Frame) -> Result<Vec<EncodedFrame>, CodecError> {
-        self.encode_frame(frame, false)
+        let encoded = self.encode_frame(frame, false);
+        self.after_encode(&encoded);
+        encoded
     }
 
     /// See [`VideoEncoder::encode_repeat`]: the time since the last
@@ -595,7 +618,9 @@ impl VideoEncoder for FfmpegEncoder {
     /// A viewer who needs a keyframe asks, and
     /// [`Self::force_keyframe`] still gets one out at once.
     fn encode_repeat(&mut self, frame: &Frame) -> Result<Vec<EncodedFrame>, CodecError> {
-        self.encode_frame(frame, true)
+        let encoded = self.encode_frame(frame, true);
+        self.after_encode(&encoded);
+        encoded
     }
 
     /// See [`VideoEncoder::frames_in_flight`].
@@ -891,7 +916,6 @@ impl FfmpegDecoder {
             data,
             width: w,
             height: h,
-            timestamp_ms: encoded.timestamp_ms,
             format: crate::PictureFormat::Rgba,
         }))
     }
@@ -922,7 +946,7 @@ impl VideoDecoder for FfmpegDecoder {
 /// Compute output dimensions: fit `src` inside the `Quality` bound,
 /// preserving aspect ratio, never upscaling, rounded down to even
 /// dimensions (4:2:0 chroma requires them), minimum 2×2.
-fn fit_dimensions(src_w: u32, src_h: u32, quality: Quality) -> (u32, u32) {
+pub(crate) fn fit_dimensions(src_w: u32, src_h: u32, quality: Quality) -> (u32, u32) {
     let (max_w, max_h) = (u64::from(quality.width()), u64::from(quality.height()));
     let (sw, sh) = (u64::from(src_w.max(1)), u64::from(src_h.max(1)));
 
@@ -1387,6 +1411,19 @@ fn scale_packed(
         return Err(CodecError::Encode(format!(
             "frame data too small: {} bytes for {width}x{height} (need {needed})",
             src.len()
+        )));
+    }
+    // The encoder may still hold the last picture's buffers (frame
+    // threads, a lookahead, an asynchronous hardware queue): writing into
+    // them would change a frame it has not encoded yet. FFmpeg copies
+    // them out first only then; otherwise this is a refcount check
+    // (review 2026-10, P3-39).
+    // SAFETY: `dst` is the session's own, valid frame.
+    let writable = unsafe { ffmpeg::ffi::av_frame_make_writable(dst.as_mut_ptr()) };
+    if writable < 0 {
+        return Err(CodecError::Encode(format!(
+            "frame not writable: {}",
+            ffmpeg::Error::from(writable)
         )));
     }
     let planes: [*const u8; 4] = [src.as_ptr(), ptr::null(), ptr::null(), ptr::null()];

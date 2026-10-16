@@ -27,7 +27,8 @@
 //! iOS: [`vpio`] — Apple's voice-processing unit, one for both
 //! directions, with [`avsession`] for the session's mode, route and
 //! interruptions; cpal's `RemoteIO` serves the rest, as on Android.
-//! The two callback backends share their real-time halves ([`pump`]).
+//! Every backend, and the cpal fallbacks, share their real-time halves
+//! ([`pump`]) and their start errors.
 //! macOS: cpal's `CoreAudio` path runs the callback on the HAL's real-time
 //! thread already; nothing to take over yet. Linux: cpal/ALSA until there
 //! is a `PipeWire` backend.
@@ -38,12 +39,30 @@ pub mod aaudio;
 pub mod android;
 #[cfg(target_os = "ios")]
 pub mod avsession;
-#[cfg(any(target_os = "android", target_os = "ios"))]
-mod pump;
+pub(crate) mod pump;
 #[cfg(target_os = "ios")]
 pub mod vpio;
 #[cfg(windows)]
 pub mod wasapi;
+
+/// A native capture that would not start. Carries the ring and latch
+/// back so the caller can hand them to the cpal fallback untouched. One
+/// type for every backend (review 2026-10, P2-49).
+#[cfg(any(windows, target_os = "android", target_os = "ios"))]
+pub struct CaptureStartError {
+    pub reason: String,
+    pub producer: rtrb::Producer<f32>,
+    pub wake_tx: crate::latch::Ring,
+}
+
+/// A native render that would not start; same idea as
+/// [`CaptureStartError`].
+#[cfg(any(windows, target_os = "android", target_os = "ios"))]
+pub struct RenderStartError {
+    pub reason: String,
+    pub consumer: rtrb::Consumer<f32>,
+    pub wake_tx: crate::latch::Ring,
+}
 
 /// The voice-call path's two halves where a callback backend provides
 /// them (same constructors, fields and errors on both).

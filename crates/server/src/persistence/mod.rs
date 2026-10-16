@@ -90,10 +90,15 @@ const RELOAD_WAIT: Duration = Duration::from_secs(5);
 /// one at once, dropping from memory whatever it had just changed (a
 /// ban from the panel, say).
 const RELOAD_BACKOFF: Duration = Duration::from_secs(1);
-/// How many such pauses before a stale snapshot is taken after all: a
-/// server that writes policy without a break for seconds on end still
-/// gets the other process's change, a few seconds late.
+/// How many such pauses before the tick says so in the log, and waits
+/// [`RELOAD_PATIENCE`] between tries from then on. A stale snapshot is
+/// never taken: it was, after these, and a ban made from the panel 3–4 s
+/// earlier fell out of memory until the next reload (review 2026-10,
+/// P1-12). The other process's change waits for a snapshot that holds
+/// the tick's own writes too.
 const MAX_RELOAD_BACKOFFS: u32 = 3;
+/// The pause between tries once [`MAX_RELOAD_BACKOFFS`] ran out.
+const RELOAD_PATIENCE: Duration = Duration::from_secs(4);
 
 #[derive(Debug, thiserror::Error)]
 pub enum PersistError {
@@ -129,6 +134,8 @@ pub enum PersistError {
     NoSuchRole(String),
     #[error("a role is already named {0}")]
     RoleNameTaken(String),
+    #[error("a server has at most {0} roles")]
+    TooManyRoles(usize),
     #[error(
         "'{0}' cannot name a role: 1–32 lowercase letters, digits and hyphens, and not a \
          built-in's name"
@@ -197,7 +204,6 @@ pub struct TelemetryRow {
     pub rung: Option<u32>,
     pub input_device: Option<String>,
     pub output_device: Option<String>,
-    pub sample: Vec<u8>,
 }
 
 impl TelemetryRow {
@@ -211,7 +217,6 @@ impl TelemetryRow {
         key_hash: UserId,
         sample: &TelemetrySample,
     ) -> Option<Self> {
-        let encoded = protocol::encode_telemetry_sample(sample)?;
         let audio = sample.audio.as_ref();
         let sharing = sample.sharing.as_ref();
         Some(Self {
@@ -225,7 +230,6 @@ impl TelemetryRow {
             rung: sharing.map(|s| s.rung_pct),
             input_device: audio.map(|a| a.input_device.clone()),
             output_device: audio.map(|a| a.output_device.clone()),
-            sample: encoded,
         })
     }
 }
@@ -238,7 +242,6 @@ pub struct TelemetryEventRow {
     pub key_hash: UserId,
     /// A short stable name (`share_started`, …) for querying.
     pub kind: String,
-    pub event: Vec<u8>,
 }
 
 /// `star, crown, …` for the `BadIcon` message.
@@ -294,7 +297,6 @@ pub struct BlobRecord {
     pub blob_id: protocol::BlobId,
     /// Sniffed.
     pub mime: String,
-    pub declared_mime: Option<String>,
     pub size: u32,
     pub name: String,
     pub created_by: Option<UserId>,
@@ -499,6 +501,9 @@ enum Envelope {
     /// wants the policy as it stands once everything queued ahead of
     /// this is written.
     Reload,
+    /// A read that must see every write queued ahead of it
+    /// ([`Persist::ask_behind_writes`]): reads are otherwise taken first.
+    Ask(Request),
     Shutdown,
 }
 
@@ -530,6 +535,11 @@ pub enum Query {
     ReportedMessage { msg_id: u64 },
     /// Reports for the panel, newest first.
     Reports { resolved: bool, limit: u16 },
+    /// How many live rows point at a file — messages not deleted and
+    /// avatars: what its reference count should be. After a DM store
+    /// that timed out, whose row may or may not have been written
+    /// (review 2026-10, P2-24).
+    BlobRefs { blob_id: protocol::BlobId },
 }
 
 /// Which conversation a read or a mark is about (spec §6): the general
@@ -553,6 +563,8 @@ pub enum Answer {
     /// Boxed: a whole message row, where every other answer is small.
     ReportedMessage(Option<Box<ReportedMessage>>),
     Reports(Vec<protocol::ReportSummary>),
+    /// A count ([`Query::BlobRefs`]).
+    Count(u32),
     /// Persistence is off: there is nothing to read.
     Unavailable,
     Failed(String),
@@ -948,19 +960,32 @@ impl Persist {
     /// than `deadline` — as [`Outcome::TimedOut`] if the thread had not
     /// answered by then.
     pub fn ask(&mut self, query: Query, deadline: Instant) -> AskId {
+        self.ask_on(query, deadline, false)
+    }
+
+    /// [`Self::ask`], answered only once every write sent before it is
+    /// on disk: reads are taken ahead of queued writes, which a count of
+    /// what points at a file must not be (review 2026-10, P2-24).
+    pub fn ask_behind_writes(&mut self, query: Query, deadline: Instant) -> AskId {
+        self.ask_on(query, deadline, true)
+    }
+
+    fn ask_on(&mut self, query: Query, deadline: Instant, behind_writes: bool) -> AskId {
         let id = AskId(self.next_ask);
         self.next_ask += 1;
         let gave_up = Arc::new(AtomicBool::new(false));
         if self.persistent {
-            if self
-                .reads
-                .try_send(Request::Query {
-                    id,
-                    query,
-                    gave_up: Arc::clone(&gave_up),
-                })
-                .is_err()
-            {
+            let request = Request::Query {
+                id,
+                query,
+                gave_up: Arc::clone(&gave_up),
+            };
+            let sent = if behind_writes {
+                self.writes.try_send(Envelope::Ask(request)).is_ok()
+            } else {
+                self.reads.try_send(request).is_ok()
+            };
+            if !sent {
                 // Answer now rather than sit out the deadline.
                 let _ = self
                     .answer_now
@@ -1043,12 +1068,15 @@ impl Persist {
             } else {
                 warn!(
                     "policy reload: snapshots stayed older than this server's own writes \
-                     for {} s; taking this one, a change made in the last moments may be \
-                     missing from memory until the next reload",
-                    u64::from(MAX_RELOAD_BACKOFFS) * RELOAD_BACKOFF.as_secs()
+                     for {} s; keeping the policy in memory and asking again every {} s \
+                     until one holds them",
+                    u64::from(MAX_RELOAD_BACKOFFS) * RELOAD_BACKOFF.as_secs(),
+                    RELOAD_PATIENCE.as_secs()
                 );
                 self.stale_reloads = 0;
-                self.reload_backoffs = 0;
+                self.reload_wanted = true;
+                self.reload_after = Some(now + RELOAD_PATIENCE);
+                continue;
             }
             self.reload_wanted = false;
             notices.push(notice);
@@ -1188,6 +1216,7 @@ impl Worker {
                 recv(self.writes) -> envelope => match envelope {
                     Ok(Envelope::Write(command)) => Step::Write(command),
                     Ok(Envelope::Reload) => Step::Reload,
+                    Ok(Envelope::Ask(request)) => Step::Read(request),
                     Ok(Envelope::Shutdown) | Err(_) => Step::Stop,
                 },
                 default(self.until_next_job()) => Step::Idle,
@@ -1270,6 +1299,10 @@ impl Worker {
             },
             Query::Reports { resolved, limit } => match db.reports(*resolved, *limit) {
                 Ok(list) => Answer::Reports(list),
+                Err(e) => Answer::Failed(e.to_string()),
+            },
+            Query::BlobRefs { blob_id } => match db.count_blob_refs(blob_id) {
+                Ok(n) => Answer::Count(n),
                 Err(e) => Answer::Failed(e.to_string()),
             },
         }
@@ -1463,6 +1496,8 @@ impl Worker {
                 Ok(Envelope::Write(command)) => self.apply(&command),
                 // The snapshot that follows this drain answers it.
                 Ok(Envelope::Reload) => {}
+                // In its place among the writes.
+                Ok(Envelope::Ask(request)) => self.handle_request(request),
                 Ok(Envelope::Shutdown) | Err(TryRecvError::Disconnected) => {
                     self.stopping = true;
                     return;
@@ -1483,7 +1518,8 @@ impl Worker {
                         .drained_dropped
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                Envelope::Reload | Envelope::Shutdown => {}
+                // Nobody waits for an answer at shutdown.
+                Envelope::Reload | Envelope::Ask(_) | Envelope::Shutdown => {}
             }
         }
     }
@@ -1709,7 +1745,6 @@ mod tests {
             rung: None,
             input_device: None,
             output_device: None,
-            sample: Vec::new(),
         };
         assert!(p.send_telemetry(vec![row.clone()]).is_ok());
         let returned = p
@@ -1913,25 +1948,43 @@ mod tests {
         );
         assert!(!p.reload_in_flight());
 
-        // A server that never stops writing policy still gets a
-        // snapshot: after a few stale ones and a few pauses (about
-        // `MAX_RELOAD_BACKOFFS` seconds) it takes what it has.
+        // A server that never stops writing policy takes no snapshot
+        // older than its writes, however long the writes go on (it did,
+        // after a few seconds, and dropped its last ban from memory —
+        // review 2026-10, P1-12). Once they let up, the one it takes
+        // holds the CLI's change and every ban.
         cli_create_invite(&path, protocol::permissions::ROLE_GUEST, None, None).expect("cli");
         let mut next_id = 100;
-        let mut taken = None;
-        let deadline = Instant::now() + RELOAD_BACKOFF * (MAX_RELOAD_BACKOFFS + 5);
-        while taken.is_none() {
-            assert!(Instant::now() < deadline, "no snapshot was ever taken");
+        let storm_until = Instant::now() + RELOAD_BACKOFF * (MAX_RELOAD_BACKOFFS + 2);
+        while Instant::now() < storm_until {
             p.send(ban(next_id));
             next_id += 1;
+            for notice in p.poll(Instant::now()).notices {
+                assert!(
+                    !matches!(notice, Notice::Policy { .. }),
+                    "a snapshot older than the writes was taken"
+                );
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let last_ban = next_id - 1;
+        let mut taken = None;
+        let deadline = Instant::now() + RELOAD_PATIENCE * 3;
+        while taken.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "no snapshot once the writes stopped"
+            );
             for notice in p.poll(Instant::now()).notices {
                 if let Notice::Policy { policy, .. } = notice {
                     taken = Some(policy);
                 }
             }
-            thread::sleep(Duration::from_millis(5));
+            thread::sleep(Duration::from_millis(20));
         }
-        assert_eq!(taken.expect("a reload").invites.len(), 2);
+        let taken = taken.expect("a reload");
+        assert_eq!(taken.invites.len(), 2);
+        assert!(taken.restrictions.iter().any(|r| r.id == last_ban));
         p.shutdown();
         if let Some(dir) = path.parent() {
             let _ = std::fs::remove_dir_all(dir);

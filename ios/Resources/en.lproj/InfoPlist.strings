@@ -1,0 +1,3 @@
+/* The permission prompts (Info.plist), in this language. */
+"NSMicrophoneUsageDescription" = "baucord uses the microphone while you are in a voice channel.";
+"NSLocalNetworkUsageDescription" = "baucord connects to servers on your local network when you add one by its local address.";
