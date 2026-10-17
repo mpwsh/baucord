@@ -261,6 +261,11 @@ Play music in another app first, at a steady volume.
   defaults' question keeps the bar full width. Settings' scroll bar,
   and the admin panel's Users and Audit lists' with enough rows to
   scroll, are at the window's edge, clear of the role pickers.
+- [ ] **new** — admin panel → Roles: scroll down, press Edit on a
+  custom role. The list is gone and the editor starts at the top; the
+  arrow, Cancel and Escape each bring the list back, and so does Save
+  role. Save a name already taken: the error shows under "Edit role".
+  Close the panel mid-edit and open it again: it shows the list.
 - [ ] **new** — ban yourself from a test server (no reason, then
   "spam" for 1 h) and connect: a red toast at the top reads "…from
   this server indefinitely: (no reason given)" / "…for 1 h: spam",
@@ -616,6 +621,9 @@ agrees with it.
   is a toast under the status bar, not on it, and the card sits below
   it. Tap Nickname: the keyboard comes up, the card can be dragged to
   reach Connect, and nothing is hidden behind the keys.
+- [ ] **new** — admin panel → Roles → Edit on a custom role: the editor
+  fills the page with one arrow, the top bar's; it (and Back) brings
+  the roles back, a second press leaves the tab.
 - [ ] **same** — every dialog: Back closes it; the channel-password
   field has the keyboard, what is typed arrives, the keyboard's Enter
   joins [P2-58].

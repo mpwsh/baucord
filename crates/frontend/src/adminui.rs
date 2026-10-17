@@ -96,6 +96,9 @@ pub(crate) fn close(app: &mut AppState) {
     app.admin_pending = None;
     let s = app.main.global::<AdminState>();
     s.set_confirm_open(false);
+    // The role editor is a page in place of the list: the next open
+    // starts on the list, not in an edit left halfway.
+    s.set_role_edit_open(false);
     s.set_busy(false);
     // What the server listed goes with the page: it was kept for the
     // rest of the run, past the session and the server it came from
