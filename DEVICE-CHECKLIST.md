@@ -258,8 +258,9 @@ Play music in another app first, at a steady volume.
 - [ ] **new** — maximise the window, open Settings, then the admin
   panel: the line above the footer runs to the right edge and Save and
   close (Close in the panel) sits in the bottom-right corner; Reset to
-  defaults' question keeps the bar full width. Settings' scroll bar is
-  at the window's edge.
+  defaults' question keeps the bar full width. Settings' scroll bar,
+  and the admin panel's Users and Audit lists' with enough rows to
+  scroll, are at the window's edge, clear of the role pickers.
 - [ ] **new** — ban yourself from a test server (no reason, then
   "spam" for 1 h) and connect: a red toast at the top reads "…from
   this server indefinitely: (no reason given)" / "…for 1 h: spam",

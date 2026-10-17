@@ -423,16 +423,24 @@ component UserCard inherits Row {
 component UsersTab inherits VerticalLayout {
     in property <bool> compact;
     in property <length> pad;
+    /// `AdminContent`'s: the list's own right edge, and how far short
+    /// of it its rows stop.
+    in property <length> edge;
+    in property <length> inset;
     padding: root.pad;
+    padding-right: root.edge;
     spacing: Theme.gap-md;
-    TabHead { title: Tr.admin-users; lead: Tr.admin-users-lead; tab: 0; }
+    TabHead { title: Tr.admin-users; lead: Tr.admin-users-lead; tab: 0; padding-right: root.inset; }
     if AdminState.users.length == 0 && !AdminState.busy : Empty { text: Tr.admin-none; }
     ListView {
         vertical-stretch: 1;
         mouse-drag-pan-enabled: State.touch-host;
-        for u in AdminState.users : VerticalLayout {
-            if !root.compact : UserLine { u: u; }
-            if root.compact : UserCard { u: u; }
+        for u in AdminState.users : HorizontalLayout {
+            padding-right: root.inset;
+            VerticalLayout {
+                if !root.compact : UserLine { u: u; }
+                if root.compact : UserCard { u: u; }
+            }
         }
     }
 }
@@ -807,14 +815,21 @@ component AuditCard inherits Row {
 component AuditTab inherits VerticalLayout {
     in property <bool> compact;
     in property <length> pad;
+    /// As `UsersTab`'s.
+    in property <length> edge;
+    in property <length> inset;
     padding: root.pad;
+    padding-right: root.edge;
     spacing: Theme.gap-md;
-    TabHead { title: Tr.admin-audit; lead: Tr.admin-audit-lead; tab: 6; }
+    TabHead { title: Tr.admin-audit; lead: Tr.admin-audit-lead; tab: 6; padding-right: root.inset; }
     if AdminState.audit.length == 0 && !AdminState.busy : Empty { text: Tr.admin-none; }
     if root.compact && AdminState.audit.length > 0 : ListView {
         vertical-stretch: 1;
         mouse-drag-pan-enabled: State.touch-host;
-        for e in AdminState.audit : AuditCard { e: e; }
+        for e in AdminState.audit : HorizontalLayout {
+            padding-right: root.inset;
+            AuditCard { e: e; }
+        }
     }
     // A table: fixed columns for when, who and what; the target and
     // the details share the rest. Headers say what each is.
@@ -823,7 +838,7 @@ component AuditTab inherits VerticalLayout {
         HorizontalLayout {
             height: 28px;
             padding-left: Theme.gap-xs;
-            padding-right: Theme.gap-xs;
+            padding-right: Theme.gap-xs + root.inset;
             spacing: Theme.gap-sm;
             ColHead { text: Tr.admin-col-when; width: 84px; }
             ColHead { text: Tr.admin-col-who; width: 96px; }
@@ -831,29 +846,35 @@ component AuditTab inherits VerticalLayout {
             ColHead { text: Tr.admin-col-target; width: 116px; }
             ColHead { text: Tr.admin-col-detail; horizontal-stretch: 1; }
         }
-        Rectangle { height: 1px; background: Theme.border; }
+        HorizontalLayout {
+            padding-right: root.inset;
+            Rectangle { height: 1px; background: Theme.border; }
+        }
         ListView {
             vertical-stretch: 1;
             mouse-drag-pan-enabled: State.touch-host;
-            for e in AdminState.audit : Row {
-                row-height: 44px;
-                HorizontalLayout {
-                    padding-left: Theme.gap-xs;
-                    padding-right: Theme.gap-xs;
-                    spacing: Theme.gap-sm;
-                    Muted { text: e.when; width: 84px; }
-                    Cell { text: e.actor; font-weight: 600; width: 96px; }
-                    Cell { text: e.action; color: Theme.accent-text; width: 132px; }
-                    Cell { text: e.target; color: Theme.text-secondary; width: 116px; }
-                    // Two lines when it needs them, elided past that.
-                    Text {
-                        text: e.detail;
-                        color: Theme.text-secondary;
-                        font-size: Theme.font-xs;
-                        vertical-alignment: center;
-                        wrap: word-wrap;
-                        overflow: elide;
-                        horizontal-stretch: 1;
+            for e in AdminState.audit : HorizontalLayout {
+                padding-right: root.inset;
+                Row {
+                    row-height: 44px;
+                    HorizontalLayout {
+                        padding-left: Theme.gap-xs;
+                        padding-right: Theme.gap-xs;
+                        spacing: Theme.gap-sm;
+                        Muted { text: e.when; width: 84px; }
+                        Cell { text: e.actor; font-weight: 600; width: 96px; }
+                        Cell { text: e.action; color: Theme.accent-text; width: 132px; }
+                        Cell { text: e.target; color: Theme.text-secondary; width: 116px; }
+                        // Two lines when it needs them, elided past that.
+                        Text {
+                            text: e.detail;
+                            color: Theme.text-secondary;
+                            font-size: Theme.font-xs;
+                            vertical-alignment: center;
+                            wrap: word-wrap;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
                     }
                 }
             }
@@ -1002,9 +1023,18 @@ component AdminContent inherits Rectangle {
     in property <int> tab;
     in property <bool> compact;
     in property <length> pad: Theme.gap-xl;
+    /// The wide panel's measure: the tab's content stops this far from
+    /// its left edge while its lists' scroll bars stay at the window's
+    /// edge (ANDROID-SPEC.md D75). 0: no measure (the phone's page).
+    in property <length> max-column: 0px;
+    // The lists' own right padding, and how much further in their rows,
+    // the head and a whole-scrolling tab's content end.
+    property <length> edge: root.max-column > 0 ? 0px : root.pad;
+    property <length> inset: root.max-column > 0
+        ? Math.max(0px, root.width - root.max-column) + root.pad : 0px;
     vertical-stretch: 1;
-    if root.tab == 0 : UsersTab { compact: root.compact; pad: root.pad; }
-    if root.tab == 6 : AuditTab { compact: root.compact; pad: root.pad; }
+    if root.tab == 0 : UsersTab { compact: root.compact; pad: root.pad; edge: root.edge; inset: root.inset; }
+    if root.tab == 6 : AuditTab { compact: root.compact; pad: root.pad; edge: root.edge; inset: root.inset; }
     if root.tab != 0 && root.tab != 6 : ScrollView {
         width: 100%;
         height: 100%;
@@ -1013,6 +1043,7 @@ component AdminContent inherits Rectangle {
         mouse-drag-pan-enabled: State.touch-host;
         VerticalLayout {
             padding: root.pad;
+            padding-right: root.edge + root.inset;
             alignment: start;
             if root.tab == 1 : RolesTab { compact: root.compact; }
             if root.tab == 2 : RestrictionsTab { compact: root.compact; }
@@ -1035,9 +1066,10 @@ export component AdminPanel inherits Rectangle {
     in property <bool> narrow: false;
     /// Narrow only: a tab's page is showing, not the list.
     in-out property <bool> section-open: false;
-    // The tab keeps to a column beside the tabs, at most 960 px wide:
-    // on a maximized window a row's controls stay within reach of its
-    // name. The Close bar under it spans the whole width (ANDROID-SPEC.md D75).
+    // The tab keeps to a column beside the tabs, at most 960 px wide
+    // (`AdminContent.max-column`): on a maximized window a row's
+    // controls stay within reach of its name. Its lists' scroll bars and
+    // the Close bar under it reach the window's edge (ANDROID-SPEC.md D75).
     property <length> column: Math.min(root.width - 188px, 960px);
     // The column is narrower than a wide row needs (the Users row's
     // Actions and role pickers beside the name; the audit table's
@@ -1073,13 +1105,10 @@ export component AdminPanel inherits Rectangle {
             }
         }
         VerticalLayout {
-            HorizontalLayout {
-                AdminContent {
-                    width: root.column;
-                    tab: root.tab;
-                    compact: root.compact;
-                }
-                Rectangle { }
+            AdminContent {
+                tab: root.tab;
+                compact: root.compact;
+                max-column: 960px;
             }
             Rectangle {
                 height: 64px;
