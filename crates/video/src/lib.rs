@@ -135,14 +135,18 @@ impl Quality {
     /// This is the *actual* encoder target (ABR + VBV), not a hint. The
     /// sender may run below it under uplink pressure — see
     /// [`Quality::scaled_bitrate`] and [`VideoEncoder::set_bitrate_scale_pct`].
+    ///
+    /// 1080p was raised a quarter on 2026-10-17 (8 → 10 Mbit/s at 60 fps,
+    /// 6 → 7.5 at 30): the frames between keyframes, ~59 of 60, are what
+    /// the target buys, and at 8 they softened on motion and scrolling.
     #[must_use]
     pub const fn bitrate(self) -> u32 {
         match self {
             Self::HD30 => 3_500_000,
             Self::HD60 => 4_500_000,
-            Self::FHD30 => 6_000_000,
-            Self::FHD60 => 8_000_000,
-            Self::QHD30 => 10_000_000,
+            Self::FHD30 => 7_500_000,
+            // 1440p at 30 has about the pixel rate of 1080p at 60.
+            Self::FHD60 | Self::QHD30 => 10_000_000,
         }
     }
 
@@ -434,13 +438,15 @@ pub trait VideoEncoder {
         true
     }
 
-    /// The last frame came out too large to send (over
-    /// `protocol::MAX_VIDEO_FRAME_BYTES`) and was dropped: raise the
-    /// minimum quantizer the next session opens with, so the keyframe
-    /// that replaces it is smaller. Returns the new floor, or `None` when
-    /// the backend has none or the highest is already in force. The
-    /// floor relaxes on its own once frames fit again.
-    fn frame_too_large(&mut self) -> Option<u32> {
+    /// The last frame came out `bytes` long, over `limit`
+    /// (`protocol::MAX_VIDEO_FRAME_BYTES`), and was dropped: raise the
+    /// minimum quantizer the next session opens with — as far as that
+    /// frame needed — so the keyframe that replaces it is smaller. It
+    /// binds every frame of the session, not only keyframes. Returns the
+    /// new floor, or `None` when the backend has none or the highest is
+    /// already in force. The floor eases on its own once keyframes come
+    /// out with room under the limit.
+    fn frame_too_large(&mut self, _bytes: usize, _limit: usize) -> Option<u32> {
         None
     }
 
@@ -557,12 +563,12 @@ mod tests {
 
         #[test]
         fn returns_preset_bitrate_at_100() {
-            assert_eq!(Quality::FHD60.scaled_bitrate(100), 8_000_000);
+            assert_eq!(Quality::FHD60.scaled_bitrate(100), 10_000_000);
         }
 
         #[test]
         fn scales_linearly() {
-            assert_eq!(Quality::FHD60.scaled_bitrate(50), 4_000_000);
+            assert_eq!(Quality::FHD60.scaled_bitrate(50), 5_000_000);
         }
 
         #[test]

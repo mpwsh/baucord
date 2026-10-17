@@ -2136,10 +2136,13 @@ fn send_encoded(
         // with it.
         if encoded.data.len() > protocol::MAX_VIDEO_FRAME_BYTES {
             state.log.on_too_large(encoded.data.len());
-            match state.encoder.frame_too_large() {
+            match state
+                .encoder
+                .frame_too_large(encoded.data.len(), protocol::MAX_VIDEO_FRAME_BYTES)
+            {
                 Some(qp) => warn!(
                     "encoded frame too large to send ({} KB, max {} KB): \
-                     keyframes now encode at QP ≥ {qp}",
+                     the encoder now runs at QP ≥ {qp} until keyframes fit with room",
                     encoded.data.len() / 1000,
                     protocol::MAX_VIDEO_FRAME_BYTES / 1000,
                 ),

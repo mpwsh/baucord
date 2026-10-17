@@ -826,9 +826,10 @@ impl AppState {
                         // no separators; the other kinds say ": " in the
                         // catalog.
                         let (until, reason) = match kind {
-                            client::RemovedKind::Banned { until } => {
-                                (format!(" {}", describe_until(*until)), format!(": {reason}"))
-                            }
+                            client::RemovedKind::Banned { until } => (
+                                format!(" {}", describe_until(*until)),
+                                format!(": {reason}"),
+                            ),
                             _ => (String::new(), reason),
                         };
                         t!(

@@ -430,7 +430,7 @@ fn avcc_reframing_keeps_every_picture() {
 /// A frame too large to send raises a quantizer floor that the next
 /// session opens with (`qmin`), and the encoder honours it from the
 /// first frame: the remedy for AMF's oversized first-frame IDRs
-/// (`codec::QP_FLOORS`), checked on whichever encoder this machine has
+/// (`codec::QP_FLOOR_FIRST`), checked on whichever encoder this machine has
 /// (libx264 in CI). Content the rate control would spend freely on —
 /// here a gradient, which it encodes at a low QP — comes out far
 /// smaller under the floor. (Content already at a high QP is not
@@ -462,7 +462,8 @@ fn a_quantizer_floor_shrinks_the_first_keyframe() {
     let mut floored = FfmpegEncoder::new(quality).expect("second encoder");
     assert_eq!(floored.qp_floor(), None);
     let mut floor = None;
-    while let Some(q) = floored.frame_too_large() {
+    // Frames twice the protocol's limit (255 × 1080 B) push it up.
+    while let Some(q) = floored.frame_too_large(2 * 275_400, 275_400) {
         floor = Some(q);
     }
     assert_eq!(floor, Some(36), "steps up to the highest floor, then stops");

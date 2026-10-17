@@ -180,6 +180,14 @@ Play music in another app first, at a steady volume.
 
 ### 1.3 Sharing a screen [P2-22, P2-26, P2-41, P2-44, P3-28]
 
+- [ ] **new** — share a busy 1080p60 screen (a code editor full of text,
+  then a game) from an AMD machine and from a Mac for five minutes.
+  log: the session line says `10000 kbit/s`; after any `encoded frame
+  too large to send`, the floor named there is 24 or one step above,
+  not a jump to 28–36, and later session lines step it down (`QP ≥ 26`
+  → `QP ≥ 24` → none) rather than climbing back each 30 s. The viewer
+  sees text as sharp as from an NVIDIA sharer, and no hitch every half
+  minute.
 - [ ] **new** — with someone else in your channel: start a share, stop
   it. Both of you hear the rising pair at the start and the falling
   pair (the same two notes, high to low) a moment after the stop. Share

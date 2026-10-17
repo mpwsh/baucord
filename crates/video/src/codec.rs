@@ -120,18 +120,37 @@ const AMF_MAX_AU_BITS: u32 = 2_000_000;
 /// ⇒ ~200 KB nominal, leaving overshoot room.
 const VBV_MAX_BITS: u32 = 1_600_000;
 
-/// The quantizer floors an encoder steps through when it makes frames
-/// too large to send (`VideoEncoder::frame_too_large`), lowest first. A
-/// fresh AMF session's first IDR ignores both the VBV and
-/// `max_au_size`: 287–522 KB against the 275 KB limit on a detailed
-/// 1080p desktop (2026-10-08), and 425 KB from a session opened at
-/// 2.1 Mbit/s — so a lower bitrate does not shrink it, but a quantizer
-/// floor binds every frame from the first. Each step roughly halves a
-/// detailed keyframe; text stays readable at all of them.
-const QP_FLOORS: [u32; 4] = [24, 28, 32, 36];
-/// A floor is relaxed one step after this long without a frame too
-/// large (re-applied with the next session, which a change opens).
+/// The quantizer floor an encoder takes when it first makes a frame too
+/// large to send (`VideoEncoder::frame_too_large`). A fresh AMF
+/// session's first IDR ignores both the VBV and `max_au_size`:
+/// 287–522 KB against the 275 KB limit on a detailed 1080p desktop
+/// (2026-10-08), and 425 KB from a session opened at 2.1 Mbit/s — so a
+/// lower bitrate does not shrink it, but a quantizer floor binds every
+/// frame from the first. `VideoToolbox` is bounded only per second
+/// (`DataRateLimits`), so one keyframe can be as large.
+///
+/// Every frame, not only keyframes: `qmin` is the session's, and in
+/// `FFmpeg` 7.1 it is the only minimum QP AMF and `VideoToolbox` take. So
+/// the floor rises only as far as the oversized frame needed and comes
+/// back down as soon as the keyframes show room (2026-10-17: a fixed
+/// +4 a step and a 30 s timer kept AMF and Mac shares at QP 28–32,
+/// reopening every 30 s into another oversized first IDR).
+const QP_FLOOR_FIRST: u32 = 24;
+/// The highest floor; past it a frame too large is only dropped.
+const QP_FLOOR_MAX: u32 = 36;
+/// Floors move in steps of this many QP (two ≈ ×1.26 a frame's size).
+const QP_FLOOR_STEP: u32 = 2;
+/// A floor eases one step no sooner than this after it last moved…
 const QP_FLOOR_RELAX_AFTER: Duration = Duration::from_secs(30);
+/// …and only once this many keyframes came out under it…
+const QP_FLOOR_RELAX_KEYFRAMES: u32 = 3;
+/// …the largest of them within this share of the frame limit, percent:
+/// room for the next step's ×1.26 with a margin, so the session it
+/// reopens fits.
+const QP_FLOOR_RELAX_STEP_PCT: usize = 60;
+/// The same for coming off the first floor altogether: a keyframe with
+/// no floor can be several times the size of one at QP 24.
+const QP_FLOOR_RELAX_OFF_PCT: usize = 35;
 
 /// The three rate-control numbers a session is opened with, all derived
 /// from one target so they scale together.
@@ -206,10 +225,15 @@ pub struct FfmpegEncoder {
     last_frame_ms: Option<u64>,
     /// Last PTS handed to the encoder — used to keep PTS strictly increasing.
     last_pts: Option<i64>,
-    /// Index into [`QP_FLOORS`] once a frame came out too large to send,
-    /// and when it last moved (relaxed after [`QP_FLOOR_RELAX_AFTER`]).
-    qp_floor: Option<usize>,
+    /// The quantizer floor once a frame came out too large to send, and
+    /// when it last moved ([`QP_FLOOR_FIRST`] and what follows it).
+    qp_floor: Option<u32>,
     qp_floor_moved: Option<Instant>,
+    /// The frame limit the floor answers to (`frame_too_large`'s), and
+    /// the keyframes since the floor last moved: how many, the largest.
+    frame_limit: usize,
+    floor_keyframes: u32,
+    floor_peak_keyframe: usize,
     session: Option<EncSession>,
 }
 
@@ -301,6 +325,9 @@ impl FfmpegEncoder {
                         last_pts: None,
                         qp_floor: None,
                         qp_floor_moved: None,
+                        frame_limit: 0,
+                        floor_keyframes: 0,
+                        floor_peak_keyframe: 0,
                         session: None,
                     });
                 }
@@ -327,7 +354,7 @@ impl FfmpegEncoder {
         out: &mut Vec<EncodedFrame>,
     ) -> Result<(), CodecError> {
         let scale = self.bitrate_scale_pct;
-        let floor = self.qp_floor.map(|i| QP_FLOORS[i]);
+        let floor = self.qp_floor;
         if let Some(s) = self.session.as_mut() {
             let same_source =
                 s.src_w == frame.width && s.src_h == frame.height && s.src_format == frame.format;
@@ -569,17 +596,42 @@ impl FfmpegEncoder {
             // the 2 s cadence scale).
             self.last_idr_out_ms = Some(frame.timestamp_ms);
         }
+        self.note_keyframes(&out);
         Ok(out)
     }
 
-    /// One step back down after [`QP_FLOOR_RELAX_AFTER`] without a
-    /// frame too large.
+    /// One step back down, once the keyframes under the floor show room
+    /// for it ([`QP_FLOOR_RELAX_AFTER`] and what follows it). The next
+    /// session opens with it.
     fn relax_qp_floor(&mut self, now: Instant) {
-        if let (Some(i), Some(moved)) = (self.qp_floor, self.qp_floor_moved)
-            && now.duration_since(moved) >= QP_FLOOR_RELAX_AFTER
+        let (Some(floor), Some(moved)) = (self.qp_floor, self.qp_floor_moved) else {
+            return;
+        };
+        if now.duration_since(moved) < QP_FLOOR_RELAX_AFTER
+            || self.floor_keyframes < QP_FLOOR_RELAX_KEYFRAMES
         {
-            self.qp_floor = i.checked_sub(1);
+            return;
+        }
+        if let Some(eased) = qp_floor_relaxed(floor, self.floor_peak_keyframe, self.frame_limit) {
+            self.qp_floor = match eased {
+                FloorEase::Down(next) => Some(next),
+                FloorEase::Off => None,
+            };
             self.qp_floor_moved = Some(now);
+            self.floor_keyframes = 0;
+            self.floor_peak_keyframe = 0;
+        }
+    }
+
+    /// Keyframe sizes while a floor is in force: what decides whether it
+    /// can ease ([`Self::relax_qp_floor`]).
+    fn note_keyframes(&mut self, out: &[EncodedFrame]) {
+        if self.qp_floor.is_none() {
+            return;
+        }
+        for keyframe in out.iter().filter(|f| f.is_keyframe) {
+            self.floor_keyframes += 1;
+            self.floor_peak_keyframe = self.floor_peak_keyframe.max(keyframe.data.len());
         }
     }
 
@@ -646,6 +698,7 @@ impl VideoEncoder for FfmpegEncoder {
             // Ground truth for the reopen-for-IDR backstop, as in encode.
             self.last_idr_out_ms = Some(keyframe.timestamp_ms);
         }
+        self.note_keyframes(&out);
         Ok(out)
     }
 
@@ -672,16 +725,19 @@ impl VideoEncoder for FfmpegEncoder {
 
     /// See [`VideoEncoder::frame_too_large`]: the next quantizer floor,
     /// applied by the session [`Self::ensure_session`] opens next.
-    fn frame_too_large(&mut self) -> Option<u32> {
-        let next = qp_floor_after_oversize(self.qp_floor)?;
+    fn frame_too_large(&mut self, bytes: usize, limit: usize) -> Option<u32> {
+        let next = qp_floor_after_oversize(self.qp_floor, bytes, limit)?;
         self.qp_floor = Some(next);
         self.qp_floor_moved = Some(Instant::now());
-        Some(QP_FLOORS[next])
+        self.frame_limit = limit;
+        self.floor_keyframes = 0;
+        self.floor_peak_keyframe = 0;
+        Some(next)
     }
 
     /// The quantizer floor in force, if any.
     fn qp_floor(&self) -> Option<u32> {
-        self.qp_floor.map(|i| QP_FLOORS[i])
+        self.qp_floor
     }
 
     /// See [`VideoEncoder::supports_forced_keyframes`]: everything we
@@ -702,14 +758,54 @@ impl VideoEncoder for FfmpegEncoder {
     }
 }
 
-/// The floor index after a frame too large: the first, the next, or
-/// `None` when the highest is already in force.
-fn qp_floor_after_oversize(current: Option<usize>) -> Option<usize> {
+/// The floor after a frame of `bytes` came out over `limit`: the first,
+/// one as much higher as that frame needed, or `None` when the highest
+/// is already in force.
+fn qp_floor_after_oversize(current: Option<u32>, bytes: usize, limit: usize) -> Option<u32> {
     match current {
-        None => Some(0),
-        Some(i) if i + 1 < QP_FLOORS.len() => Some(i + 1),
-        Some(_) => None,
+        None => Some(QP_FLOOR_FIRST),
+        Some(floor) if floor >= QP_FLOOR_MAX => None,
+        Some(floor) => Some((floor + qp_rise_to_fit(bytes, limit)).min(QP_FLOOR_MAX)),
     }
+}
+
+/// The QP rise that brings a frame of `bytes` under `limit` with 15 %
+/// to spare: six QP halve an H.264 frame, give or take, so 6·log2 of
+/// the ratio — rounded up to whole steps, one to four of them.
+fn qp_rise_to_fit(bytes: usize, limit: usize) -> u32 {
+    #[allow(clippy::cast_precision_loss)]
+    let ratio = bytes as f64 * 1.15 / limit.max(1) as f64;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let rise = (6.0 * ratio.log2()).ceil().max(0.0) as u32;
+    (rise.div_ceil(QP_FLOOR_STEP) * QP_FLOOR_STEP).clamp(QP_FLOOR_STEP, 4 * QP_FLOOR_STEP)
+}
+
+/// Where a quantizer floor eases to ([`qp_floor_relaxed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FloorEase {
+    /// One step down, to this floor.
+    Down(u32),
+    /// Off: the first floor goes.
+    Off,
+}
+
+/// Where the floor may ease to, given the largest keyframe since it
+/// last moved: a step down, off altogether from the first floor, or
+/// `None` (stay) when that keyframe leaves too little room.
+fn qp_floor_relaxed(floor: u32, peak_keyframe: usize, limit: usize) -> Option<FloorEase> {
+    let room_pct = if floor > QP_FLOOR_FIRST {
+        QP_FLOOR_RELAX_STEP_PCT
+    } else {
+        QP_FLOOR_RELAX_OFF_PCT
+    };
+    if limit == 0 || peak_keyframe * 100 > limit * room_pct {
+        return None;
+    }
+    Some(if floor > QP_FLOOR_FIRST {
+        FloorEase::Down((floor - QP_FLOOR_STEP).max(QP_FLOOR_FIRST))
+    } else {
+        FloorEase::Off
+    })
 }
 
 // SAFETY: These types own raw FFmpeg pointers (AVCodecContext, SwsContext,
@@ -995,7 +1091,7 @@ fn encoder_pix_fmt(name: &str) -> Pixel {
 /// Open one encoding session. `quality` sets the resolution bound and
 /// frame rate; the bitrate is the preset's scaled to `bitrate_scale_pct`
 /// (see [`RateControl`] for everything derived from it); `qp_floor` is
-/// the minimum quantizer after frames came out too large ([`QP_FLOORS`]).
+/// the minimum quantizer after frames came out too large ([`QP_FLOOR_FIRST`]).
 #[allow(clippy::too_many_arguments)] // one session's whole shape
 fn open_session(
     codec: ffmpeg::Codec,
@@ -1457,6 +1553,34 @@ fn scale_packed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The protocol's frame limit (255 chunks of 1080 B).
+    const LIMIT: usize = 275_400;
+
+    #[test]
+    fn a_floor_starts_at_the_first_and_rises_by_what_the_frame_needed() {
+        assert_eq!(qp_floor_after_oversize(None, 300_000, LIMIT), Some(QP_FLOOR_FIRST));
+        // Just over: one step.
+        assert_eq!(qp_floor_after_oversize(Some(24), 280_000, LIMIT), Some(26));
+        // Twice the limit: 6·log2(2.3) ≈ 7.2 → 8.
+        assert_eq!(qp_floor_after_oversize(Some(24), 2 * LIMIT, LIMIT), Some(32));
+        // Ten times: at most four steps, and never past the highest.
+        assert_eq!(qp_floor_after_oversize(Some(24), 10 * LIMIT, LIMIT), Some(32));
+        assert_eq!(qp_floor_after_oversize(Some(34), 2 * LIMIT, LIMIT), Some(QP_FLOOR_MAX));
+        assert_eq!(qp_floor_after_oversize(Some(QP_FLOOR_MAX), 2 * LIMIT, LIMIT), None);
+    }
+
+    #[test]
+    fn a_floor_eases_only_when_the_keyframes_leave_room() {
+        // A step down needs the largest keyframe within 60 % of the limit.
+        assert_eq!(qp_floor_relaxed(30, LIMIT / 2, LIMIT), Some(FloorEase::Down(28)));
+        assert_eq!(qp_floor_relaxed(30, LIMIT * 7 / 10, LIMIT), None);
+        // Off the first floor needs 35 %.
+        assert_eq!(qp_floor_relaxed(QP_FLOOR_FIRST, LIMIT / 2, LIMIT), None);
+        assert_eq!(qp_floor_relaxed(QP_FLOOR_FIRST, LIMIT / 4, LIMIT), Some(FloorEase::Off));
+        // No limit known yet: stay.
+        assert_eq!(qp_floor_relaxed(30, 1, 0), None);
+    }
 
     mod rate_control {
         use super::*;

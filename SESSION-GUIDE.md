@@ -783,6 +783,16 @@ Memory-mode servers (persistence off) still use the legacy
   the rest. Each wrapped line in such a form says `min-height:
   self.preferred-height` (`connect.slint`, 2026-10-16: render it at
   500×400, the window's minimum).
+- **A quantizer floor is the whole session's, on every encoder we use**
+  (`FFmpeg` 7.1, read 2026-10-17): `qmin` becomes AMF's
+  `AMF_VIDEO_ENCODER_MIN_QP` (the H.264 wrapper has no per-frame-type
+  minimum) and VideoToolbox's `MinAllowedFrameQP`, and VideoToolbox's
+  only rate bound is `DataRateLimits` over one second — one keyframe
+  may take most of it. So a floor meant for an oversized keyframe
+  costs every P-frame too: raise it no further than the frame needed
+  and ease it on measured keyframe room, not on a timer
+  (`video::codec::QP_FLOOR_FIRST`). The real way out for those two is
+  room for a bigger frame on the wire.
 - **A child's `max-width` caps the layout it is in, and whatever that
   layout fills**: a layout's maximum is its children's, so a 560 px
   cap on one `Text` shrank Settings' whole footer bar back to a column

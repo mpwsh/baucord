@@ -70,6 +70,14 @@ and the release pipeline.
 
 ### Desktop
 
+- **Sharper 1080p streams.** 1080p at 60 fps encodes at 10 Mbit/s (was
+  8) and at 30 fps at 7.5 (was 6). A frame too large to send no longer
+  costs the share minutes of quality: the encoder's quality floor
+  (since 1.1.9, the remedy for AMD's oversized keyframes; it binds
+  every frame, not only keyframes) now rises only as far as that frame
+  needed and comes back down once keyframes fit with room, instead of
+  jumping four steps at a time and reopening every 30 s into another
+  oversized keyframe. It was most of what AMD and Mac sharers lost.
 - **Settings save only on "Save and close".** Close, Escape and Back
   put everything back as it was when the page opened; Reset to
   defaults only changes the values on the page. Quitting with unsaved
