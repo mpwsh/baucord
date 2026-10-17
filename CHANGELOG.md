@@ -171,6 +171,10 @@ and the release pipeline.
   window, the last two until they no longer apply (a click on the
   device one opens Settings), and the card centres below them. A
   window shorter than the card scrolls.
+- Settings' and the admin panel's footer is a bar across the whole
+  window, with its buttons in the bottom-right corner; on a big window
+  they stopped in the middle of it. Settings scrolls with the bar at
+  the window's edge, and the admin panel's lists may grow to 960 px.
 - A ban says its length and reason with spaces between them ("…from
   this server for 2 h: spam", not "…from this serverfor 2 hspam").
 

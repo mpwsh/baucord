@@ -783,6 +783,12 @@ Memory-mode servers (persistence off) still use the legacy
   the rest. Each wrapped line in such a form says `min-height:
   self.preferred-height` (`connect.slint`, 2026-10-16: render it at
   500×400, the window's minimum).
+- **A child's `max-width` caps the layout it is in, and whatever that
+  layout fills**: a layout's maximum is its children's, so a 560 px
+  cap on one `Text` shrank Settings' whole footer bar back to a column
+  while it asked its Reset question (2026-10-17, ANDROID-SPEC D75).
+  Keep a measure on a layout of its own beside a stretching filler
+  (as `SettingsContent` does), never on a row of a full-width bar.
 - **The narrow (phone) layout renders only at a phone width:**
   `MainWindow` has `preferred-width`/`min-width`, so a fixture alone
   draws the wide layout. Copy the `.slint` tree, swap

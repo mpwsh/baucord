@@ -1035,10 +1035,10 @@ export component AdminPanel inherits Rectangle {
     in property <bool> narrow: false;
     /// Narrow only: a tab's page is showing, not the list.
     in-out property <bool> section-open: false;
-    // The tab and its Close button share one column beside the tabs,
-    // at most 840 px wide: on a maximized window a row's controls stay
-    // near its name and the button under the list, not at the far edge.
-    property <length> column: Math.min(root.width - 188px, 840px);
+    // The tab keeps to a column beside the tabs, at most 960 px wide:
+    // on a maximized window a row's controls stay within reach of its
+    // name. The Close bar under it spans the whole width (ANDROID-SPEC.md D75).
+    property <length> column: Math.min(root.width - 188px, 960px);
     // The column is narrower than a wide row needs (the Users row's
     // Actions and role pickers beside the name; the audit table's
     // columns): rows stack instead.
@@ -1073,8 +1073,14 @@ export component AdminPanel inherits Rectangle {
             }
         }
         VerticalLayout {
-            width: root.column;
-            AdminContent { tab: root.tab; compact: root.compact; }
+            HorizontalLayout {
+                AdminContent {
+                    width: root.column;
+                    tab: root.tab;
+                    compact: root.compact;
+                }
+                Rectangle { }
+            }
             Rectangle {
                 height: 64px;
                 background: Theme.bg-primary;
@@ -1087,8 +1093,6 @@ export component AdminPanel inherits Rectangle {
                 }
             }
         }
-        // The rest of a wide window.
-        Rectangle { }
     }
 
     if root.narrow : VerticalLayout {

@@ -255,6 +255,11 @@ Play music in another app first, at a steady volume.
   down to its smallest: the card stays centred, and at the smallest
   height it scrolls with the wheel instead of cutting off its top and
   bottom.
+- [ ] **new** — maximise the window, open Settings, then the admin
+  panel: the line above the footer runs to the right edge and Save and
+  close (Close in the panel) sits in the bottom-right corner; Reset to
+  defaults' question keeps the bar full width. Settings' scroll bar is
+  at the window's edge.
 - [ ] **new** — ban yourself from a test server (no reason, then
   "spam" for 1 h) and connect: a red toast at the top reads "…from
   this server indefinitely: (no reason given)" / "…for 1 h: spam",
