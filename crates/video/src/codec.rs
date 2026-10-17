@@ -1559,25 +1559,46 @@ mod tests {
 
     #[test]
     fn a_floor_starts_at_the_first_and_rises_by_what_the_frame_needed() {
-        assert_eq!(qp_floor_after_oversize(None, 300_000, LIMIT), Some(QP_FLOOR_FIRST));
+        assert_eq!(
+            qp_floor_after_oversize(None, 300_000, LIMIT),
+            Some(QP_FLOOR_FIRST)
+        );
         // Just over: one step.
         assert_eq!(qp_floor_after_oversize(Some(24), 280_000, LIMIT), Some(26));
         // Twice the limit: 6·log2(2.3) ≈ 7.2 → 8.
-        assert_eq!(qp_floor_after_oversize(Some(24), 2 * LIMIT, LIMIT), Some(32));
+        assert_eq!(
+            qp_floor_after_oversize(Some(24), 2 * LIMIT, LIMIT),
+            Some(32)
+        );
         // Ten times: at most four steps, and never past the highest.
-        assert_eq!(qp_floor_after_oversize(Some(24), 10 * LIMIT, LIMIT), Some(32));
-        assert_eq!(qp_floor_after_oversize(Some(34), 2 * LIMIT, LIMIT), Some(QP_FLOOR_MAX));
-        assert_eq!(qp_floor_after_oversize(Some(QP_FLOOR_MAX), 2 * LIMIT, LIMIT), None);
+        assert_eq!(
+            qp_floor_after_oversize(Some(24), 10 * LIMIT, LIMIT),
+            Some(32)
+        );
+        assert_eq!(
+            qp_floor_after_oversize(Some(34), 2 * LIMIT, LIMIT),
+            Some(QP_FLOOR_MAX)
+        );
+        assert_eq!(
+            qp_floor_after_oversize(Some(QP_FLOOR_MAX), 2 * LIMIT, LIMIT),
+            None
+        );
     }
 
     #[test]
     fn a_floor_eases_only_when_the_keyframes_leave_room() {
         // A step down needs the largest keyframe within 60 % of the limit.
-        assert_eq!(qp_floor_relaxed(30, LIMIT / 2, LIMIT), Some(FloorEase::Down(28)));
+        assert_eq!(
+            qp_floor_relaxed(30, LIMIT / 2, LIMIT),
+            Some(FloorEase::Down(28))
+        );
         assert_eq!(qp_floor_relaxed(30, LIMIT * 7 / 10, LIMIT), None);
         // Off the first floor needs 35 %.
         assert_eq!(qp_floor_relaxed(QP_FLOOR_FIRST, LIMIT / 2, LIMIT), None);
-        assert_eq!(qp_floor_relaxed(QP_FLOOR_FIRST, LIMIT / 4, LIMIT), Some(FloorEase::Off));
+        assert_eq!(
+            qp_floor_relaxed(QP_FLOOR_FIRST, LIMIT / 4, LIMIT),
+            Some(FloorEase::Off)
+        );
         // No limit known yet: stay.
         assert_eq!(qp_floor_relaxed(30, 1, 0), None);
     }
