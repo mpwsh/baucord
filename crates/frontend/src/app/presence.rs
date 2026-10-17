@@ -290,6 +290,14 @@ impl AppState {
             .map(|u| u.channel_id)
     }
 
+    /// Whether `client_id` is in the channel we are in (us included).
+    pub(super) fn in_our_channel(&self, client_id: u64) -> bool {
+        self.session
+            .users
+            .get(&client_id)
+            .is_some_and(|u| Some(u.channel_id) == self.our_channel())
+    }
+
     pub(super) fn channel_name(&self, channel_id: u16) -> String {
         self.session
             .channels

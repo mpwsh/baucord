@@ -176,6 +176,9 @@ and the release pipeline.
   they stopped in the middle of it. Both scroll with the bar at the
   window's edge (the admin lists' bar ran over the role pickers), and
   the admin panel's rows may grow to 960 px.
+- A stream ending in your channel plays the start's two notes falling
+  (the setting is now "starts or stops sharing"). A sharer who quits or
+  leaves gets the leave chime alone.
 - Editing or making a role opens its own page in the Roles tab, in place
   of the list, with an arrow back; Escape and Back leave the editor
   before the panel.

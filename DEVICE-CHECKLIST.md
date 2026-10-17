@@ -180,6 +180,12 @@ Play music in another app first, at a steady volume.
 
 ### 1.3 Sharing a screen [P2-22, P2-26, P2-41, P2-44, P3-28]
 
+- [ ] **new** — with someone else in your channel: start a share, stop
+  it. Both of you hear the rising pair at the start and the falling
+  pair (the same two notes, high to low) a moment after the stop. Share
+  again and quit baucord mid-share, or move to the lobby: the other
+  side hears the leave chime only, not cut into by the stop. Untick
+  Settings → Sounds → "starts or stops sharing": neither plays.
 - [ ] **new** — share a screen where nothing moves; a second user
   starts watching a minute later. They get the picture at once. The
   sharer's stats line shows almost no bitrate while still [P2-41].

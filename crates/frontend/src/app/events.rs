@@ -9,6 +9,29 @@
 use super::*;
 
 impl AppState {
+    /// The stream-stopped sound for `client_id`'s share, after
+    /// `SHARE_STOP_SETTLE`, if they are still in our channel then.
+    fn play_share_stopped(client_id: u64) {
+        /// Well past the gap between a stop and the leave the server
+        /// sends with it; short enough to still read as the stream's
+        /// end.
+        const SHARE_STOP_SETTLE: Duration = Duration::from_millis(300);
+        let weak = APP.with(|a| a.borrow().as_ref().map(Rc::downgrade));
+        let Some(weak) = weak else {
+            return;
+        };
+        slint::Timer::single_shot(SHARE_STOP_SETTLE, move || {
+            with_app(&weak, |app| {
+                if app.in_our_channel(client_id) && app.settings.sounds.share_started_on() {
+                    app.voice
+                        .tx
+                        .send(VoiceControl::PlaySound(SoundType::ShareStopped))
+                        .ok();
+                }
+            });
+        });
+    }
+
     /// Drain every worker channel. Bounded like the FLTK loop was, and
     /// `FrameReady` is coalesced per stream: if frames queued while the
     /// UI thread was busy, blitting each stale frame just replays the
@@ -1082,12 +1105,7 @@ impl AppState {
                 }
                 // A stream going up in our channel — ours included: the
                 // sharer hears that they are live, the same as the room.
-                let in_our_channel = self
-                    .session
-                    .users
-                    .get(&client_id)
-                    .is_some_and(|u| Some(u.channel_id) == self.our_channel());
-                if in_our_channel && self.settings.sounds.share_started_on() {
+                if self.in_our_channel(client_id) && self.settings.sounds.share_started_on() {
                     self.voice
                         .tx
                         .send(VoiceControl::PlaySound(SoundType::ShareStarted))
@@ -1112,6 +1130,15 @@ impl AppState {
                 }
                 if let Some(viewer) = self.viewers.remove(&client_id) {
                     viewer.close();
+                }
+                // And coming down, ours included, under the same switch.
+                // A beat later and only if the sharer is still with us: a
+                // sharer who quits or leaves for the lobby sends the stop
+                // and the leave together, the leave chime says it, and a
+                // sound started under it would be cut off at once (one
+                // plays at a time).
+                if self.in_our_channel(client_id) && self.settings.sounds.share_started_on() {
+                    Self::play_share_stopped(client_id);
                 }
             }
             // ── 1.1.2: profiles and blobs (spec §7, §7.1) ────────────

@@ -34,6 +34,9 @@ pub enum SoundType {
     DirectMessage,
     /// Someone in our channel started sharing their screen.
     ShareStarted,
+    /// Someone in our channel stopped sharing: the start's two notes,
+    /// falling.
+    ShareStopped,
     /// Someone started watching the stream we share (softer: it is
     /// for the sharer alone, and viewers come and go).
     ViewerJoined,
@@ -52,6 +55,7 @@ pub struct SoundBank {
     mention: Vec<f32>,
     direct: Vec<f32>,
     share_started: Vec<f32>,
+    share_stopped: Vec<f32>,
     viewer_joined: Vec<f32>,
     went_quiet: Vec<f32>,
     back_live: Vec<f32>,
@@ -77,6 +81,9 @@ impl SoundBank {
             // apart, held — nothing like the DM chime's quick high
             // arpeggio. A short, quieter pair for a viewer arriving.
             share_started: synth_notes(&[(392.0, 0.12), (587.0, 0.22)], 0.30),
+            // And coming down: the same two notes the other way round,
+            // the lower one held — the start's shape, falling.
+            share_stopped: synth_notes(&[(587.0, 0.12), (392.0, 0.22)], 0.30),
             viewer_joined: synth_notes(&[(784.0, 0.06), (988.0, 0.10)], 0.16),
             // The join chime's two notes, G4 and B♭4 (it rises from one
             // to the other), one at a time and calmer: a single soft
@@ -96,6 +103,7 @@ impl SoundBank {
             SoundType::Mention => &self.mention,
             SoundType::DirectMessage => &self.direct,
             SoundType::ShareStarted => &self.share_started,
+            SoundType::ShareStopped => &self.share_stopped,
             SoundType::ViewerJoined => &self.viewer_joined,
             SoundType::WentQuiet => &self.went_quiet,
             SoundType::BackLive => &self.back_live,

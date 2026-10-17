@@ -231,7 +231,8 @@ pub struct SoundSettings {
     /// us, and only us.
     #[serde(default = "default_true")]
     pub direct_message: bool,
-    /// Someone in our channel starts sharing their screen.
+    /// Someone in our channel starts or stops sharing their screen (the
+    /// name is from before the stop had a sound; kept for saved files).
     #[serde(default = "default_true")]
     pub share_started: bool,
     /// Someone starts watching the stream we share (a softer sound,
