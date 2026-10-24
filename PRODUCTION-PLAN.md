@@ -48,8 +48,8 @@ What stands between this and "production for strangers":
 6. **Phones in the stores.** What Google Play's review asks of the app
    shipped in 1.2 (§7); what is left for Play is mostly Play Console
    work (PLAY-STORE.md) plus MOB-16 and MOB-17. The App Store is not
-   decided; it would need MOB-2, MOB-3, MOB-6, the iOS half of MOB-5,
-   and MOB-19.
+   decided; it would need MOB-6 and MOB-19 (TestFlight from CI, with
+   the privacy manifest and an opaque icon, came 2026-10-23, §7).
 
 ## 2. Milestone A — safe to expose (do first)
 
@@ -412,25 +412,17 @@ was fixed on 2026-10-16 (§7), with what only a device can confirm in
 ## 4. Milestone C — phones in the stores
 
 Today's builds are a sideloaded APK (ANDROID-SPEC D4) and Ad Hoc builds
-(IOS-SPEC D37; D10 planned TestFlight). **Google Play is the goal**
-(§6, 2): **PLAY-STORE.md** is the process — account, signing, forms,
+(IOS-SPEC D37), with TestFlight from CI since 2026-10-23 (D67).
+**Google Play is the goal** (§6, 2): **PLAY-STORE.md** is the process — account, signing, forms,
 the 14-day closed test. What the app itself had to do for it shipped
 in 1.2 (§7); left here: MOB-5's Play side, MOB-16, MOB-17. The App
 Store is not decided yet.
 
-- [ ] **MOB-2 [P0][S] iOS privacy manifest.** No `PrivacyInfo.xcprivacy`;
-  the binary uses required-reason APIs (file timestamps through
-  `std::fs::metadata`, `mach_absolute_time` through cpal). App Store
-  Connect refuses uploads without it, TestFlight included.
-- [ ] **MOB-3 [P0][S] The iOS icon keeps its alpha channel**
-  (`ios/scripts/render_icon.sh`, on purpose for development); App
-  Store Connect rejects it. Flatten onto #1A1D21 for release builds.
 - [ ] **MOB-5 [P0][M] Store pipelines.** Android is done (§7;
   ANDROID-SPEC D62). Left: on Play's side, give it our release key as
   the app signing key, which is also the upload key (PLAY-STORE.md §4,
   the user); later, upload from CI through the Play Developer API. iOS
-  exports Ad Hoc only (`ios-release.yml` ~148, ~231): add the App
-  Store/TestFlight export and the symbol upload.
+  is done (TestFlight upload with the dSYMs, 2026-10-23, §7).
 - [ ] **MOB-6 [P1][S] Encryption export compliance.** No
   `ITSAppUsesNonExemptEncryption` in the Info.plist; rustls/ring are
   non-Apple cryptography (a BIS self-classification is likely). Play:
@@ -1696,6 +1688,11 @@ One line each; the spec decision named holds the detail.
     **Not run anywhere real:** Windows DXGI halving and the pointer
     redraw, E16's streams, everything on iOS, the server against a
     live deployment — `DEVICE-CHECKLIST.md` **[10-16]**.
+- **2026-10-23 — MOB-2, MOB-3, MOB-5 (iOS)**: the privacy manifest,
+  checked in CI against the binary's imports; the app icon opaque in
+  every build; `ios-release.yml` uploads to TestFlight with an App Store
+  profile and an App Store Connect API key (IOS-SPEC D67). Not yet run
+  on a Mac (DEVICE-CHECKLIST §3.5); the encryption answer is MOB-6.
 
 ## 8. Facts this plan rests on
 

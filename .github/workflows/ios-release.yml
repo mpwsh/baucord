@@ -1,7 +1,15 @@
-# Builds the iOS app on release (or manual run). With the signing secrets it
-# exports an Ad Hoc .ipa and attaches it to the release; without them the
-# unsigned build is only a workflow artifact.
-# Secrets: IOS_CERTIFICATE_P12_BASE64, IOS_CERTIFICATE_PASSWORD, IOS_PROFILE_BASE64.
+# Builds the iOS app on release (or manual run), then, depending on the
+# secrets present (ios/README.md §3b, §3c; IOS-SPEC.md D37, D67):
+# - the certificate and an Ad Hoc profile: an Ad Hoc .ipa, attached to the
+#   release;
+# - the certificate, an App Store profile and an App Store Connect API key:
+#   the build uploaded to TestFlight (on a release; on a manual run only
+#   when its "testflight" box is ticked);
+# - neither: the unsigned build, as a workflow artifact only.
+# Both profiles may be present: one archive, two exports.
+# Secrets: IOS_CERTIFICATE_P12_BASE64, IOS_CERTIFICATE_PASSWORD,
+#   IOS_PROFILE_BASE64 (Ad Hoc), IOS_APPSTORE_PROFILE_BASE64 (App Store),
+#   ASC_API_KEY_P8_BASE64, ASC_API_KEY_ID, ASC_API_ISSUER_ID.
 # Variable (optional): IOS_BUNDLE_ID (default dev.baucord).
 name: ios-release
 
@@ -13,6 +21,10 @@ on:
       tag:
         description: "Tag to label the build with (dry run: the .ipa is a workflow artifact, not a release asset)"
         default: "manual"
+      testflight:
+        description: "Also upload the build to TestFlight (needs the App Store profile and API key secrets)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write   # gh release upload
@@ -32,6 +44,9 @@ jobs:
       # Secrets can't be tested in a step's `if:`; these env copies can.
       P12_B64: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 }}
       PROFILE_B64: ${{ secrets.IOS_PROFILE_BASE64 }}
+      APPSTORE_PROFILE_B64: ${{ secrets.IOS_APPSTORE_PROFILE_BASE64 }}
+      # A release uploads whenever it can; a manual run only when asked.
+      WANT_TESTFLIGHT: ${{ github.event_name == 'release' || github.event.inputs.testflight == 'true' }}
       # The runner's CMake 4 rejects libopus' old cmake_minimum_required.
       CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     steps:
@@ -80,8 +95,8 @@ jobs:
           key: ios-release-arm64
           save-if: false
 
-      - name: Install signing certificate and profile
-        if: ${{ env.P12_B64 != '' && env.PROFILE_B64 != '' }}
+      - name: Install signing certificate and profiles
+        if: ${{ env.P12_B64 != '' && (env.PROFILE_B64 != '' || env.APPSTORE_PROFILE_B64 != '') }}
         env:
           P12_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
         run: |
@@ -89,7 +104,6 @@ jobs:
           KEYCHAIN="$RUNNER_TEMP/baucord-signing.keychain-db"
           KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
           echo "$P12_B64" | base64 --decode > "$RUNNER_TEMP/signing.p12"
-          echo "$PROFILE_B64" | base64 --decode > "$RUNNER_TEMP/adhoc.mobileprovision"
 
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           security set-keychain-settings -lut 21600 "$KEYCHAIN"
@@ -105,33 +119,76 @@ jobs:
             exit 1
           fi
 
-          security cms -D -i "$RUNNER_TEMP/adhoc.mobileprovision" > "$RUNNER_TEMP/profile.plist"
           PB=/usr/libexec/PlistBuddy
-          UUID="$($PB -c 'Print :UUID' "$RUNNER_TEMP/profile.plist")"
-          NAME="$($PB -c 'Print :Name' "$RUNNER_TEMP/profile.plist")"
-          TEAM="$($PB -c 'Print :TeamIdentifier:0' "$RUNNER_TEMP/profile.plist")"
-          APPID="$($PB -c 'Print :Entitlements:application-identifier' "$RUNNER_TEMP/profile.plist")"
-          if [ "$APPID" != "$TEAM.$BUNDLE_ID" ]; then
-            echo "::error::the profile is for $APPID, the build for $TEAM.$BUNDLE_ID — make the profile for $BUNDLE_ID, or set the IOS_BUNDLE_ID variable to the profile's app id"
-            exit 1
-          fi
-          if ! $PB -c 'Print :ProvisionedDevices' "$RUNNER_TEMP/profile.plist" > "$RUNNER_TEMP/devices.txt" 2>/dev/null; then
-            echo "::error::\"$NAME\" lists no devices: not an Ad Hoc profile (an App Store one is for TestFlight, which this workflow does not upload to)"
-            exit 1
-          fi
-          DEVICES="$(grep -c '^ ' "$RUNNER_TEMP/devices.txt" || true)"
-          echo "profile \"$NAME\" ($UUID): team $TEAM, $APPID, $DEVICES device(s), expires $($PB -c 'Print :ExpirationDate' "$RUNNER_TEMP/profile.plist")"
+          TEAM=""
+          # install_profile KIND BASE64: decode a profile, check it is the
+          # KIND it was given as (adhoc: lists devices; appstore: lists
+          # none and is not an enterprise one) and for this app, install
+          # it, and leave its name in PROFILE_NAME.
+          install_profile() {
+            local kind="$1" b64="$2"
+            local file="$RUNNER_TEMP/$kind.mobileprovision" plist="$RUNNER_TEMP/$kind.plist"
+            local uuid name team appid devices all
+            echo "$b64" | base64 --decode > "$file"
+            security cms -D -i "$file" > "$plist"
+            uuid="$($PB -c 'Print :UUID' "$plist")"
+            name="$($PB -c 'Print :Name' "$plist")"
+            team="$($PB -c 'Print :TeamIdentifier:0' "$plist")"
+            appid="$($PB -c 'Print :Entitlements:application-identifier' "$plist")"
+            if [ "$appid" != "$team.$BUNDLE_ID" ]; then
+              echo "::error::the $kind profile \"$name\" is for $appid, the build for $team.$BUNDLE_ID — make the profile for $BUNDLE_ID, or set the IOS_BUNDLE_ID variable to the profile's app id"
+              exit 1
+            fi
+            if [ -n "$TEAM" ] && [ "$team" != "$TEAM" ]; then
+              echo "::error::the two profiles belong to different teams ($TEAM, $team)"
+              exit 1
+            fi
+            TEAM="$team"
+            devices=""
+            if $PB -c 'Print :ProvisionedDevices' "$plist" > "$RUNNER_TEMP/$kind-devices.txt" 2>/dev/null; then
+              devices="$(grep -c '^ ' "$RUNNER_TEMP/$kind-devices.txt" || true)"
+            fi
+            all="$($PB -c 'Print :ProvisionsAllDevices' "$plist" 2>/dev/null || echo false)"
+            case "$kind" in
+              adhoc)
+                if [ -z "$devices" ]; then
+                  echo "::error::IOS_PROFILE_BASE64 holds \"$name\", which lists no devices: not an Ad Hoc profile (an App Store one goes in IOS_APPSTORE_PROFILE_BASE64)"
+                  exit 1
+                fi ;;
+              appstore)
+                if [ -n "$devices" ] || [ "$all" = true ]; then
+                  echo "::error::IOS_APPSTORE_PROFILE_BASE64 holds \"$name\", which is not an App Store profile (it lists devices, or all of them: Ad Hoc, Development or In-House)"
+                  exit 1
+                fi ;;
+            esac
+            echo "$kind profile \"$name\" ($uuid): team $team, $appid, ${devices:-no} device(s), expires $($PB -c 'Print :ExpirationDate' "$plist")"
+            for DIR in "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles" \
+                       "$HOME/Library/MobileDevice/Provisioning Profiles"; do
+              mkdir -p "$DIR"
+              cp "$file" "$DIR/$uuid.mobileprovision"
+            done
+            PROFILE_NAME="$name"
+          }
 
-          for DIR in "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles" \
-                     "$HOME/Library/MobileDevice/Provisioning Profiles"; do
-            mkdir -p "$DIR"
-            cp "$RUNNER_TEMP/adhoc.mobileprovision" "$DIR/$UUID.mobileprovision"
-          done
+          ADHOC_PROFILE_NAME=""
+          APPSTORE_PROFILE_NAME=""
+          if [ -n "$PROFILE_B64" ]; then
+            install_profile adhoc "$PROFILE_B64"
+            ADHOC_PROFILE_NAME="$PROFILE_NAME"
+          fi
+          if [ -n "$APPSTORE_PROFILE_B64" ]; then
+            install_profile appstore "$APPSTORE_PROFILE_B64"
+            APPSTORE_PROFILE_NAME="$PROFILE_NAME"
+          fi
           {
             echo "SIGNED=1"
             echo "KEYCHAIN=$KEYCHAIN"
             echo "TEAM_ID=$TEAM"
-            echo "PROFILE_NAME=$NAME"
+            echo "ADHOC_PROFILE_NAME=$ADHOC_PROFILE_NAME"
+            echo "APPSTORE_PROFILE_NAME=$APPSTORE_PROFILE_NAME"
+            # The archive is signed with either; each export re-signs it
+            # with its own.
+            echo "ARCHIVE_PROFILE_NAME=${ADHOC_PROFILE_NAME:-$APPSTORE_PROFILE_NAME}"
           } >> "$GITHUB_ENV"
 
       - name: Generate Xcode project
@@ -161,7 +218,7 @@ jobs:
               CODE_SIGN_STYLE=Manual
               DEVELOPMENT_TEAM="$TEAM_ID"
               CODE_SIGN_IDENTITY="Apple Distribution"
-              PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME"
+              PROVISIONING_PROFILE_SPECIFIER="$ARCHIVE_PROFILE_NAME"
               OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN"
             )
           else
@@ -185,8 +242,56 @@ jobs:
           fi
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' -c 'Print :CFBundleShortVersionString' -c 'Print :CFBundleVersion' "$APP/Info.plist"
 
+      # App Store Connect refuses a build whose binary calls a "required
+      # reason" API its privacy manifest does not declare (ITMS-91053).
+      # This looks for the same APIs in what the binary imports and the
+      # Objective-C names it carries — a best effort, not Apple's own
+      # scan — so a new dependency shows up here, not in a rejection
+      # email (IOS-SPEC.md D67).
+      - name: Check the privacy manifest against the binary
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/baucord.xcarchive/Products/Applications/baucord.app"
+          MANIFEST="$APP/PrivacyInfo.xcprivacy"
+          if [ ! -f "$MANIFEST" ]; then
+            echo "::error::the app bundle has no PrivacyInfo.xcprivacy (ios/Resources/PrivacyInfo.xcprivacy, listed in ios/project.yml)"
+            exit 1
+          fi
+          plutil -convert xml1 -o "$RUNNER_TEMP/manifest.xml" "$MANIFEST"
+          { grep -o 'NSPrivacyAccessedAPICategory[A-Za-z]*' "$RUNNER_TEMP/manifest.xml" || true; } | sort -u > "$RUNNER_TEMP/declared.txt"
+          nm -u "$APP/baucord" > "$RUNNER_TEMP/imports.txt"
+          strings -a "$APP/baucord" > "$RUNNER_TEMP/strings.txt"
+          FAIL=0
+          # check CATEGORY IMPORTS-REGEX [NAMES-REGEX] (either may be '')
+          check() {
+            local category="$1" imports="$2" names="${3:-}" found
+            found="$( { if [ -n "$imports" ]; then grep -E "$imports" "$RUNNER_TEMP/imports.txt" || true; fi
+                        if [ -n "$names" ]; then grep -o -E "$names" "$RUNNER_TEMP/strings.txt" | sort -u || true; fi
+                      } | tr '\n' ' ')"
+            if grep -x "NSPrivacyAccessedAPICategory$category" "$RUNNER_TEMP/declared.txt" >/dev/null; then
+              if [ -n "$found" ]; then
+                echo "$category: declared; the binary uses $found"
+              else
+                echo "::warning::$category is declared, but the binary no longer seems to use it — check, then drop it from ios/Resources/PrivacyInfo.xcprivacy"
+              fi
+            elif [ -n "$found" ]; then
+              echo "::error::the binary uses $category APIs ($found), which ios/Resources/PrivacyInfo.xcprivacy does not declare: App Store Connect would refuse the upload. Add the category with the reason that fits (Apple: \"Describing use of required reason API\")"
+              FAIL=1
+            fi
+          }
+          # The $ in these are regex anchors, not expansions.
+          # shellcheck disable=SC2016
+          {
+            check FileTimestamp '^_(f?stat|lstat|fstatat|f?getattrlist|getattrlistat|getattrlistbulk)(64)?(\$INODE64)?$|^_NSURL(CreationDate|ContentModificationDate|AttributeModificationDate)Key$|^_NSFile(CreationDate|ModificationDate)$'
+            check SystemBootTime '^_mach_absolute_time$' 'systemUptime'
+            check DiskSpace '^_f?statv?fs(64)?(\$INODE64)?$|^_NSURLVolume(Available|Total)Capacity(ForImportantUsage|ForOpportunisticUsage)?Key$|^_NSFileSystem(Free)?Size$'
+            check ActiveKeyboards '' 'activeInputModes'
+            check UserDefaults '^_OBJC_CLASS_\$_NSUserDefaults$' 'NSUserDefaults'
+          }
+          exit "$FAIL"
+
       - name: Export signed .ipa
-        if: ${{ env.SIGNED == '1' }}
+        if: ${{ env.ADHOC_PROFILE_NAME != '' }}
         run: |
           set -euo pipefail
           cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
@@ -199,7 +304,7 @@ jobs:
             <key>signingStyle</key><string>manual</string>
             <key>signingCertificate</key><string>Apple Distribution</string>
             <key>provisioningProfiles</key>
-            <dict><key>$BUNDLE_ID</key><string>$PROFILE_NAME</string></dict>
+            <dict><key>$BUNDLE_ID</key><string>$ADHOC_PROFILE_NAME</string></dict>
             <key>thinning</key><string>&lt;none&gt;</string>
           </dict>
           </plist>
@@ -215,6 +320,58 @@ jobs:
           codesign --verify --deep --strict Payload/baucord.app
           codesign -dv Payload/baucord.app 2>&1 | grep -E "Identifier|Authority=Apple Distribution|TeamIdentifier"
 
+      # One archive, re-signed with the App Store profile and sent to App
+      # Store Connect by xcodebuild itself (destination "upload"), dSYMs
+      # included; it shows under TestFlight once Apple has processed it.
+      # The build number is the run number (above), which only grows; a
+      # build uploaded from a Mac with run.sh's commit count could be
+      # higher and make this one be refused (ios/README.md §3c).
+      - name: Upload to TestFlight
+        if: ${{ env.APPSTORE_PROFILE_NAME != '' && env.WANT_TESTFLIGHT == 'true' }}
+        env:
+          ASC_KEY_B64: ${{ secrets.ASC_API_KEY_P8_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          for NAME in ASC_KEY_B64 ASC_KEY_ID ASC_ISSUER_ID; do
+            if [ -z "${!NAME}" ]; then
+              echo "::error::the App Store profile is there but the App Store Connect API key is not: set ASC_API_KEY_P8_BASE64, ASC_API_KEY_ID and ASC_API_ISSUER_ID (ios/README.md §3c)"
+              exit 1
+            fi
+          done
+          KEY="$RUNNER_TEMP/AuthKey_${ASC_KEY_ID}.p8"
+          trap 'rm -f "$KEY"' EXIT
+          (umask 077 && echo "$ASC_KEY_B64" | base64 --decode > "$KEY")
+
+          cat > "$RUNNER_TEMP/ExportOptions-appstore.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>$TEAM_ID</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>signingCertificate</key><string>Apple Distribution</string>
+            <key>provisioningProfiles</key>
+            <dict><key>$BUNDLE_ID</key><string>$APPSTORE_PROFILE_NAME</string></dict>
+            <key>uploadSymbols</key><true/>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+          </dict>
+          </plist>
+          EOF
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/baucord.xcarchive" \
+            -exportPath "$RUNNER_TEMP/appstore" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions-appstore.plist" \
+            -authenticationKeyPath "$KEY" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+          VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$RUNNER_TEMP/baucord.xcarchive/Products/Applications/baucord.app/Info.plist")"
+          BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$RUNNER_TEMP/baucord.xcarchive/Products/Applications/baucord.app/Info.plist")"
+          echo "::notice::uploaded $VERSION ($BUILD) to App Store Connect; it appears under TestFlight once processed"
+
       - name: Package unsigned .ipa
         if: ${{ env.SIGNED != '1' }}
         run: |
@@ -227,10 +384,16 @@ jobs:
         id: out
         run: |
           set -eu
-          if [ "${SIGNED:-}" = 1 ]; then
+          # An App Store profile alone makes no .ipa to keep: the artifact
+          # is then the dSYMs.
+          if [ -n "${ADHOC_PROFILE_NAME:-}" ]; then
             echo "ipa=baucord-ios-${TAG}.ipa" >> "$GITHUB_OUTPUT"
-          else
+            echo "name=baucord-ios-${TAG}.ipa" >> "$GITHUB_OUTPUT"
+          elif [ "${SIGNED:-}" != 1 ]; then
             echo "ipa=baucord-ios-${TAG}-unsigned.ipa" >> "$GITHUB_OUTPUT"
+            echo "name=baucord-ios-${TAG}-unsigned.ipa" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=baucord-ios-${TAG}-dSYMs" >> "$GITHUB_OUTPUT"
           fi
           if [ -d "$RUNNER_TEMP/baucord.xcarchive/dSYMs" ]; then
             ditto -c -k --keepParent "$RUNNER_TEMP/baucord.xcarchive/dSYMs" "baucord-ios-${TAG}-dSYMs.zip"
@@ -242,14 +405,14 @@ jobs:
       - name: Upload .ipa and dSYMs
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ steps.out.outputs.ipa }}
+          name: ${{ steps.out.outputs.name }}
           path: |
             ${{ steps.out.outputs.ipa }}
             ${{ steps.out.outputs.dsyms }}
           if-no-files-found: error
 
       - name: Attach .ipa to release
-        if: ${{ github.event_name == 'release' && env.SIGNED == '1' }}
+        if: ${{ github.event_name == 'release' && env.ADHOC_PROFILE_NAME != '' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$TAG" "${{ steps.out.outputs.ipa }}" --clobber

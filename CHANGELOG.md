@@ -148,6 +148,10 @@ and the release pipeline.
   desktop (the three buttons stack on a narrow screen).
 - A stream whose decoder lost its session asks for a fresh picture
   instead of staying frozen.
+- iPhone: builds can go to TestFlight, uploaded by the release workflow
+  (with an App Store profile and an App Store Connect API key). The app
+  carries a privacy manifest, and its icon no longer has transparent
+  corners, which iOS showed as black.
 
 ### Everyone
 

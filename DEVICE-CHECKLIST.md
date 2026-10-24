@@ -889,6 +889,30 @@ now (`PRODUCTION-PLAN.md` §6).
 
 ---
 
+### 3.5 TestFlight **[10-23]** [IOS-SPEC D67]
+
+Written in the Linux sandbox: the workflow was linted and its shell run
+against stand-ins, the Swift helper never met a compiler.
+
+- [ ] **the icon** — `ios/run.sh` (any build): the build log shows
+  `app icon: … (1024x1024, opaque)`; on the home screen, the dog on its
+  disc with corners in the app's dark background, not black. If the
+  step stops in `flatten_icon.swift`, paste the log.
+- [ ] **the manifest in the bundle** — Xcode → the target → Build
+  Phases → Copy Bundle Resources lists `PrivacyInfo.xcprivacy`; the
+  built `baucord.app` has it at its root.
+- [ ] **CI as before** — ios-release by hand, *testflight* unticked:
+  green; "Check the privacy manifest against the binary" lists
+  FileTimestamp and SystemBootTime as used, with no error or warning.
+  An error there names the API to declare.
+- [ ] **the first upload** — the secrets of ios/README §3c, then a run
+  with *testflight* ticked: the step ends with *uploaded 1.3.0 (N)*;
+  App Store Connect → TestFlight shows the build processing, then
+  *Missing Compliance* (answer it; MOB-6); it installs from the
+  TestFlight app on a phone that is not in the Ad Hoc profile.
+- [ ] **no rejection email** — nothing from App Store Connect about
+  ITMS-91053 (an undeclared API) or the icon in the hour after.
+
 ## 4. macOS **[7]**
 
 Not covered before; the seventh batch changed it. A Mac with Apple

@@ -63,6 +63,13 @@ targets:
       - path: Resources/en.lproj
       - path: Resources/es.lproj
       - path: Resources/pt-BR.lproj
+      # The privacy manifest: the "required reason" APIs the binary
+      # calls (IOS-SPEC D67, MOB-2). App Store Connect refuses an upload
+      # without it, TestFlight included. Named as a resource so it lands
+      # at the bundle's root whatever XcodeGen makes of the extension;
+      # CI checks it against the binary's imports.
+      - path: Resources/PrivacyInfo.xcprivacy
+        buildPhase: resources
 
     info:
       path: Generated/Info.plist
@@ -121,6 +128,9 @@ targets:
         script: 'bash "${SRCROOT}/scripts/render_icon.sh"'
         inputFiles:
           - $(SRCROOT)/../assets/icons/icon.png
+          # The scripts too: a change to how the icon is drawn redraws it.
+          - $(SRCROOT)/scripts/render_icon.sh
+          - $(SRCROOT)/scripts/flatten_icon.swift
         outputFiles:
           - $(SRCROOT)/Resources/Assets.xcassets/AppIcon.appiconset/icon-1024.png
 

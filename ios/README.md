@@ -160,8 +160,63 @@ phone says it is, turn it on as in 3a, step 4):
   onto the phone's tile.
 
 A phone that is not in the profile refuses it ("unable to install");
-add its UDID (steps 2 and 4). To give it to people without USB, the
-next step is TestFlight (spec M5).
+add its UDID (steps 2 and 4). To give it to people without USB or
+UDIDs: TestFlight, §3c.
+
+### 3c. TestFlight (the same workflow)
+
+With an App Store profile and an App Store Connect API key in the
+secrets as well, the workflow also uploads the build to App Store
+Connect, and it appears in TestFlight once Apple has processed it
+(IOS-SPEC D67). Testers install the TestFlight app and need neither a
+UDID nor a cable; a build lasts 90 days. The Ad Hoc `.ipa` of §3b goes
+on being made while its profile is there.
+
+Once, besides §3b's app id (step 1) and Apple Distribution `.p12`
+(step 3), which serve both:
+
+1. **App Store Connect** (appstoreconnect.apple.com) → Apps → **+** →
+   New App: iOS, a name (it has to be free on the App Store), the
+   language, the bundle id from step 1, any SKU.
+2. developer.apple.com → Profiles → **+** → *App Store Connect* (under
+   Distribution) → the app id → the certificate → download the
+   `.mobileprovision`.
+3. App Store Connect → Users and Access → Integrations → **App Store
+   Connect API** → Team Keys → **+** → access *App Manager* → download
+   the `.p8` (Apple lets you download it once). Note its Key ID and the
+   Issuer ID shown above the list.
+4. Four more repository secrets:
+   ```sh
+   base64 -i baucord_App_Store.mobileprovision | pbcopy  # → IOS_APPSTORE_PROFILE_BASE64
+   base64 -i AuthKey_XXXXXXXXXX.p8 | pbcopy             # → ASC_API_KEY_P8_BASE64
+                                                       #   ASC_API_KEY_ID: the key's ID
+                                                       #   ASC_API_ISSUER_ID: the Issuer ID
+   ```
+
+Then Actions → ios-release → Run workflow → tick **testflight**; a
+published release uploads by itself. Checks before the upload: the
+profiles' kinds, app id and team, and the privacy manifest against what
+the binary calls (a missing declaration fails the run with the API's
+name, see `Resources/PrivacyInfo.xcprivacy`).
+
+After the upload, in App Store Connect → the app → **TestFlight**:
+
+- The build shows *Processing* for a while, then **Missing
+  Compliance**: the app does not answer the encryption question in its
+  Info.plist yet (MOB-6), so answer it there, once per build.
+- **Internal testing**: up to 100 people with a role on the App Store
+  Connect team; no review.
+- **External testing** (anyone with an email or a public link): Beta App
+  Review first, which wants a description, a feedback email, a privacy
+  policy URL (`web/privacy.html`'s page) and, in the review notes, a
+  server and an invite code to get in with. The lobby's background
+  audio is an open question for that review (PRODUCTION-PLAN §6, 2).
+
+The build number is the workflow's run number, which only grows, and
+App Store Connect wants each upload of a version to carry a higher one.
+Upload from CI only: a build sent from a Mac would carry `run.sh`'s
+commit count, likely higher, and the next CI uploads of that version
+would be refused.
 
 ## 4. Logs
 

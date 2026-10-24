@@ -3,8 +3,8 @@
 > **Status (2026-10-09):** 1.2.0, Ad Hoc builds on users' iPhones
 > (from CI, D37, or `run.sh --device`). §0–§13 describe the client as
 > it is now; §14 holds every decision taken since the first draft
-> (D14…D64, in order), each with its reason. What is left:
-> `PRODUCTION-PLAN.md` (MOB-2, 3, 5, 6, 9, 10, 19). Start from
+> (D14…D67, in order), each with its reason. What is left:
+> `PRODUCTION-PLAN.md` (MOB-6, 9, 10, 19). Start from
 > `START-HERE.md`.
 
 `ANDROID-SPEC.md` is this spec's older sibling: almost everything the
@@ -41,8 +41,8 @@ would update the app), iOS before 17, Intel Macs' simulator.
 | D7 | The iOS host selects **winit + Skia** itself; the frontend's own choice (Skia on the CPU) is compiled out on iOS | that choice keeps Windows Game Mode from classing baucord as a game; on a phone it would cost battery and ProMotion's 120 Hz |
 | D8 | Echo cancellation = Apple's **Voice-Processing I/O unit (VPIO)**, a native backend `audio/src/native/vpio.rs` on `coreaudio-rs`, written for iOS (D47) and reusable on macOS | AEC-SPEC.md D1 (platform AEC first); VPIO is also that spec's planned macOS route (§9, E8) — one backend serves both |
 | D9 | Stream viewing = **VideoToolbox** (`VTDecompressionSession`) as a fourth `VideoDecoder` (D30) | hardware H.264 with no FFmpeg for iOS (`video` swaps in `codec_stub.rs` there), the way MediaCodec did it on Android (D23 there) |
-| D10 | Distribution: **development installs from Xcode** (a free Apple ID works: 7-day profiles, 3 apps per device); **Ad Hoc** builds from CI for the paid program's registered phones (D37); **TestFlight** to give it to anyone else — not yet (MOB-5) | iOS has no APK equivalent; TestFlight is the closest thing to "send people a build" |
-| D11 | The app icon is the repo's **`assets/icons/icon.png`**, rendered at build time into one 1024 px asset (`sips`) | Android's D36 for iOS: one picture for every platform |
+| D10 | Distribution: **development installs from Xcode** (a free Apple ID works: 7-day profiles, 3 apps per device); **Ad Hoc** builds from CI for the paid program's registered phones (D37); **TestFlight** to give it to anyone else — from CI since D67 | iOS has no APK equivalent; TestFlight is the closest thing to "send people a build" |
+| D11 | The app icon is the repo's **`assets/icons/icon.png`**, rendered at build time into one 1024 px asset (`sips`; since D67 drawn onto #1A1D21 with no alpha channel) | Android's D36 for iOS: one picture for every platform |
 | D12 | Bundle id **`dev.baucord`** (overridable per machine in `Config/Local.xcconfig`), display name "baucord" | the Android `applicationId`; bundle ids are global across Apple accounts, so a developer whose id is taken sets their own |
 | D13 | **Staying connected:** the `audio` background mode keeps the process running while audio runs (Android's foreground service, D34 there). Since D51 a connected app always has some: the VPIO unit in a room, a plain output in the lobby. A disconnected app is suspended with the screen | iOS has no sanctioned way to keep a chat socket alive in the background; push notifications are the real answer (PRD-1) |
 
@@ -65,11 +65,13 @@ baucord/
     Config/Base.xcconfig      shared settings; includes Version.xcconfig and Local.xcconfig
     Config/Local.xcconfig.example   your signing team / bundle id (copy it)
     scripts/build_with_cargo.sh     the cargo build phase
-    scripts/render_icon.sh          ../assets/icons/icon.png → AppIcon
+    scripts/render_icon.sh          ../assets/icons/icon.png → AppIcon, opaque
+    scripts/flatten_icon.swift      what draws it onto #1A1D21 (D67)
     Resources/Assets.xcassets       the icon (rendered) and the launch colour
+    Resources/PrivacyInfo.xcprivacy the privacy manifest (D67)
     run.sh                    generate, build, install, launch, stream the log
     README.md                 setup on the Mac, the phone, CI builds, logs
-  .github/workflows/ios-release.yml   an Ad Hoc .ipa on a published release (D37)
+  .github/workflows/ios-release.yml   an Ad Hoc .ipa and/or a TestFlight upload on a published release (D37, D67)
 ```
 
 `crates/ios` is a normal workspace member, so every rule in the session
@@ -501,7 +503,9 @@ from `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION` (XcodeGen would
 otherwise write "1.0" and "1"), the scene manifest, the launch colour,
 the orientations, dark style and light status bar, 120 Hz, the `audio`
 background mode, the microphone and local-network strings, the
-Documents folder in Files.
+Documents folder in Files. Beside it, `Resources/PrivacyInfo.xcprivacy`,
+the privacy manifest (D67): file timestamps (C617.1) and system boot
+time (35F9.1), no tracking, no collected data types.
 
 **Signing.** Automatic. `Config/Base.xcconfig` includes the uncommitted
 `Config/Local.xcconfig`, which sets `DEVELOPMENT_TEAM` (and
@@ -511,25 +515,25 @@ asks the user to trust the developer on the phone. The Developer
 Program ($99/year) gives one-year profiles, Ad Hoc builds and
 TestFlight.
 
-**CI**: `.github/workflows/ios-release.yml` (D37) builds on a published
-release, like the Android APK — a signed Ad Hoc `.ipa` when the paid
-program's certificate and profile are in the repository's secrets, an
-unsigned build (an artifact, not installable) otherwise. Development
-builds stay local (`run.sh`).
+**CI**: `.github/workflows/ios-release.yml` (D37, D67) builds on a
+published release, like the Android APK — a signed Ad Hoc `.ipa` when
+the paid program's certificate and an Ad Hoc profile are in the
+repository's secrets; an upload to TestFlight when an App Store profile
+and an App Store Connect API key are there too (on a manual run, only
+with its *testflight* box ticked); an unsigned build (an artifact, not
+installable) when neither is. Development builds stay local
+(`run.sh`).
 
-**TestFlight and the App Store** (not done; MOB-2, MOB-3, MOB-5,
-MOB-6): `xcodebuild archive`, then `-exportArchive` with `method =
-app-store-connect` and `destination = upload` and an App Store Connect
-API key — Slint's own flow for its viewer. Before the first upload:
-the icon without an alpha channel (App Store Connect refuses one;
-`render_icon.sh` keeps transparency today), a privacy manifest
-(`PrivacyInfo.xcprivacy`) declaring the "required reason" APIs the
-binary uses — decided from `nm -u` on the built executable; expected:
-file timestamps (`stat`), system boot time (cpal's iOS host calls
-`mach_absolute_time`; std's `Instant` uses `clock_gettime`, which is
-not on the list), disk space if `sysinfo` reads it — and the
-`ITSAppUsesNonExemptEncryption` answer (standard TLS 1.3 through
-rustls). The build number already grows with every commit (D25).
+**TestFlight** (D67): the archive re-exported with `method =
+app-store-connect` and `destination = upload` and the API key — Slint's
+own flow for its viewer. What App Store Connect checks first is
+handled: the icon has no alpha channel (`render_icon.sh`), the privacy
+manifest declares the "required reason" APIs, and CI compares it with
+the binary's imports before uploading. Still open: the
+`ITSAppUsesNonExemptEncryption` answer (MOB-6; standard TLS 1.3 through
+rustls), so each build asks in App Store Connect. The build number is
+CI's run number; `run.sh`'s commit count (D25) is for local builds,
+which should not be uploaded (ios/README §3c).
 
 ## 12. Milestones
 
@@ -543,7 +547,7 @@ open is in PRODUCTION-PLAN.md.
 | M2 | files, links, localized permission strings | files and links done early (D31); the strings are MOB-19 |
 | M3 | voice: the session, VPIO, routes, interruptions, the record permission | VPIO and interruptions done (D47, D51); activation on join, routes and the record permission are MOB-19, "paused — call" MOB-9 |
 | M4 | viewing; resilience; the DM notification | viewing (D30) and notifications (D50) done; the background task, network change, NAT64 and `SO_NET_SERVICE_TYPE` are MOB-10, CLI-10 and MOB-19 |
-| M5 | release: TestFlight, privacy manifest, icon without alpha | open: MOB-2, MOB-3, MOB-5, MOB-6; Ad Hoc from CI meanwhile (D37) |
+| M5 | release: TestFlight, privacy manifest, icon without alpha | done from CI 2026-10-23 (D67), not yet run; the encryption answer is MOB-6 |
 
 Later (roughly in order): VPIO on macOS (AEC-SPEC E8), push
 notifications (APNs + the server), CallKit, an `AVRoutePickerView`
@@ -564,7 +568,7 @@ VideoToolbox encoding).
 | VPIO side effects: quieter loudspeaker, ducking, 48 kHz | open until a phone log confirms D47 (SESSION-GUIDE §5) |
 | Free provisioning expires every 7 days | the paid program's Ad Hoc builds (D37) last a year |
 | IPv6-only networks | CLI-10: `getaddrinfo` for literals |
-| App Store Connect's privacy-manifest and icon checks | MOB-2, MOB-3 (§11) |
+| App Store Connect's privacy-manifest and icon checks | D67: an opaque icon, and CI compares the manifest with the binary's imports before each upload |
 | Skia falls back to the CPU without telling the app | retired: the logs show Skia compiling Metal shaders; if it ever falls back, `BackendSelector::require_metal()` fails loudly instead |
 | Skia's 1-second wait on the Metal shader compiler (Ganesh skips that draw for the frame) | seen once in the simulator (D28), no visible effect; Slint's to fix if it ever shows |
 | Half-drawn glyphs now and then on the phone | open: `run.sh --renderer` tells where they come from (D40) |
@@ -685,3 +689,4 @@ fix was installed, so still with portrait insets):
 | D64 | **The 2026-10 review under the iPhone: other apps' audio, the lobby's buffers, the background stops watching** (2026-10-16, 1.3.0, shared; ANDROID-SPEC.md D74 for the shared part; amends D50, D51, D57, D58; review 2026-10 P1-2, P1-6, P1-7, P2-40, P2-41, P3-12, P3-15; MOB-19). *Other apps' audio* (P1-7): since D51 the session is active from connect, for the lobby's output; with no `MixWithOthers` that stopped music or a podcast at connect and kept it stopped in the lobby, and a user who started it again interrupted the output that keeps the app alive. Out of a call the options now carry `MixWithOthers` (`crates/ios/src/session.rs` at startup, `avsession::options` with each plan); a room's `voiceChat` drops it and interrupts other apps as a call does; leaving the room deactivates the session with `NotifyOthersOnDeactivation` (`avsession::end_call`) before the lobby's output activates it again, mixed (§6.2). *The lobby's buffers*: the plain output out of a room opens with 4096-frame buffers (`AudioOutput::set_quiet`) and the preferred IO buffer goes back to 0.1 s (`avsession::prefer_quiet_io`): the 10 ms a voice unit asked for had stayed, about 100 callbacks and worker passes a second for hours in the background. *Shared with Android (D74)*: the server's PING every 20 s (amends D58; the lobby's output keeps an iPhone's app running in the background, so its own 5 s keep-alive goes out and the ping changes little here — it was for Android's lobby, which holds no wake lock); a watched stream stops in the background — no picture, no sound — and is asked for again on return (amends D57: its sound no longer plays on); the inbound watcher's 30 s backstop and the voice thread's wait of up to an hour (amends D57's "the watcher's 2" and "once a second"); a mention's own chime — `Library/Sounds/baucord-mention.wav` beside `baucord-message.wav`, both from `frontend::host::chime_wav(tone)`, D50's `alert_sound_wav` (amends D50) — and a burst from one person quiet for 10 s. iOS not compiled here; **not run on an iPhone** | music stopped by connecting to a lobby the user only waits in is a bug, not a call; the rest as Android's |
 | D65 | **The pages' footers span the window; the buttons in its corner** (2026-10-17, 1.3.0, shared; ANDROID-SPEC.md D75 for the whole of it; amends D62's column). The wide layout of Settings and the admin panel only — an iPhone on its side; upright the narrow layout is unchanged | the user's ask |
 | D66 | **A role's editor is a page in place of the roles** (2026-10-17, 1.3.0, shared; ANDROID-SPEC.md D76 for the whole of it). On the iPhone the admin panel's top bar arrow steps out of the editor first | the user's ask |
+| D67 | **TestFlight from CI; the privacy manifest; an opaque icon** (2026-10-23, 1.3.0, iPhone only; MOB-2, MOB-3 and MOB-5's iOS half). `ios-release.yml` takes a second profile, an *App Store* one (`IOS_APPSTORE_PROFILE_BASE64`), and an App Store Connect API key (`ASC_API_KEY_P8_BASE64`, `ASC_API_KEY_ID`, `ASC_API_ISSUER_ID`); with them it re-exports the same archive with `method = app-store-connect`, `destination = upload`, the dSYMs uploaded and `manageAppVersionAndBuildNumber` off (the run number stays the build number), on a published release or on a manual run with its *testflight* box ticked. Either profile alone works, or both; the archive is signed with the Ad Hoc one when there is one; each is checked for its kind (devices or none), the app id and one team. `ios/Resources/PrivacyInfo.xcprivacy`, a resource at the bundle's root: file timestamps, C617.1 (`std::fs` stats files in the app's own container; the pickers hand over copies in tmp), and system boot time, 35F9.1 (cpal's `mach_absolute_time`, time between audio events); no tracking, no collected data types (the App Store's privacy label waits on LEG-5; TestFlight does not need it). A CI step compares the categories with the binary's imports (`nm -u`) and Objective-C names (`strings`) for file timestamps, boot time, disk space, active keyboards and user defaults, and fails on an undeclared one. `render_icon.sh` draws `icon.png` onto #1A1D21 without an alpha channel in every configuration, through `scripts/flatten_icon.swift` (CoreGraphics, run in a clean macOS environment) and stops if `sips` still reports alpha; iOS showed the icon's transparent pixels as black anyway, and one rule for every build means no stale icon between configurations. `ITSAppUsesNonExemptEncryption` stays unset: the answer is a legal declaration (MOB-6, the user). Checked in the Linux sandbox: actionlint and shellcheck; the profile, manifest and upload steps' shell run against stand-ins for `security`, `PlistBuddy`, `nm`, `strings` and `xcodebuild`, misconfigurations included. Not run: the Swift helper, XcodeGen with the manifest, the upload (DEVICE-CHECKLIST §3.5) | a TestFlight build reaches any tester with no UDID or cable; one archive serves both exports; the icon and the manifest are what App Store Connect turns builds away for, so CI checks them before Apple does |
