@@ -138,9 +138,9 @@ IDs & Profiles):
 5. Repository → Settings → Secrets and variables → Actions → *New
    repository secret*, three times:
    ```sh
-   base64 -i baucord-distribution.p12 | pbcopy        # → IOS_CERTIFICATE_P12_BASE64
+   base64 < baucord-distribution.p12 | tr -d "\n" | pbcopy        # → IOS_CERTIFICATE_P12_BASE64
                                                       #   IOS_CERTIFICATE_PASSWORD: the .p12's password
-   base64 -i baucord_Ad_Hoc.mobileprovision | pbcopy  # → IOS_PROFILE_BASE64
+   base64 < baucord_Ad_Hoc.mobileprovision | tr -d "\n" | pbcopy  # → IOS_PROFILE_BASE64
    ```
 
 Then publish a release (`v1.2.0`, the crates' version — the workflow
@@ -187,8 +187,8 @@ Once, besides §3b's app id (step 1) and Apple Distribution `.p12`
    Issuer ID shown above the list.
 4. Four more repository secrets:
    ```sh
-   base64 -i baucord_App_Store.mobileprovision | pbcopy  # → IOS_APPSTORE_PROFILE_BASE64
-   base64 -i AuthKey_XXXXXXXXXX.p8 | pbcopy             # → ASC_API_KEY_P8_BASE64
+   base64 < baucord_App_Store.mobileprovision | tr -d "\n" | pbcopy  # → IOS_APPSTORE_PROFILE_BASE64
+   base64 < AuthKey_XXXXXXXXXX.p8 | tr -d "\n" | pbcopy             # → ASC_API_KEY_P8_BASE64
                                                        #   ASC_API_KEY_ID: the key's ID
                                                        #   ASC_API_ISSUER_ID: the Issuer ID
    ```
