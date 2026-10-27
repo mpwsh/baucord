@@ -41,6 +41,14 @@ pub fn download_url(version: &str) -> String {
     format!("{DOWNLOAD_BASE}/baucord-v{version}-{PLATFORM_SUFFIX}.zip")
 }
 
+/// The update for a copy installed as `baucord.app` (macOS): the whole
+/// universal bundle, zipped (macos/README.md). A bare binary from the
+/// per-architecture zip goes on updating from [`download_url`].
+#[must_use]
+pub fn app_bundle_download_url(version: &str) -> String {
+    format!("{DOWNLOAD_BASE}/baucord-v{version}-macos.zip")
+}
+
 /// Is `remote` a newer version than `local`? Dotted-numeric compare,
 /// missing components read as 0; any non-numeric component makes the
 /// versions incomparable (→ false, don't nag the user).
@@ -88,6 +96,14 @@ mod tests {
     fn component_count_mismatch_reads_missing_as_zero() {
         assert!(is_newer("0.2", "0.1.9"));
         assert!(!is_newer("0.1", "0.1.0"));
+    }
+
+    #[test]
+    fn the_app_bundle_has_one_universal_zip() {
+        assert_eq!(
+            app_bundle_download_url("1.4.0"),
+            "https://baucord.com/baucord-v1.4.0-macos.zip"
+        );
     }
 
     #[test]

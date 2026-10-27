@@ -4,7 +4,21 @@ What changed from one release to the next, for the people who run a
 baucord server and the people who use the apps. Releases before this
 file are summed up in SESSION-GUIDE.md §3 ("Shipped").
 
-## 1.3.0 (unreleased)
+## Next (unreleased)
+
+### Desktop
+
+- **macOS: a real app.** The Mac download is now `baucord.app` in a
+  disk image: open it and drag baucord into Applications. One app for
+  Apple silicon and Intel Macs. It opens its window without a Terminal
+  window first, has its icon in the Dock, and asks for the microphone
+  as baucord. Signed with a Developer ID and notarized by Apple once
+  those are set up (macos/README.md).
+- An installed `baucord.app` updates itself whole. Copies still running
+  from the old zip go on updating from it; to move to the app, install
+  it from the disk image: your servers and identity carry over.
+
+## 1.3.0
 
 The 2026-10 review, fixed whole: what costs while nothing happens,
 pictures and memory, Windows audio, Settings that save only when asked,

@@ -13,13 +13,18 @@ use std::{
     time::Duration,
 };
 
-use app_core::update::{download_url, is_newer, PLATFORM_SUFFIX, VERSION_URL};
+use app_core::update::{
+    app_bundle_download_url, download_url, is_newer, PLATFORM_SUFFIX, VERSION_URL,
+};
 use i18n::t;
 use log::{error, info, warn};
 use slint::ComponentHandle;
 use ui::State;
 
-use crate::app::{self, CURRENT_VERSION};
+use crate::{
+    app::{self, CURRENT_VERSION},
+    bundle,
+};
 
 /// Executable file stems inside the update zip. The release archives
 /// use the target's native naming, so the real filename is the stem
@@ -171,14 +176,24 @@ fn download_zip(
     progress: &AtomicU32,
     cancelled: &AtomicBool,
 ) -> Result<PathBuf, String> {
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("."));
+    // A copy installed as baucord.app downloads the whole bundle into a
+    // work folder beside it; a bare binary, its platform's zip beside
+    // itself.
+    let (url, dir) = if let Some(app) = installed_bundle() {
+        let work = update_dir(&app);
+        std::fs::create_dir_all(&work)
+            .map_err(|e| format!("Failed to create {}: {e}", work.display()))?;
+        (app_bundle_download_url(version), work)
+    } else {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+            .unwrap_or_else(|| PathBuf::from("."));
+        (download_url(version), exe_dir)
+    };
 
-    let url = download_url(version);
     let filename = url.rsplit('/').next().unwrap_or("baucord-update.zip");
-    let dest = exe_dir.join(filename);
+    let dest = dir.join(filename);
 
     info!("Downloading {url} → {}", dest.display());
 
@@ -246,13 +261,71 @@ fn download_zip(
 
 // ── Install ─────────────────────────────────────────────────────────────
 
+/// The `baucord.app` this copy runs from, on macOS; `None` for a bare
+/// binary and on every other platform.
+fn installed_bundle() -> Option<PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    bundle::bundle_root(&exe)
+}
+
+/// Where a bundle update is downloaded, unpacked and swapped: a hidden
+/// folder beside the bundle, on its volume, so the swap is two renames.
+fn update_dir(app: &Path) -> PathBuf {
+    app.parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+        .join(".baucord-update")
+}
+
+/// Replace the running `baucord.app` with the one in the zip, whole
+/// (the bundle is signed as one piece — `bundle`), and relaunch it.
+/// On any failure the installed app stays as it was.
+fn install_bundle(zip_path: &Path, app: &Path) -> Result<(), String> {
+    let work = update_dir(app);
+    let unpacked = work.join("new");
+    let aside = work.join("old.app");
+    let _ = std::fs::remove_dir_all(&unpacked);
+
+    let swapped = (|| {
+        bundle::extract_tree(zip_path, &unpacked)?;
+        let fresh = unpacked.join(bundle::BUNDLE_NAME);
+        let new_exe = fresh
+            .join("Contents")
+            .join("MacOS")
+            .join(exe_name(MAIN_EXE_STEM));
+        if !new_exe.is_file() {
+            return Err(format!(
+                "{}/Contents/MacOS/{} not found in the update zip",
+                bundle::BUNDLE_NAME,
+                exe_name(MAIN_EXE_STEM)
+            ));
+        }
+        ensure_executable(&new_exe)?;
+        bundle::swap_bundle(app, &fresh, &aside)
+    })();
+    // The zip, the unpacked copy and the old bundle all live in `work`.
+    let _ = std::fs::remove_dir_all(&work);
+    swapped?;
+
+    info!("Replaced {} with the new version", app.display());
+    relaunch(
+        &app.join("Contents")
+            .join("MacOS")
+            .join(exe_name(MAIN_EXE_STEM)),
+    )
+}
+
 /// Extract the downloaded zip, replace both executables, and relaunch.
 ///
 /// Runs on a thread of its own (`AppState::finish_leaving`): extracting
 /// the zip took the window with it for seconds (review 2026-10, P3-11).
 /// Ends in `process::exit`; returns only on an error.
 ///
-/// Steps:
+/// A copy installed as `baucord.app` (macOS) replaces its bundle whole
+/// instead ([`install_bundle`]). A bare binary's steps:
 /// 1. Extract root-level zip entries to a staging dir next to the exe.
 /// 2. Make sure both staged binaries carry the exec bit (Unix).
 /// 3. `self_replace` the running binary.
@@ -261,6 +334,11 @@ fn download_zip(
 /// 6. Spawn the new executable and exit.
 pub fn extract_and_install(zip_path: &str) -> Result<(), String> {
     let zip_path = PathBuf::from(zip_path);
+
+    // macOS, installed as baucord.app: the bundle is replaced whole.
+    if let Some(app) = installed_bundle() {
+        return install_bundle(&zip_path, &app);
+    }
 
     // Resolve our own path ONCE, before the swap. On Linux
     // `current_exe()` reads `/proc/self/exe`, which turns into
@@ -322,7 +400,12 @@ pub fn extract_and_install(zip_path: &str) -> Result<(), String> {
 
     cleanup_staging(&zip_path, &extract_dir);
 
-    info!("Relaunching {}", current_exe.display());
+    relaunch(&current_exe)
+}
+
+/// Start `exe` and exit this process; returns only if the start failed.
+fn relaunch(exe: &Path) -> Result<(), String> {
+    info!("Relaunching {}", exe.display());
 
     // spawn() returning Ok means the OS has created the process — the
     // child runs the freshly-replaced binary from the same path and
@@ -335,7 +418,7 @@ pub fn extract_and_install(zip_path: &str) -> Result<(), String> {
     // The variable tells it to wait for us to go first (`instance`).
     // The same arguments carry over, so a `--profile` run comes back
     // on its own profile.
-    std::process::Command::new(&current_exe)
+    std::process::Command::new(exe)
         .args(std::env::args_os().skip(1))
         .env(crate::instance::RELAUNCH_ENV, "1")
         .spawn()

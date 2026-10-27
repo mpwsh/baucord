@@ -87,6 +87,7 @@ for the work at hand (§3). Everything else is linked from here.
 | `ANDROID-SPEC.md` | the Android client as it is (§0–§13); decisions D1…D9 in §1, from D10 on in §14 (from D23 on, newest first) | before Android work |
 | `IOS-SPEC.md` | the iPhone client as it is (§0–§13); decisions D1…D13 in §1, from D14 on in §14 (in order) | before iOS work |
 | `android/README.md`, `ios/README.md` | building, running and releasing each phone app | when the user builds |
+| `macos/README.md` | the Mac app: `baucord.app` in a disk image, signing and notarizing, how its updates work | before touching macOS packaging or the updater |
 | `DEVICE-CHECKLIST.md` | what has to be seen on a real Windows machine, Android phone and iPhone before a release: every change the sandbox could not run, as *do this → expect that* | when the user tests; add a line for every platform change made unrun |
 | `licenses/README.md` | the third-party notices: what writes them, what CI does | before adding a native library |
 | `tools/chat-scroll-sim/` | the chat pane's scrolling harness (ANDROID-SPEC D66); CI runs it on every pull request | before touching the chat's scrolling |

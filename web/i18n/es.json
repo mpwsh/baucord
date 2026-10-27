@@ -16,6 +16,7 @@
   "dl-also": "También para {platforms}.",
   "dl-and": "y",
   "dl-meta-generic": "Versión __VERSION__ para Windows, macOS, Linux y Android.",
+  "dl-macos-hint": "Para Macs con Apple Silicon e Intel, macOS 11 o posterior. Abrí la imagen de disco y arrastrá baucord a Aplicaciones. Se actualiza solo desde ahí y conserva tus servidores y tu identidad.",
   "dl-android-hint": "Android 10 o posterior. Abrí el archivo descargado para instalarlo; Android pide una vez permiso para instalar desde tu navegador. Para actualizar, instalá la versión nueva encima de la vieja: tus servidores y tu identidad quedan.",
   "dl-ios": "Todavía no hay versión para iPhone para descargar. Abrí esta página en una computadora o en un teléfono Android.",
   "shot-call-alt": "baucord durante una llamada: canales de voz y usuarios a la izquierda, el chat de texto compartido a la derecha",

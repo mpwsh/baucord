@@ -48,8 +48,9 @@ What stands between this and "production for strangers":
 6. **Phones in the stores.** What Google Play's review asks of the app
    shipped in 1.2 (§7); what is left for Play is mostly Play Console
    work (PLAY-STORE.md) plus MOB-16 and MOB-17. The App Store is not
-   decided; it would need MOB-6 and MOB-19 (TestFlight from CI, with
-   the privacy manifest and an opaque icon, came 2026-10-23, §7).
+   decided; it would need MOB-19 (TestFlight from CI, with the privacy
+   manifest, an opaque icon and the encryption answer, came
+   2026-10-23/24, §7).
 
 ## 2. Milestone A — safe to expose (do first)
 
@@ -248,7 +249,8 @@ What stands between this and "production for strangers":
   job uploads with a bucket-wide key through an unpinned third-party
   action (`release.yml` ~443, `web.yaml` ~26). Sign a manifest
   (version + SHA-256 per zip) with an offline ed25519/minisign key,
-  embed the public key, verify before extracting, `https_only`;
+  embed the public key, verify before extracting, `https_only` (the
+  macOS bundle zip too, `baucord-v<v>-macos.zip`, 2026-10-24);
   scope the bucket token to release objects; replace the action with
   a pinned `aws s3 cp`.
 - [ ] **UPD-2 [P1][S] Downloads longer than 30 s always fail**
@@ -423,13 +425,6 @@ Store is not decided yet.
   the app signing key, which is also the upload key (PLAY-STORE.md §4,
   the user); later, upload from CI through the Play Developer API. iOS
   is done (TestFlight upload with the dSYMs, 2026-10-23, §7).
-- [ ] **MOB-6 [P1][S] Encryption export compliance.** No
-  `ITSAppUsesNonExemptEncryption` in the Info.plist; rustls/ring are
-  non-Apple cryptography (a BIS self-classification is likely). Play:
-  nothing to file (checked 2026-10-08, PLAY-STORE.md §10). Standard
-  crypto in a free mass-market app is 5D992.c, and since BIS's
-  2021-03-29 rule it needs no report; the email notification is only
-  for non-standard crypto.
 - [ ] **MOB-7 [P1][S] Android moves the identity key to a new phone**:
   `allowBackup="false"` no longer covers device-to-device transfer for
   apps targeting 31+. Add `dataExtractionRules` excluding everything
@@ -1693,6 +1688,23 @@ One line each; the spec decision named holds the detail.
   every build; `ios-release.yml` uploads to TestFlight with an App Store
   profile and an App Store Connect API key (IOS-SPEC D67). Not yet run
   on a Mac (DEVICE-CHECKLIST §3.5); the encryption answer is MOB-6.
+- **2026-10-24 — MOB-6**: the first TestFlight build (run #11) went
+  through; the encryption question is answered in the Info.plist
+  (`ITSAppUsesNonExemptEncryption` = NO: standard algorithms, not on
+  the App Store in France — France needs a French encryption
+  declaration first; IOS-SPEC D68).
+- **2026-10-24 — the Mac app**: `baucord.app`, universal, in a disk
+  image (`baucord-v<v>-macos.dmg`) with an Applications shortcut, built
+  from the two release binaries by `macos/package.sh` in `release.yml`'s
+  `macos-app` job; signed with a Developer ID and notarized on releases
+  when the secrets are there, ad hoc otherwise (macos/README.md). An
+  installed bundle updates whole from `baucord-v<v>-macos.zip`
+  (`frontend/src/bundle.rs`); bare binaries keep their per-architecture
+  zips. The website offers the disk image. Considered and set aside: a
+  Mac App Store build — its sandbox is mandatory, and the desktop's
+  video (FFmpeg + x264, GPL-3.0, LEG-1) and keybinds (Accessibility)
+  would need VideoToolbox encoding and Input Monitoring first. Not yet
+  run on a Mac (DEVICE-CHECKLIST §4.4).
 
 ## 8. Facts this plan rests on
 

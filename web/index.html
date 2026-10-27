@@ -695,6 +695,11 @@
           <p class="dl-meta" x-show="!ready" x-cloak x-i18n="dl-meta-generic">
             Version __VERSION__ for Windows, macOS, Linux and Android.
           </p>
+          <p class="dl-mobile" x-show="macos" x-cloak x-i18n="dl-macos-hint">
+            For Apple Silicon and Intel Macs, macOS 11 or later. Open the disk
+            image and drag baucord into Applications. It updates itself from
+            there, and keeps your servers and identity.
+          </p>
           <p class="dl-mobile" x-show="android" x-cloak x-i18n="dl-android-hint">
             Android 10 or later. Open the downloaded file to install it;
             Android asks once to allow installs from your browser. To update,
@@ -1007,25 +1012,13 @@
                 </td>
               </tr>
               <tr>
-                <td><strong>macOS</strong> (Apple Silicon)</td>
-                <td class="file">baucord-v__VERSION__-macos-arm64.zip</td>
+                <td><strong>macOS</strong> (Apple Silicon and Intel)</td>
+                <td class="file">baucord-v__VERSION__-macos.dmg</td>
                 <td></td>
                 <td>
                   <a
                     class="btn solid"
-                    href="baucord-v__VERSION__-macos-arm64.zip"
-                    >Download</a
-                  >
-                </td>
-              </tr>
-              <tr>
-                <td><strong>macOS</strong> (Intel)</td>
-                <td class="file">baucord-v__VERSION__-macos-intel.zip</td>
-                <td></td>
-                <td>
-                  <a
-                    class="btn solid"
-                    href="baucord-v__VERSION__-macos-intel.zip"
+                    href="baucord-v__VERSION__-macos.dmg"
                     >Download</a
                   >
                 </td>
@@ -1223,16 +1216,17 @@
       // Downloads. One list of builds, shared by the hero control and the
       // table. The hero picks the visitor's platform:
       //   Windows / Linux  -> from the user agent
-      //   macOS            -> Chromium reports the CPU through UA client
-      //                       hints; Safari doesn't, so we look at the WebGL
-      //                       renderer string (Intel/AMD => Intel Mac) and
-      //                       default to Apple Silicon otherwise.
+      //   macOS            -> the disk image: one universal baucord.app
+      //                       for Apple Silicon and Intel (macos/README.md),
+      //                       with a drag-to-Applications hint
       //   Android          -> the APK (arm64; every Android 10+ phone that
       //                       is not 32-bit-only), with an install hint
       //   iPhone/iPad      -> a "not yet" note, no button
       // Sizes come from a HEAD request to each file (same origin), so the
       // page never has to be edited when a build changes size. The APK
-      // reaches R2 from android-release.yml, the zips from release.yml.
+      // reaches R2 from android-release.yml, the zips and the disk image
+      // from release.yml. (The per-architecture macOS zips are still
+      // published, for the updater of copies installed from them.)
       document.addEventListener("alpine:init", function () {
         var VERSION = "__VERSION__";
         var PLATFORMS = [
@@ -1243,16 +1237,10 @@
             file: "baucord-v" + VERSION + "-win-x64.zip",
           },
           {
-            id: "macos-arm64",
+            id: "macos",
             name: "macOS",
-            arch: "Apple Silicon",
-            file: "baucord-v" + VERSION + "-macos-arm64.zip",
-          },
-          {
-            id: "macos-intel",
-            name: "macOS",
-            arch: "Intel",
-            file: "baucord-v" + VERSION + "-macos-intel.zip",
+            arch: "Apple Silicon, Intel",
+            file: "baucord-v" + VERSION + "-macos.dmg",
           },
           {
             id: "linux-x64",
@@ -1290,17 +1278,6 @@
           });
         }
 
-        function webglGuess() {
-          try {
-            var c = document.createElement("canvas");
-            var gl =
-              c.getContext("webgl") || c.getContext("experimental-webgl");
-            var ext = gl && gl.getExtension("WEBGL_debug_renderer_info");
-            var r = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : "";
-            if (/intel|amd|radeon|nvidia/i.test(r)) return "macos-intel";
-          } catch (e) {}
-          return "macos-arm64";
-        }
         function detect(cb) {
           var ua = navigator.userAgent || "";
           var plat = (navigator.platform || "").toLowerCase();
@@ -1309,21 +1286,7 @@
           if (/iphone|ipad|ipod/i.test(ua) || touchMac) return cb("mobile");
           if (/windows/i.test(ua)) return cb("win-x64");
           if (/cros|linux|x11/i.test(ua)) return cb("linux-x64");
-          if (/mac/i.test(plat) || /macintosh/i.test(ua)) {
-            var uad = navigator.userAgentData;
-            if (uad && uad.getHighEntropyValues) {
-              uad
-                .getHighEntropyValues(["architecture"])
-                .then(function (v) {
-                  cb(v.architecture === "x86" ? "macos-intel" : "macos-arm64");
-                })
-                .catch(function () {
-                  cb(webglGuess());
-                });
-              return;
-            }
-            return cb(webglGuess());
-          }
+          if (/mac/i.test(plat) || /macintosh/i.test(ua)) return cb("macos");
           cb(null);
         }
 
@@ -1363,6 +1326,9 @@
             get android() {
               return shared.selected === "android-arm64";
             },
+            get macos() {
+              return shared.selected === "macos";
+            },
             get href() {
               return this.current ? this.current.file : "#download";
             },
@@ -1385,7 +1351,7 @@
                 return p.id !== shared.selected;
               });
             },
-            // "Version 1.0.1, 51 MB. Also for Windows, Linux and macOS (Intel)."
+            // "Version 1.0.1, 51 MB. Also for Windows, Linux and Android."
             get metaText() {
               var i18n = Alpine.store("i18n");
               var cur = this.current;

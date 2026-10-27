@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- What baucord.app asks the hardened runtime for, when signed with a
+     Developer ID (macos/package.sh, macos/README.md). The runtime is
+     what notarization requires; under it the microphone needs this
+     entitlement as well as the Info.plist's NSMicrophoneUsageDescription.
+     Screen recording, Accessibility and the network need none. Nothing
+     else is loosened: no JIT, no unsigned memory, no foreign libraries
+     (FFmpeg and Opus are linked in statically). -->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+</dict>
+</plist>

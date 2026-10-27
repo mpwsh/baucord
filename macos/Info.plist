@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- baucord.app's Info.plist; macos/package.sh writes the version in
+     place of __VERSION__ (macos/README.md). -->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>baucord</string>
+	<key>CFBundleExecutable</key>
+	<string>baucord</string>
+	<key>CFBundleIconFile</key>
+	<string>baucord</string>
+	<key>CFBundleIdentifier</key>
+	<string>dev.baucord</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleLocalizations</key>
+	<array>
+		<string>en</string>
+		<string>es</string>
+		<string>pt-BR</string>
+	</array>
+	<key>CFBundleName</key>
+	<string>baucord</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>__VERSION__</string>
+	<key>CFBundleVersion</key>
+	<string>__VERSION__</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.social-networking</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>© 0x0 Studios</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>baucord connects to servers on your local network when you add one by its local address.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>baucord uses the microphone while you are in a voice channel.</string>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
+</dict>
+</plist>

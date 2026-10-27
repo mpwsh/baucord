@@ -42,6 +42,10 @@ pub mod updater;
 #[path = "stubs/updater.rs"]
 pub mod updater;
 
+/// The macOS app bundle the updater replaces whole (desktop only).
+#[cfg(feature = "desktop")]
+pub mod bundle;
+
 /// One instance per config directory: a desktop binary's concern.
 #[cfg(feature = "desktop")]
 pub mod instance;

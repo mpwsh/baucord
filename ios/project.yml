@@ -116,6 +116,13 @@ targets:
           - audio
         NSMicrophoneUsageDescription: baucord uses the microphone while you are in a voice channel.
         NSLocalNetworkUsageDescription: baucord connects to servers on your local network when you add one by its local address.
+        # Export compliance, answered here so App Store Connect stops
+        # asking per build (IOS-SPEC D68, MOB-6): the app's encryption is
+        # standard algorithms (TLS 1.3 through rustls/ring, not Apple's),
+        # and it is not on the App Store in France, so no documentation
+        # is required. Putting it in France means a French encryption
+        # declaration first, then YES here with Apple's compliance code.
+        ITSAppUsesNonExemptEncryption: false
         # Documents (the log, saved files) as the app's folder in the
         # Files app (spec §8).
         UIFileSharingEnabled: true

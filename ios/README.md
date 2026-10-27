@@ -201,9 +201,11 @@ name, see `Resources/PrivacyInfo.xcprivacy`).
 
 After the upload, in App Store Connect → the app → **TestFlight**:
 
-- The build shows *Processing* for a while, then **Missing
-  Compliance**: the app does not answer the encryption question in its
-  Info.plist yet (MOB-6), so answer it there, once per build.
+- The build shows *Processing* for a while, then *Ready to Submit*.
+  The encryption question is answered in the Info.plist
+  (`ITSAppUsesNonExemptEncryption`, IOS-SPEC D68): standard algorithms,
+  not on the App Store in France. Before France is ever added to the
+  app's countries, that answer has to change (D68).
 - **Internal testing**: up to 100 people with a role on the App Store
   Connect team; no review.
 - **External testing** (anyone with an email or a public link): Beta App

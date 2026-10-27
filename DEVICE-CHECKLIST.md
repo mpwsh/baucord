@@ -908,8 +908,12 @@ against stand-ins, the Swift helper never met a compiler.
 - [ ] **the first upload** — the secrets of ios/README §3c, then a run
   with *testflight* ticked: the step ends with *uploaded 1.3.0 (N)*;
   App Store Connect → TestFlight shows the build processing, then
-  *Missing Compliance* (answer it; MOB-6); it installs from the
-  TestFlight app on a phone that is not in the Ad Hoc profile.
+  *Missing Compliance*, answered once (2026-10-24, run #11: uploaded,
+  processed); it installs from the TestFlight app on a phone that is
+  not in the Ad Hoc profile.
+- [ ] **no compliance question** — the next build after IOS-SPEC D68
+  goes from *Processing* straight to *Ready to Submit*, without
+  *Missing Compliance*.
 - [ ] **no rejection email** — nothing from App Store Connect about
   ITMS-91053 (an undeclared API) or the icon in the hour after.
 
@@ -978,6 +982,37 @@ silicon, and an Intel one if there is one.
   Mac; recording a keybind there with Accessibility granted (§4.1).
 
 ---
+
+### 4.4 The Mac app **[10-24]** [macos/README.md]
+
+Built by a script tried in the Linux sandbox against stand-ins for
+`lipo`, `codesign`, `ditto`, `hdiutil`, `notarytool` and `stapler`; the
+bundle code of the updater unit-tested on Linux. Nothing ran on a Mac.
+
+- [ ] **the disk image** — the `macos-dmg-<commit>` artifact of a push's
+  *Build and Release* run: it opens to baucord and an Applications
+  shortcut; dragging installs it. Without the Developer ID secrets the
+  first open needs System Settings → Privacy & Security → Open Anyway.
+- [ ] **no Terminal** — opening baucord.app shows only its window; the
+  Dock shows the dog icon; About/⌘Q name it baucord.
+- [ ] **both Macs** — the same app runs on Apple silicon and on Intel
+  (`lipo -archs /Applications/baucord.app/Contents/MacOS/baucord` lists
+  both).
+- [ ] **permissions name baucord** — joining a voice room asks for the
+  microphone *as baucord*, with the Info.plist's sentence; screen
+  sharing and keybinds ask for theirs as baucord. A Developer ID build
+  keeps them across an update.
+- [ ] **notarized** — with the secrets, a release's disk image opens
+  with no warning at all; `spctl -a -vv /Applications/baucord.app` says
+  *accepted, source=Notarized Developer ID*.
+- [ ] **the update swaps the bundle** — an installed 1.x.y app offered a
+  newer release: it downloads, restarts as the new version from the
+  same place, `.baucord-update` beside it is gone, and the permissions
+  above were not asked again (Developer ID).
+- [ ] **a zip install still updates** — the bare binary from the old
+  `-macos-arm64.zip` updates from the same kind of zip, as before.
+- [ ] **settings carry over** — the app opened after the zip install
+  shows the same servers and nickname.
 
 ## 5. A server host
 
