@@ -169,18 +169,23 @@ fn set_mode(_path: &Path, _mode: Option<u32>) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Write;
+
+    use super::*;
 
     #[test]
     fn finds_the_bundle_of_its_executable() {
         assert_eq!(
-            bundle_root(Path::new("/Applications/baucord.app/Contents/MacOS/baucord")),
+            bundle_root(Path::new(
+                "/Applications/baucord.app/Contents/MacOS/baucord"
+            )),
             Some(PathBuf::from("/Applications/baucord.app"))
         );
         // Renamed by the user: still the bundle it runs from.
         assert_eq!(
-            bundle_root(Path::new("/Users/a/Apps/Baucord 2.app/Contents/MacOS/baucord")),
+            bundle_root(Path::new(
+                "/Users/a/Apps/Baucord 2.app/Contents/MacOS/baucord"
+            )),
             Some(PathBuf::from("/Users/a/Apps/Baucord 2.app"))
         );
     }
@@ -188,7 +193,10 @@ mod tests {
     #[test]
     fn a_bare_binary_has_no_bundle() {
         assert_eq!(bundle_root(Path::new("/Users/a/baucord/baucord")), None);
-        assert_eq!(bundle_root(Path::new("/opt/x/Contents/MacOS/baucord")), None);
+        assert_eq!(
+            bundle_root(Path::new("/opt/x/Contents/MacOS/baucord")),
+            None
+        );
         assert_eq!(bundle_root(Path::new("C:\\baucord\\baucord.exe")), None);
         assert_eq!(bundle_root(Path::new("baucord")), None);
     }
@@ -204,10 +212,8 @@ mod tests {
     struct Scratch(PathBuf);
     impl Scratch {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "baucord-bundle-test-{name}-{}",
-                std::process::id()
-            ));
+            let dir = std::env::temp_dir()
+                .join(format!("baucord-bundle-test-{name}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).unwrap();
             Self(dir)
@@ -260,7 +266,10 @@ mod tests {
 
         let exe = dest.join("baucord.app/Contents/MacOS/baucord");
         assert_eq!(fs::read(&exe).unwrap(), b"exe");
-        assert_eq!(fs::metadata(&exe).unwrap().permissions().mode() & 0o777, 0o755);
+        assert_eq!(
+            fs::metadata(&exe).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
         let link = dest.join("baucord.app/Contents/Current");
         assert_eq!(fs::read_link(&link).unwrap(), PathBuf::from("MacOS"));
         assert!(!dest.join("__MACOSX").exists());
