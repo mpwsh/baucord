@@ -8,7 +8,6 @@ baucord-gateway on 127.0.0.1:8765 whose bot has JOIN_CHANNELS and SPEAK
 ffmpeg's output as fast as the socket takes it, 100 ms at a time."""
 import json
 import os
-import shlex
 import subprocess
 import threading
 
@@ -28,10 +27,19 @@ class Player:
 
     def play(self, url):
         self.stop()
-        cmd = "yt-dlp -q -o - %s | ffmpeg -loglevel error -i - -f f32le -ar 48000 -ac 1 -" % shlex.quote(url)
+        # yt-dlp | ffmpeg, piped here rather than by a shell: the same on
+        # Windows, where cmd.exe took shlex's quotes literally and cut a
+        # URL at its `&`. `--` keeps a "URL" from being read as an option.
+        ytdlp = subprocess.Popen(["yt-dlp", "-q", "-o", "-", "--", url], stdout=subprocess.PIPE)
+        proc = subprocess.Popen(
+            ["ffmpeg", "-loglevel", "error", "-i", "-", "-f", "f32le", "-ar", "48000", "-ac", "1", "-"],
+            stdin=ytdlp.stdout,
+            stdout=subprocess.PIPE,
+        )
+        ytdlp.stdout.close()  # ffmpeg's now; yt-dlp stops when ffmpeg does
+        proc.upstream = ytdlp
         with self.lock:
-            self.proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
-            proc = self.proc
+            self.proc = proc
         threading.Thread(target=self._pump, args=(proc,), daemon=True).start()
 
     def _pump(self, proc):
@@ -44,12 +52,23 @@ class Player:
                     break
             self.ws.send(piece)  # blocks when ten seconds are queued: the pacing
         proc.wait()
+        proc.upstream.wait()
+        # Ended by itself (not a !stop or the next !play) with yt-dlp
+        # failing: say so, rather than going quiet.
+        with self.lock:
+            failed = self.proc is proc and proc.upstream.returncode != 0
+            if self.proc is proc:
+                self.proc = None
+        if failed:
+            action(self.ws, "CREATE_MESSAGE",
+                   text="couldn't play that (yt-dlp failed; if every link fails, update it: yt-dlp -U)")
 
     def stop(self):
         with self.lock:
             proc, self.proc = self.proc, None
         if proc:
             proc.kill()
+            proc.upstream.kill()
             self.ws.send(json.dumps({"op": "voice", "t": "STOP"}))
 
 
@@ -81,13 +100,19 @@ with connect(GATEWAY) as ws:
         elif t == "MESSAGE_CREATE" and not d["own"]:
             words = d["text"].split(maxsplit=1)
             if words[:1] == ["!play"] and len(words) == 2:
+                url = words[1].strip()
+                # Links only: yt-dlp guesses https:// in front of a bare
+                # word and fetches whatever that names.
+                if not url.lower().startswith(("http://", "https://")):
+                    action(ws, "CREATE_MESSAGE", text="!play takes a link (https://...)")
+                    continue
                 channel = channels.get(d["client_id"])
                 if channel is None:
                     action(ws, "CREATE_MESSAGE", text="join a voice channel first, %s" % d["name"])
                     continue
                 action(ws, "JOIN_CHANNEL", channel_id=channel)
-                action(ws, "CREATE_MESSAGE", text="playing %s for %s" % (words[1], d["name"]))
-                player.play(words[1])
+                action(ws, "CREATE_MESSAGE", text="playing %s for %s" % (url, d["name"]))
+                player.play(url)
             elif words[:1] == ["!stop"]:
                 player.stop()
                 action(ws, "CREATE_MESSAGE", text="stopped")
