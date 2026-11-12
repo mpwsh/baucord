@@ -29,6 +29,9 @@ rand.workspace = true
 # system library on any platform; `cc` handles MSVC); `backup` is the
 # online backup API behind `server backup`.
 rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
+# The recorder (1.5) decodes the voice it relays in a recording channel:
+# the same crate and libopus the audio engine and the gateway use.
+opus = "0.4"
 # `server backup` archives the database snapshot and the blobs directory.
 tar = "0.4.46"
 

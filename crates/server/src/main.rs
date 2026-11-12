@@ -595,6 +595,7 @@ fn db_prune(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
             history_days: p.history.retain_days,
             telemetry_days: p.telemetry.retain_days,
             file_days: p.files.retain_days,
+            recording_days: config.recording.retain_days,
         },
     )?;
     println!("pruned {removed} row(s) and file(s) past their retention windows");

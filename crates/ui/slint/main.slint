@@ -6,14 +6,22 @@
 // an overlay here — which retires the orphaned-popup / focus-churn
 // machinery wholesale (there is nothing to strand on the desktop).
 
+// The app's typeface (1.5): Inter 4.1, the weights the UI uses.
+import "../fonts/Inter-Regular.ttf";
+import "../fonts/Inter-Medium.ttf";
+import "../fonts/Inter-SemiBold.ttf";
+import "../fonts/Inter-Bold.ttf";
+import "../fonts/Inter-Italic.ttf";
+import "../fonts/Inter-SemiBoldItalic.ttf";
 import { IconSet, IconDisplay } from "@lucide";
 import { Palette } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
-import { State, Logic, Phase, UserRow, ChatRow, EmojiRow, KeybindRow, ServerRow, ModAction, ToastKind, MenuEntry } from "globals.slint";
+import { State, Logic, StageTile, Phase, UserRow, ChatRow, EmojiRow, KeybindRow, ServerRow, ModAction, ToastKind, MenuEntry } from "globals.slint";
 import { ConnectView } from "connect.slint";
 import { StartupView } from "startup.slint";
 import { Sidebar } from "sidebar.slint";
+import { Rail, Inbox, InboxEmpty, Stage } from "views.slint";
 import { ChatPane } from "chat.slint";
 import { Btn, IconBtn, Modal, PageRect, Field, FieldLabel, Hint, Dropdown, CheckRow, AvatarTile, MenuPanel, RoleGlyph, TipLayer, Toast } from "widgets.slint";
 import { SettingsPanel, SettingsState, SettingsLogic } from "settings.slint";
@@ -22,12 +30,59 @@ import { StreamViewerWindow, StreamViewerPanel } from "viewer.slint";
 
 import { BaucordTray, TrayPerson } from "tray.slint";
 
-export { SettingsState, SettingsLogic, StreamViewerWindow, BaucordTray, TrayPerson, State, Logic, Tr, Theme, Phase, UserRow, ChatRow, EmojiRow, KeybindRow, ServerRow, ModAction, ToastKind, MenuEntry }
+export { SettingsState, SettingsLogic, StreamViewerWindow, BaucordTray, TrayPerson, State, Logic, Tr, Theme, Phase, UserRow, StageTile, ChatRow, EmojiRow, KeybindRow, ServerRow, ModAction, ToastKind, MenuEntry }
 export { AdminState, AdminLogic, AdminUserRow, AdminRoleRow, AdminRestrictionRow, AdminInviteRow, AdminChannelRow, AdminBlobRow, AdminAuditRow }
+
+/// The strip between two columns (1.5): a step lighter than the
+/// ground, with a grip, and the drag that moves it. Only a line follows
+/// the pointer (the window draws it); the width lands on release.
+component EdgeStrip inherits Rectangle {
+    callback begin();
+    callback moving(dx: length);
+    callback done(dx: length);
+    callback cancelled();
+    background: Theme.bg-tertiary;
+    Rectangle {
+        x: 0;
+        width: 1px;
+        background: Theme.border;
+    }
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 2px;
+        height: 32px;
+        border-radius: 1px;
+        background: ta.has-hover || ta.pressed ? Theme.accent-text : Theme.grip;
+    }
+    ta := TouchArea {
+        mouse-cursor: MouseCursor.col-resize;
+        property <bool> dragging: false;
+        pointer-event(ev) => {
+            if (ev.kind == PointerEventKind.down) {
+                self.dragging = true;
+                root.begin();
+            } else if (ev.kind == PointerEventKind.up && self.dragging) {
+                self.dragging = false;
+                root.done(self.mouse-x - self.pressed-x);
+            } else if (ev.kind == PointerEventKind.cancel) {
+                self.dragging = false;
+                root.cancelled();
+            }
+        }
+        moved => {
+            if (self.pressed) { root.moving(self.mouse-x - self.pressed-x); }
+        }
+    }
+}
 
 export component MainWindow inherits Window {
     title: "baucord";
     background: Theme.bg-primary;
+    // Inter (1.5), embedded: the same type on every platform rather
+    // than each system's own (fonts/, cut to the scripts the app shows;
+    // a character outside them falls back to the system's fonts).
+    default-font-family: "Inter";
     // The app is dark whatever the OS is: the stock widgets drawn from
     // the style's palette (scrollbars, Settings → About's AboutSlint on
     // a phone) follow.
@@ -197,6 +252,9 @@ export component MainWindow inherits Window {
     // width lands on release. Re-laying out the chat (every message
     // re-wraps) on every pointer move flickered the whole window.
     property <length> sidebar-preview: -1px;
+    // The same for the right panel's edge beside Channel view: the
+    // panel's width while dragged, -1 otherwise.
+    property <length> panel-preview: -1px;
     nav-keys := FocusScope {
         // Only ever focused on purpose: a click must leave the
         // desktop's composer its focus, and Tab must not stop here.
@@ -232,53 +290,156 @@ export component MainWindow inherits Window {
             // closing hands the focus back as before.
             visible: root.main-shown;
             // The chat pane is a persistent instance (the shell drives
-            // its scroll and composer at any time), so both pages are
+            // its scroll and composer at any time), so every column is
             // placed by hand rather than swapped with `if`.
+            //
+            // 1.5: the rail at every width, then the columns it shows —
+            // the main one (the channel list or Channel view) and the
+            // chat — or Messages: the inbox and the conversation picked
+            // in it. Channel view takes the room the chat leaves; beside
+            // the list the chat does. Narrow, one column at a time (the
+            // main one if any, else the chat), and a conversation slides
+            // in over the inbox.
+            property <length> rail-w: 64px;
+            property <bool> msgs: State.view-messages;
+            property <bool> in-call: State.stage-name != "";
+            // The main column: 1 the list, 2 Channel view, 0 none.
+            property <int> main: State.view-main == 2 && !self.in-call ? 1 : State.view-main;
+            property <bool> chat-wanted: State.view-chat || self.main == 0;
+            property <bool> list-on: self.main == 1;
+            property <bool> stage-on: self.main == 2;
+            property <bool> chat-on: self.chat-wanted && !(root.narrow && self.main != 0);
+            property <length> rest: self.width - self.rail-w;
+            // The strip between two columns: its grip says the edge can
+            // be dragged.
+            property <length> strip: 8px;
+            property <bool> pair: self.chat-on && self.main != 0;
+            property <length> side-w: self.pair ? Math.min(State.sidebar-width, self.rest - 300px) : self.rest;
+            property <length> panel-w: !self.chat-on ? 0px
+                : !self.pair ? self.rest
+                : self.list-on ? self.rest - self.side-w - self.strip
+                : Math.clamp(State.panel-width, 300px, Math.max(300px, self.rest - 300px - self.strip));
+            property <length> stage-w: self.pair ? self.rest - self.panel-w - self.strip : self.rest;
+            property <length> inbox-w: root.narrow ? self.rest : Math.min(340px, self.rest * 0.45);
+            // Cameras are watched only while Channel view can be seen
+            // (the host subscribes and lets go on this edge).
+            property <bool> stage-seen: stage-box.visible && root.main-shown && State.app-shown;
+            changed stage-seen => { Logic.stage-shown(self.stage-seen); }
+            Rail {
+                x: 0;
+                y: 0;
+                // In front of the inbox sliding out to the left.
+                z: 2;
+                width: main-screen.rail-w;
+                height: main-screen.height;
+                list-on: !main-screen.msgs && main-screen.list-on;
+                stage-on: !main-screen.msgs && main-screen.stage-on;
+                chat-on: !main-screen.msgs && main-screen.chat-on;
+            }
             sidebar-box := Rectangle {
-                // Narrow: pushed out to the left as the chat comes in
-                // from the right (the two never overlap).
-                x: root.narrow ? -root.chat-shown * parent.width : 0;
-                width: root.narrow ? parent.width : State.sidebar-width;
-                visible: !root.narrow || root.chat-shown < 1;
+                x: main-screen.rail-w;
+                width: main-screen.side-w;
+                height: parent.height;
+                y: 0;
+                visible: !main-screen.msgs && main-screen.list-on;
                 // Above the chat pane, so a tooltip at the edge is not
                 // painted over by it.
                 z: 1;
-                Sidebar { }
-                grip := TouchArea {
-                    x: parent.width - 4px;
-                    width: 8px;
-                    enabled: !root.narrow;
-                    mouse-cursor: MouseCursor.col-resize;
-                    pure function target() -> length {
-                        return Math.clamp(State.sidebar-width + (self.mouse-x - self.pressed-x),
-                            220px, Math.min(480px, root.width - 360px));
-                    }
-                    pointer-event(ev) => {
-                        if (ev.kind == PointerEventKind.down) {
-                            root.sidebar-preview = State.sidebar-width;
-                        } else if (ev.kind == PointerEventKind.up && root.sidebar-preview >= 0px) {
-                            State.sidebar-width = self.target();
-                            root.sidebar-preview = -1px;
-                            Logic.sidebar-resized(State.sidebar-width);
-                        } else if (ev.kind == PointerEventKind.cancel) {
-                            root.sidebar-preview = -1px;
-                        }
-                    }
-                    moved => { if (self.pressed) { root.sidebar-preview = self.target(); } }
+                Sidebar { narrow: root.narrow; }
+            }
+            stage-box := Rectangle {
+                x: main-screen.rail-w;
+                width: main-screen.stage-w;
+                height: parent.height;
+                y: 0;
+                visible: !main-screen.msgs && main-screen.stage-on;
+                Stage { narrow: root.narrow; }
+            }
+            // The strip after the channel list: drags its width.
+            if !main-screen.msgs && main-screen.list-on && main-screen.pair : EdgeStrip {
+                x: main-screen.rail-w + main-screen.side-w;
+                width: main-screen.strip;
+                height: main-screen.height;
+                pure function target(dx: length) -> length {
+                    return Math.clamp(State.sidebar-width + dx, 220px, Math.min(480px, root.width - 360px));
                 }
+                begin => { root.sidebar-preview = main-screen.rail-w + State.sidebar-width; }
+                moving(dx) => { root.sidebar-preview = main-screen.rail-w + self.target(dx); }
+                done(dx) => {
+                    State.sidebar-width = self.target(dx);
+                    root.sidebar-preview = -1px;
+                    Logic.sidebar-resized(State.sidebar-width);
+                }
+                cancelled => { root.sidebar-preview = -1px; }
+            }
+            // The strip between Channel view and the chat: drags the
+            // chat's width.
+            if !main-screen.msgs && main-screen.stage-on && main-screen.pair : EdgeStrip {
+                x: main-screen.rail-w + main-screen.rest - main-screen.panel-w - main-screen.strip;
+                width: main-screen.strip;
+                height: main-screen.height;
+                pure function target(dx: length) -> length {
+                    return Math.clamp(State.panel-width - dx, 300px,
+                        Math.max(300px, main-screen.rest - 300px - main-screen.strip));
+                }
+                begin => { root.panel-preview = State.panel-width; }
+                moving(dx) => { root.panel-preview = self.target(dx); }
+                done(dx) => {
+                    State.panel-width = self.target(dx);
+                    root.panel-preview = -1px;
+                    Logic.panel-resized(State.panel-width);
+                }
+                cancelled => { root.panel-preview = -1px; }
+            }
+            inbox-box := Rectangle {
+                // Narrow: pushed out to the left as the conversation
+                // comes in from the right.
+                x: main-screen.rail-w - (root.narrow ? root.chat-shown * main-screen.rest : 0px);
+                width: main-screen.inbox-w;
+                height: parent.height;
+                y: 0;
+                visible: main-screen.msgs && (!root.narrow || root.chat-shown < 1);
+                Inbox { narrow: root.narrow; }
+                if !root.narrow : Rectangle {
+                    x: parent.width - 1px;
+                    width: 1px;
+                    background: Theme.bg-tertiary;
+                }
+            }
+            if main-screen.msgs && !root.narrow && State.active-dm < 0 : InboxEmpty {
+                x: main-screen.rail-w + main-screen.inbox-w;
+                width: main-screen.rest - main-screen.inbox-w;
+                height: parent.height;
             }
             chat-pane := ChatPane {
                 narrow: root.narrow;
                 drawn: root.main-shown && State.app-shown;
-                x: root.narrow ? (1 - root.chat-shown) * parent.width : State.sidebar-width;
-                width: root.narrow ? parent.width : parent.width - State.sidebar-width;
+                // A step lighter beside another column; the window's
+                // own ground when it has the room to itself.
+                ground: main-screen.msgs || !main-screen.pair ? Theme.bg-primary : Theme.bg-panel;
+                x: main-screen.msgs
+                    ? (root.narrow ? main-screen.rail-w + (1 - root.chat-shown) * main-screen.rest
+                        : main-screen.rail-w + main-screen.inbox-w)
+                    : main-screen.rail-w + main-screen.rest - main-screen.panel-w;
+                y: 0;
+                width: main-screen.msgs
+                    ? (root.narrow ? main-screen.rest : main-screen.rest - main-screen.inbox-w)
+                    : main-screen.panel-w;
                 height: parent.height;
-                visible: !root.narrow || root.chat-shown > 0;
+                visible: main-screen.msgs
+                    ? (root.narrow ? root.chat-shown > 0 : State.active-dm >= 0)
+                    : main-screen.chat-on;
             }
         }
     }
     if root.sidebar-preview >= 0px : Rectangle {
         x: root.inset-left + root.sidebar-preview - 1px;
+        width: 2px;
+        height: 100%;
+        background: Theme.accent-text;
+    }
+    if root.panel-preview >= 0px : Rectangle {
+        x: root.inset-left + root.page-width - root.panel-preview - 1px;
         width: 2px;
         height: 100%;
         background: Theme.accent-text;

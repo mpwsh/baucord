@@ -13,7 +13,8 @@ WORKDIR /app
 # The whole workspace is copied so Cargo.lock resolves exactly as it
 # does on a developer machine (that is what lets --locked hold below);
 # only the server's dependency graph is ever *compiled*, so ffmpeg,
-# pipewire and slint never enter this image.
+# pipewire and slint never enter this image (libopus does: the
+# recorder).
 FROM chef AS planner
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates crates
@@ -22,6 +23,9 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 # ── Build ───────────────────────────────────────────────────────────────
 FROM chef AS builder
+# The recorder (1.5) decodes voice with libopus, which builds with
+# cmake (the gateway's image does the same).
+RUN apt-get update && apt-get install -y --no-install-recommends cmake && rm -rf /var/lib/apt/lists/*
 COPY rust-toolchain.toml ./
 # Cargo resolves every [patch] path in the workspace, so the vendored
 # crates must be present even though the server doesn't build them.

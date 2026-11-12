@@ -28,6 +28,41 @@ pub struct Config {
     pub channels: Vec<ChannelSettings>,
     /// Policy for channels created from the client.
     pub user_channels: UserChannelSettings,
+    /// Voice channel recording (1.5).
+    pub recording: RecordingSettings,
+}
+
+/// Voice channel recording (1.5): the server mixes a channel's voice
+/// into one WAV and gives it to the people who were in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RecordingSettings {
+    /// `false`: every start is refused and no recorder thread runs.
+    pub enabled: bool,
+    /// 48000, 24000 or 16000: what Opus decodes to directly.
+    pub sample_rate_hz: u32,
+    /// A recording ends itself here; at most 720 (the WAV's 4 GiB).
+    pub max_minutes: u32,
+    /// Recordings at once on the server.
+    pub max_concurrent: u32,
+    /// Recordings kept on disk; a start is refused at the cap.
+    pub total_cap_gb: u32,
+    /// Files are deleted this many days after recording; 0 keeps them
+    /// forever.
+    pub retain_days: u32,
+}
+
+impl Default for RecordingSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sample_rate_hz: 48_000,
+            max_minutes: 240,
+            max_concurrent: 2,
+            total_cap_gb: 10,
+            retain_days: 30,
+        }
+    }
 }
 
 /// One voice channel (room). Designed to grow: every field except
@@ -129,6 +164,8 @@ pub struct LimitSettings {
     pub max_sharers: usize,
     /// Viewers allowed per stream.
     pub max_viewers_per_stream: usize,
+    /// Cameras on at once in one channel (1.5).
+    pub max_cameras_per_channel: usize,
     /// Chat messages longer than this (bytes) are truncated. At most
     /// [`MAX_CHAT_BYTES_LIMIT`]: one message must fit a history page.
     pub max_chat_bytes: usize,
@@ -210,6 +247,11 @@ pub struct PersistenceSettings {
     /// file: tests lower it to provoke drops; leave the default.
     #[serde(skip_serializing)]
     pub write_queue: usize,
+    /// `recording.retain_days`, handed to the persistence thread's
+    /// retention pass (1.5). Set from the `recording:` section, never
+    /// read from this one.
+    #[serde(skip)]
+    pub recording_retain_days: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -378,6 +420,20 @@ impl Config {
         if self.persistence.enabled && self.persistence.path.trim().is_empty() {
             return Err("persistence.path is empty".to_string());
         }
+        let rec = self.recording;
+        if ![48_000, 24_000, 16_000].contains(&rec.sample_rate_hz) {
+            return Err(format!(
+                "recording.sample_rate_hz: {} — use 48000, 24000 or 16000",
+                rec.sample_rate_hz
+            ));
+        }
+        if rec.max_minutes == 0 || rec.max_minutes > protocol::recording::MAX_RECORDING_MINUTES {
+            return Err(format!(
+                "recording.max_minutes: {} — between 1 and {} (a WAV holds 4 GiB)",
+                rec.max_minutes,
+                protocol::recording::MAX_RECORDING_MINUTES
+            ));
+        }
         if self.persistence.write_queue == 0 {
             return Err("persistence.write_queue must be at least 1".to_string());
         }
@@ -497,6 +553,7 @@ impl Default for Config {
             logging: LoggingSettings::default(),
             channels: default_channels(),
             user_channels: UserChannelSettings::default(),
+            recording: RecordingSettings::default(),
         }
     }
 }
@@ -527,6 +584,7 @@ impl Default for LimitSettings {
         Self {
             max_sharers: 8,
             max_viewers_per_stream: 16,
+            max_cameras_per_channel: 12,
             max_chat_bytes: 2000,
             // 4 MiB/min per client (four full-size images or a pile of
             // stickers), 16 MiB/min for the room — bursty enough for a
@@ -550,6 +608,7 @@ impl Default for PersistenceSettings {
             avatars: AvatarSettings::default(),
             telemetry: TelemetryRetention::default(),
             write_queue: 4096,
+            recording_retain_days: 0,
         }
     }
 }

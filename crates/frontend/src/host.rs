@@ -57,6 +57,17 @@ pub trait Hooks: Send + Sync {
     /// # Errors
     /// The host's own message.
     fn save_download(&self, name: &str, mime: &str, bytes: &[u8]) -> Result<Saved, String>;
+    /// [`Self::save_download`] for a file already on disk (a streamed
+    /// download, 1.5), which may be far larger than memory should hold.
+    /// The default reads it whole; a phone streams it into its
+    /// Downloads instead where it can.
+    ///
+    /// # Errors
+    /// The host's own message.
+    fn save_download_path(&self, name: &str, mime: &str, from: &Path) -> Result<Saved, String> {
+        let bytes = std::fs::read(from).map_err(|e| e.to_string())?;
+        self.save_download(name, mime, &bytes)
+    }
     /// Open a file [`Self::save_download`] wrote with whatever handles
     /// `mime`.
     ///
@@ -421,6 +432,15 @@ pub fn save_download(name: &str, mime: &str, bytes: &[u8]) -> Option<Result<Save
     hooks()
         .filter(|h| h.owns_downloads())
         .map(|h| h.save_download(name, mime, bytes))
+}
+
+/// [`save_download`] for a file on disk (1.5); `None` where the app
+/// writes Downloads itself.
+#[must_use]
+pub fn save_download_path(name: &str, mime: &str, from: &Path) -> Option<Result<Saved, String>> {
+    hooks()
+        .filter(|h| h.owns_downloads())
+        .map(|h| h.save_download_path(name, mime, from))
 }
 
 /// Whether a saved file is still where it was saved.

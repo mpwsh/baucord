@@ -23,7 +23,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use log::{debug, info};
-use protocol::{parse_system_audio, parse_video_header, parse_voice, ClientId, Lane, ShareScope};
+use protocol::{
+    parse_system_audio, parse_video_header, parse_voice, Bytes, ClientId, Lane, ShareScope,
+};
 use transport::{Driver, Shared, TrackStats, VideoItem};
 
 use crate::link_stats::VoiceSeqTracker;
@@ -57,6 +59,10 @@ pub struct VoiceRelay {
     /// Per-sender sequence tracking for the link report — see
     /// [`crate::link_stats`].
     pub seq: VoiceSeqTracker,
+    /// Packets forwarded in a recording channel this tick, as
+    /// (channel, sender, packet) — a clone of the same bytes, for the
+    /// recorder (1.5). The tick takes them after `process`.
+    pub tapped: Vec<(u16, ClientId, Bytes)>,
 }
 
 /// What one relay tick needs to know about the room: who is admitted,
@@ -81,6 +87,9 @@ pub struct Room<'a> {
     /// Voice from the lobby goes nowhere (spec §12, 1.1.5).
     pub lobby: u16,
     pub channel_of: &'a HashMap<ClientId, u16>,
+    /// Channels being recorded (1.5): their packets are also copied
+    /// into [`VoiceRelay::tapped`].
+    pub recording: &'a HashSet<u16>,
 }
 
 impl VoiceRelay {
@@ -89,6 +98,7 @@ impl VoiceRelay {
         Self {
             stats: VoiceStats::default(),
             seq: VoiceSeqTracker::default(),
+            tapped: Vec::new(),
         }
     }
 
@@ -123,6 +133,7 @@ impl VoiceRelay {
             afk_channel,
             lobby,
             channel_of,
+            recording,
         } = *room;
         for sender in senders {
             let sender_channel = channel_of.get(sender).copied();
@@ -186,6 +197,14 @@ impl VoiceRelay {
                 if sent > 0 {
                     self.stats.packets_forwarded += 1;
                     self.stats.bytes_relayed += envelope.len() as u64 * sent;
+                }
+                // A recording hears what the room would, the speaker
+                // alone in it included.
+                if let Some(ch) = sender_channel
+                    && !recording.is_empty()
+                    && recording.contains(&ch)
+                {
+                    self.tapped.push((ch, *sender, message.clone()));
                 }
             }
         }
@@ -300,6 +319,10 @@ pub struct VideoRelay {
     /// since the oldest. Per track, so a viewer watching two streams
     /// does not charge one sharer with the other's losses.
     health_window: HashMap<(ClientId, ClientId), VecDeque<TrackStats>>,
+    /// Or'ed into the sender's id to make a viewer's track: 0 for
+    /// screens, [`protocol::recording::CAMERA_TRACK_BIT`] for cameras
+    /// (1.5), so one viewer keeps both of a person's streams apart.
+    track_bit: u64,
     pub stats: VideoStats,
 }
 
@@ -317,8 +340,24 @@ impl VideoRelay {
             subscribers: HashMap::new(),
             keyframe_request_gate: HashMap::new(),
             health_window: HashMap::new(),
+            track_bit: 0,
             stats: VideoStats::default(),
         }
+    }
+
+    /// The camera relay (1.5): the same group fan-out, on viewer tracks
+    /// with [`protocol::recording::CAMERA_TRACK_BIT`] set.
+    #[must_use]
+    pub fn cameras() -> Self {
+        Self {
+            track_bit: protocol::recording::CAMERA_TRACK_BIT,
+            ..Self::new()
+        }
+    }
+
+    /// The viewer-side track of `sender`'s stream.
+    fn track(&self, sender: ClientId) -> u64 {
+        sender | self.track_bit
     }
 
     // ── Subscription management (called from the control handler) ───
@@ -355,8 +394,8 @@ impl VideoRelay {
         self.sharers.remove(&client_id);
         if let Some(viewers) = self.subscribers.remove(&client_id) {
             for viewer in viewers {
-                driver.video_finish_group(now, viewer, client_id);
-                driver.video_forget_track(viewer, client_id);
+                driver.video_finish_group(now, viewer, self.track(client_id));
+                driver.video_forget_track(viewer, self.track(client_id));
             }
         }
         self.keyframe_request_gate.remove(&client_id);
@@ -386,8 +425,8 @@ impl VideoRelay {
         if let Some(subs) = self.subscribers.get_mut(&streamer)
             && subs.remove(&viewer)
         {
-            driver.video_reset_group(now, viewer, streamer);
-            driver.video_forget_track(viewer, streamer);
+            driver.video_reset_group(now, viewer, self.track(streamer));
+            driver.video_forget_track(viewer, self.track(streamer));
             self.health_window.remove(&(viewer, streamer));
         }
     }
@@ -399,8 +438,8 @@ impl VideoRelay {
         if self.sharers.remove(&client_id).is_some() {
             if let Some(viewers) = self.subscribers.remove(&client_id) {
                 for viewer in viewers {
-                    driver.video_reset_group(now, viewer, client_id);
-                    driver.video_forget_track(viewer, client_id);
+                    driver.video_reset_group(now, viewer, self.track(client_id));
+                    driver.video_forget_track(viewer, self.track(client_id));
                 }
             }
             self.keyframe_request_gate.remove(&client_id);
@@ -472,7 +511,7 @@ impl VideoRelay {
             let mut viewers = 0u16;
             for viewer in subs {
                 let (Some(link), Some(track)) =
-                    (driver.stats(*viewer), driver.track_stats(*viewer, *sharer))
+                    (driver.stats(*viewer), driver.track_stats(*viewer, *sharer | self.track_bit))
                 else {
                     continue;
                 };
@@ -520,7 +559,10 @@ impl VideoRelay {
         }
     }
 
-    fn relay_video_item(
+    /// One group item from `sender`, mirrored onto its viewers' tracks.
+    /// The tick reads the sender's tracks itself and hands screen items
+    /// here and camera items to the camera relay (1.5).
+    pub fn relay_video_item(
         &mut self,
         driver: &mut Driver,
         now: Instant,
@@ -542,8 +584,9 @@ impl VideoRelay {
         match item {
             VideoItem::GroupStart => {
                 self.stats.groups_received += 1;
+                let track = self.track(sender);
                 for viewer in &viewers {
-                    driver.video_new_group(now, *viewer, sender);
+                    driver.video_new_group(now, *viewer, track);
                     self.stats.groups_relayed += 1;
                 }
             }
@@ -560,13 +603,14 @@ impl VideoRelay {
                     return;
                 }
                 let envelope = Shared::relayed(Lane::Video, sender, &message);
+                let track = self.track(sender);
                 let mut sent = 0u64;
                 for viewer in &viewers {
                     // A viewer whose group was reset simply misses the
                     // rest of it; the next GroupStart reopens.
-                    if driver.video_group_open(*viewer, sender)
+                    if driver.video_group_open(*viewer, track)
                         && driver
-                            .send_video_shared(now, *viewer, sender, &envelope)
+                            .send_video_shared(now, *viewer, track, &envelope)
                             .is_ok()
                     {
                         sent += 1;
@@ -578,14 +622,16 @@ impl VideoRelay {
                 }
             }
             VideoItem::GroupEnd => {
+                let track = self.track(sender);
                 for viewer in &viewers {
-                    driver.video_finish_group(now, *viewer, sender);
+                    driver.video_finish_group(now, *viewer, track);
                 }
             }
             VideoItem::GroupReset => {
                 self.stats.groups_reset_by_sharer += 1;
+                let track = self.track(sender);
                 for viewer in &viewers {
-                    driver.video_reset_group(now, *viewer, sender);
+                    driver.video_reset_group(now, *viewer, track);
                 }
             }
         }

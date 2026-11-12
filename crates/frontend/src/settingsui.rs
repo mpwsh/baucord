@@ -146,9 +146,10 @@ impl OpenedWith {
             restored.share.clone_from(&now.share);
         }
         restored.audio.lowering_told = now.audio.lowering_told;
-        restored.ui.messages_collapsed = now.ui.messages_collapsed;
         restored.ui.sidebar_width = now.ui.sidebar_width;
-        restored.ui.messages_height = now.ui.messages_height;
+        restored.ui.view_list = now.ui.view_list;
+        restored.ui.view_chat = now.ui.view_chat;
+        restored.ui.panel_width = now.ui.panel_width;
         restored.ui.hidden_dms.clone_from(&now.ui.hidden_dms);
         if !self.servers_edited {
             restored.servers.clone_from(&now.servers);
@@ -204,7 +205,8 @@ fn route_label(name: &str) -> String {
 
 /// Nav index of the Servers tab (Profile 0, General 1, Audio 2,
 /// Sounds 3, Keyboard 4, Servers 5, Credits 6, About 7, Debug 8,
-/// Licenses 9, Stream 10 — numbered as added, ordered by the nav) —
+/// Licenses 9, Stream 10, Camera 11 — numbered as added, ordered by the
+/// nav) —
 /// the connect view's pencil jumps here. Mirrors the `NavItem`s in
 /// settings.slint.
 pub const TAB_SERVERS: i32 = 5;
@@ -214,6 +216,9 @@ const TAB_AUDIO: i32 = 2;
 /// refreshes while it shows.
 const TAB_DEBUG: i32 = 8;
 const TAB_LICENSES: i32 = 9;
+/// Nav index of the Camera tab (1.5), whose preview runs only while it
+/// shows.
+const TAB_CAMERA: i32 = 11;
 
 /// The Debug tab's log view: this many of the last lines…
 const LOG_TAIL_LINES: usize = 100;
@@ -651,6 +656,8 @@ macro_rules! switches {
             set_compact_rows, on_compact_rows_changed => ui.compact_rows, push_ui_prefs;
             set_stream_pointer, on_stream_pointer_changed => share.pointer, stream_edited;
             set_stream_gpu_priority, on_stream_gpu_priority_changed => share.gpu_priority, stream_edited;
+            set_camera_mirror, on_camera_mirror_changed => camera.mirror, camera_options_changed;
+            set_send_telemetry, on_send_telemetry_changed => privacy.send_telemetry, apply_telemetry_pref;
         }
     };
 }
@@ -710,6 +717,8 @@ pub fn populate(app: &mut AppState) {
         };
     }
     switches!(show);
+    // Cameras are sent from the desktops only so far (1.5).
+    s.set_camera_supported(cfg!(not(any(target_os = "android", target_os = "ios"))));
     s.set_tray_available(cfg!(feature = "tray"));
     s.set_notifications_available(crate::host::notifies());
     let sizes: Vec<slint::SharedString> = IMAGE_SIZES
@@ -1112,6 +1121,46 @@ fn wire(sf: SettingsSurface<'_>) {
         };
     }
     switches!(save);
+    // ── Camera (1.5) ─────────────────────────────────────────────
+    logic.on_camera_selected(|index| {
+        app::with_current(move |app| {
+            let names = CAMERA_NAMES.with(|n| n.borrow().clone());
+            app.settings.camera.device = usize::try_from(index)
+                .ok()
+                .and_then(|i| i.checked_sub(1))
+                .and_then(|i| names.get(i).cloned());
+            // Its sizes, for the quality list.
+            probe_camera(app);
+            // What is open now reopens on the new camera.
+            if app.session_camera_sending() {
+                app.start_camera_thread(true);
+            } else if camera_previewing(app) {
+                app.start_camera_thread(false);
+            }
+        });
+    });
+    logic.on_camera_quality_selected(|index| {
+        app::with_current(move |app| {
+            let choices = CAMERA_QUALITIES.with(|q| q.borrow().clone());
+            if let Some(q) = usize::try_from(index).ok().and_then(|i| choices.get(i)) {
+                app.settings.camera.quality = q.key().to_string();
+                app.camera_options_changed();
+            }
+        });
+    });
+    logic.on_camera_preview_toggle(|| {
+        app::with_current(|app| {
+            if camera_previewing(app) {
+                stop_camera_preview(app);
+            } else {
+                surface(app).state().set_camera_previewing(true);
+                // A camera already on in a call shows here as it is.
+                if !app.session_camera_sending() {
+                    app.start_camera_thread(false);
+                }
+            }
+        });
+    });
     logic.on_image_size_selected(|index| {
         app::with_current(move |app| {
             if let Some((_, kb)) = usize::try_from(index).ok().and_then(|i| IMAGE_SIZES.get(i)) {
@@ -1453,6 +1502,11 @@ fn wire(sf: SettingsSurface<'_>) {
             let sf = surface(app);
             if sf.tab() == TAB_LICENSES && sf.state().get_licenses().row_count() == 0 {
                 set_licenses(&sf.state());
+            }
+            if sf.tab() == TAB_CAMERA {
+                refresh_cameras(app);
+            } else {
+                stop_camera_preview(app);
             }
             sync_audio_tab(app);
         });
@@ -2050,9 +2104,11 @@ fn close(app: &mut AppState) {
 }
 
 /// What both ways out do first: cancel a recording, stop a running mic
-/// test, and close the microphone the Audio tab's meter held.
+/// test, and close the microphone the Audio tab's meter held (and the
+/// camera its preview held).
 fn leave(app: &mut AppState) {
     cancel_capture(app);
+    stop_camera_preview(app);
     if app.is_testing_mic {
         app.handle_test_microphone(false);
         let sf = surface(app);
@@ -2423,4 +2479,110 @@ fn toggle_license(s: &ui::SettingsState, index: usize) {
             rows.remove(at + 1);
         }
     }
+}
+
+// ── Camera (1.5) ────────────────────────────────────────────────────────
+
+thread_local! {
+    /// The cameras the picker lists, by name, in its order after
+    /// "First camera".
+    static CAMERA_NAMES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The sizes the quality list shows, in its order.
+    static CAMERA_QUALITIES: std::cell::RefCell<Vec<video::Quality>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Ask the camera thread what the picked camera can deliver; the list
+/// shows 1080p, 720p and 480p until it answers (`camera_heights`).
+fn probe_camera(app: &AppState) {
+    camera_heights(app, &[]);
+    app.probe_camera(app.settings.camera.device.clone());
+}
+
+/// The quality list for a camera whose heights are `heights` (empty:
+/// not known yet, or it would not say).
+pub(crate) fn camera_heights(app: &AppState, heights: &[u32]) {
+    let choices = video::Quality::camera_choices(heights.first().copied());
+    let wanted = app.camera_quality();
+    // The pick, or the largest the camera has when the pick is more.
+    let index = choices
+        .iter()
+        .position(|q| *q == wanted)
+        .or_else(|| choices.iter().position(|q| q.height() < wanted.height()))
+        .unwrap_or(0);
+    let labels: Vec<slint::SharedString> = choices
+        .iter()
+        .map(|q| {
+            if *q == video::Quality::CAMERA_DEFAULT {
+                t!("camera-quality-default", "size" => q.label()).into()
+            } else {
+                q.label().into()
+            }
+        })
+        .collect();
+    let s = surface(app).state();
+    s.set_camera_qualities(ModelRc::new(VecModel::from(labels)));
+    s.set_camera_quality_index(i32::try_from(index).unwrap_or(0));
+    CAMERA_QUALITIES.with(|q| *q.borrow_mut() = choices);
+}
+
+/// Fill the camera picker: "First camera", then what the system has.
+fn refresh_cameras(app: &AppState) {
+    let names: Vec<String> = video::camera::list_cameras()
+        .map(|list| list.into_iter().map(|c| c.name).collect())
+        .unwrap_or_default();
+    let s = surface(app).state();
+    let mut options: Vec<slint::SharedString> = vec![t!("camera-first").into()];
+    options.extend(names.iter().map(|n| n.as_str().into()));
+    let index = app
+        .settings
+        .camera
+        .device
+        .as_ref()
+        .and_then(|d| names.iter().position(|n| n == d))
+        .map_or(0, |i| i + 1);
+    s.set_cameras(ModelRc::new(VecModel::from(options)));
+    s.set_camera_index(i32::try_from(index).unwrap_or(0));
+    s.set_camera_found(!names.is_empty());
+    CAMERA_NAMES.with(|n| *n.borrow_mut() = names);
+    probe_camera(app);
+}
+
+/// Whether the Camera tab's preview is on.
+pub(crate) fn camera_previewing(app: &AppState) -> bool {
+    surface(app).state().get_camera_previewing()
+}
+
+/// The preview off: the camera closes unless a call is sending it.
+fn stop_camera_preview(app: &mut AppState) {
+    if !camera_previewing(app) {
+        return;
+    }
+    if !app.session_camera_sending() {
+        app.stop_camera_preview_thread();
+    }
+    camera_preview_ended(app);
+}
+
+/// The preview's picture went (the camera closed or failed).
+pub(crate) fn camera_preview_ended(app: &AppState) {
+    let s = surface(app).state();
+    s.set_camera_previewing(false);
+    s.set_camera_has_preview(false);
+    s.set_camera_preview(slint::Image::default());
+}
+
+/// A self-view picture, for the preview while it is on.
+pub(crate) fn camera_preview(app: &AppState, pixels: &[u8], width: u32, height: u32) {
+    let s = surface(app).state();
+    if !s.get_camera_previewing() {
+        return;
+    }
+    let mut buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(width, height);
+    let bytes = buffer.make_mut_bytes();
+    if bytes.len() != pixels.len() {
+        return;
+    }
+    bytes.copy_from_slice(pixels);
+    s.set_camera_preview(slint::Image::from_rgba8(buffer));
+    s.set_camera_has_preview(true);
 }

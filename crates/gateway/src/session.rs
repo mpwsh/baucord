@@ -721,6 +721,66 @@ impl Session {
                     json!({ "client_id": client_json(client_id) }),
                 ));
             }
+            // 1.5: the channel timer and recordings. A bot is recorded
+            // like anyone in the room, and told so.
+            ServerMessage::ChannelClock {
+                channel_id,
+                running_ms,
+            } => {
+                self.push(Outbound::dispatch(
+                    "CHANNEL_CLOCK",
+                    json!({ "channel_id": channel_id, "running_ms": running_ms }),
+                ));
+            }
+            ServerMessage::RecordingStarted {
+                channel_id,
+                rec_id,
+                elapsed_ms,
+                by_name,
+                ..
+            } => {
+                self.push(Outbound::dispatch(
+                    "RECORDING_START",
+                    json!({
+                        "channel_id": channel_id,
+                        "rec_id": rec_id,
+                        "elapsed_ms": elapsed_ms,
+                        "by": by_name,
+                    }),
+                ));
+            }
+            ServerMessage::RecordingStopped {
+                channel_id,
+                rec_id,
+                duration_ms,
+                reason,
+                by_name,
+            } => {
+                self.push(Outbound::dispatch(
+                    "RECORDING_STOP",
+                    json!({
+                        "channel_id": channel_id,
+                        "rec_id": rec_id,
+                        "duration_ms": duration_ms,
+                        "reason": reason.describe(),
+                        "by": by_name,
+                    }),
+                ));
+            }
+            ServerMessage::RecordingReady { item } => {
+                self.push(Outbound::dispatch(
+                    "RECORDING_READY",
+                    json!({
+                        "rec_id": item.rec_id,
+                        "channel": item.channel,
+                        "started_at": item.started_at,
+                        "duration_ms": item.duration_ms,
+                        "file_name": item.file_name,
+                        "size": item.size,
+                        "blob_id": hex(&item.blob_id),
+                    }),
+                ));
+            }
             ServerMessage::VoiceReceiverReport {
                 received,
                 expected,

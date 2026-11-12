@@ -599,6 +599,8 @@ export component StreamViewerPanel inherits FocusScope {
 /// the window adds the OS title, the fullscreen state and the Windows
 /// reveal workaround.
 export component StreamViewerWindow inherits Window {
+    // Inter, as the main window (main.slint imports it).
+    default-font-family: "Inter";
     // The main window's icon (main.slint): without one the title bar
     // and Alt-Tab showed Windows' blank window.
     icon: @image-url("../../../assets/icons/tray.png");

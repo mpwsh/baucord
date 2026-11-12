@@ -92,6 +92,34 @@ impl AppState {
         }
     }
 
+    /// The hang-up button. In a call, with a lobby to go back to: leave
+    /// the call and wait there, connected and unseen (1.5). Anywhere
+    /// else — the lobby itself, a server without one — disconnect.
+    pub(super) fn hang_up(&mut self) {
+        match self.lobby_channel() {
+            Some(lobby) if self.our_channel().is_some_and(|c| c != lobby) => {
+                self.network
+                    .tx
+                    .send(NetworkControl::Send(ClientMessage::JoinChannel {
+                        channel_id: lobby,
+                        password: None,
+                    }))
+                    .ok();
+            }
+            _ => self.handle_disconnect(),
+        }
+    }
+
+    /// The lobby's channel id, on a server that has one.
+    fn lobby_channel(&self) -> Option<u16> {
+        let name = self.lobby_name.as_deref()?;
+        self.session
+            .channels
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.id)
+    }
+
     /// OK on the password prompt: save the password on the server
     /// entry, then retry the join. The prompt closes when the server
     /// echoes our move (or reopens on `WrongPassword`).
@@ -136,6 +164,8 @@ impl AppState {
         self.connected = false;
         // The session got as far as an engine of its own (`Init`).
         let session_engine = self.session.our_client_id.is_some();
+        // The leave chime is for leaving voice (1.5), not the lobby.
+        let was_in_voice = session_engine && !self.in_lobby();
         // No session, no keybinds: the key watcher stops (review P1-3).
         if let Some(hotkeys) = &mut self.hotkeys {
             hotkeys.set_connected(false);
@@ -147,6 +177,8 @@ impl AppState {
         // who was here, what we may do, the server's channels and
         // roles, our own mute and deafen. What follows only tells the
         // window, the voice engine and the screen thread.
+        // Cameras first: the screen thread keeps what it was told.
+        self.forget_cameras();
         self.session = Session::default();
         // The pictures of the session's people: the next one decodes
         // whoever it shows again, from the cache on disk.
@@ -181,7 +213,9 @@ impl AppState {
         // engine immediately would cut the sound off, so the Stop is
         // deferred. Its closure skips the Stop if a new session, a mic
         // test or the Audio tab's meter started in the meantime.
-        self.play_chime(SoundType::UserLeft);
+        if was_in_voice {
+            self.play_chime(SoundType::UserLeft);
+        }
         let weak = APP.with(|a| a.borrow().as_ref().map(Rc::downgrade));
         if let Some(weak) = weak {
             slint::Timer::single_shot(Duration::from_millis(900), move || {
@@ -230,6 +264,7 @@ impl AppState {
         s.set_resource_line(" ".into());
         s.set_users_count_label(t!("users-count", "count" => 0u32).into());
         self.users_model.set_vec(Vec::new());
+        self.stage_model.set_vec(Vec::new());
         self.sync_tray();
     }
 
@@ -638,15 +673,26 @@ impl AppState {
             self.voice_in_room = in_room;
             self.voice.tx.send(VoiceControl::SetInRoom(in_room)).ok();
         }
-        // Someone to hear it: a voice room with somebody else in it,
-        // and no test keeping it here. Otherwise the encoder gets
-        // nothing — it encoded 50 frames a second for nobody (review
-        // 2026-10, P2-37); the light and the meters go on.
-        let transmit = self.in_voice_room() && !self.is_testing_mic && self.room_has_company();
+        // Someone to hear it: a voice room with somebody else in it —
+        // or a recording, which hears whoever is in the room, the only
+        // one there included (1.5: alone, nothing was sent and the
+        // file came back silent) — and no test keeping it here.
+        // Otherwise the encoder gets nothing — it encoded 50 frames a
+        // second for nobody (review 2026-10, P2-37); the light and the
+        // meters go on.
+        let transmit = self.in_voice_room()
+            && !self.is_testing_mic
+            && (self.room_has_company() || self.room_is_recording());
         if transmit != self.voice_transmit {
             self.voice_transmit = transmit;
             self.voice.tx.send(VoiceControl::SetTransmit(transmit)).ok();
         }
+    }
+
+    /// Our room is being recorded.
+    fn room_is_recording(&self) -> bool {
+        self.our_channel()
+            .is_some_and(|room| self.session.live.recording.contains_key(&room))
     }
 
     /// Anyone else in our room.

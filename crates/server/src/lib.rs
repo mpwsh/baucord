@@ -6,5 +6,6 @@ pub mod config;
 pub mod link_stats;
 pub mod persistence;
 pub mod policy;
+pub mod recorder;
 pub mod relay;
 pub mod server;

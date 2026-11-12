@@ -71,6 +71,20 @@ pub const QUIET_REPORTS: u64 = 1 << 18;
 /// bit is sent the first rows only — every shipped client dropped a
 /// larger answer unread (review P0-1).
 pub const ADMIN_PAGES: u64 = 1 << 19;
+/// The channel timer (1.5): `ChannelClock`.
+pub const CHANNEL_CLOCK: u64 = 1 << 20;
+/// Voice channel recording (1.5, [`crate::recording`]): start, stop,
+/// the REC label, recordings delivered by Server.
+pub const RECORDING: u64 = 1 << 21;
+/// Streamed downloads of files of any size (1.5): `FetchBlobFrom`,
+/// `BlobPart`. A recording is larger than the 50 MiB a whole-blob
+/// fetch carries.
+pub const LARGE_BLOBS: u64 = 1 << 22;
+/// Cameras (1.5): the camera messages and the second video track.
+pub const CAMERA: u64 = 1 << 23;
+/// The newest line of each DM with the conversation list (1.5):
+/// `ConversationPreviews`, for the Messages inbox.
+pub const DM_PREVIEW: u64 = 1 << 24;
 
 /// What a 1.0 client can do.
 pub const CLIENT_1_0: u64 = TELEMETRY | IDENTITY;
@@ -94,7 +108,12 @@ pub const CLIENT_1_1: u64 = CLIENT_1_0
     | LOBBY
     | SAFETY
     | QUIET_REPORTS
-    | ADMIN_PAGES;
+    | ADMIN_PAGES
+    | CHANNEL_CLOCK
+    | RECORDING
+    | LARGE_BLOBS
+    | CAMERA
+    | DM_PREVIEW;
 /// What a 1.1 server offers: keys are the login, invites the door,
 /// roles decide what a session may do, and it keeps history.
 pub const SERVER_1_1: u64 = TELEMETRY
@@ -115,7 +134,12 @@ pub const SERVER_1_1: u64 = TELEMETRY
     | LOBBY
     | SAFETY
     | QUIET_REPORTS
-    | ADMIN_PAGES;
+    | ADMIN_PAGES
+    | CHANNEL_CLOCK
+    | RECORDING
+    | LARGE_BLOBS
+    | CAMERA
+    | DM_PREVIEW;
 
 /// Bits both sides announced.
 #[must_use]
@@ -164,6 +188,11 @@ mod tests {
             SAFETY,
             QUIET_REPORTS,
             ADMIN_PAGES,
+            CHANNEL_CLOCK,
+            RECORDING,
+            LARGE_BLOBS,
+            CAMERA,
+            DM_PREVIEW,
         ];
         for (i, a) in all.iter().enumerate() {
             assert_eq!(a.count_ones(), 1);

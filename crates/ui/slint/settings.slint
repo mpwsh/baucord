@@ -88,6 +88,8 @@ export global SettingsState {
     // Notifications (phones only: ANDROID-SPEC.md D52, IOS-SPEC.md D50)
     in property <bool> notifications-available: false;
     in-out property <bool> notify-messages: true;
+    /// Settings → General → Privacy: telemetry to servers (1.5).
+    in-out property <bool> send-telemetry: true;
     in-out property <bool> notify-first-join: true;
     // Chat
     in-out property <bool> show-timestamps: true;
@@ -151,6 +153,20 @@ export global SettingsState {
     /// this platform has it.
     in-out property <bool> stream-gpu-priority: true;
     in property <bool> stream-gpu-priority-available: false;
+    // ── Camera (1.5): the picker ("First camera", then the system's),
+    // a preview while the tab shows, the self-view's mirror, and the
+    // small size only. The tab is the desktops' for now.
+    in property <bool> camera-supported: false;
+    in property <[string]> cameras;
+    in-out property <int> camera-index: 0;
+    in property <bool> camera-found: true;
+    in property <bool> camera-previewing: false;
+    in property <bool> camera-has-preview: false;
+    in property <image> camera-preview;
+    in-out property <bool> camera-mirror: true;
+    /// The sizes this camera can send ("720p (default)", …) and the pick.
+    in property <[string]> camera-qualities;
+    in-out property <int> camera-quality-index: 0;
 
     // ── Keyboard ──
     in property <[KeybindRow]> keybinds;
@@ -216,6 +232,7 @@ export global SettingsLogic {
     callback viewer-joined-sound-changed(bool);
     callback mute-toggle-sound-changed(bool);
     callback notify-messages-changed(bool);
+    callback send-telemetry-changed(bool);
     callback notify-first-join-changed(bool);
     callback show-timestamps-changed(bool);
     callback compact-rows-changed(bool);
@@ -251,6 +268,10 @@ export global SettingsLogic {
     callback stream-visibility-selected(int);
     callback stream-pointer-changed(bool);
     callback stream-gpu-priority-changed(bool);
+    callback camera-selected(int);
+    callback camera-preview-toggle();
+    callback camera-mirror-changed(bool);
+    callback camera-quality-selected(int);
 
     // Keyboard
     callback record-keybind(int);
@@ -779,6 +800,12 @@ component GeneralPanel inherits VerticalLayout {
         font-size: Theme.font-sm;
         wrap: word-wrap;
     }
+    CheckRow {
+        text: Tr.telemetry-send;
+        hint: Tr.telemetry-send-hint;
+        checked <=> SettingsState.send-telemetry;
+        toggled(on) => { SettingsLogic.send-telemetry-changed(on); }
+    }
     Rectangle { }
 }
 
@@ -1098,6 +1125,78 @@ component StreamPanel inherits VerticalLayout {
             checked <=> SettingsState.stream-gpu-priority;
             toggled(on) => { SettingsLogic.stream-gpu-priority-changed(on); }
         }
+    }
+}
+
+component CameraPanel inherits VerticalLayout {
+    spacing: Theme.gap-lg;
+    alignment: start;
+    PanelHeader { title: Tr.tab-camera; lead: Tr.camera-lead; }
+    HorizontalLayout {
+        spacing: Theme.gap-md;
+        Setting {
+            label: Tr.camera-device;
+            hint: SettingsState.camera-found ? "" : Tr.camera-none;
+            horizontal-stretch: 2;
+            Dropdown {
+                options: SettingsState.cameras;
+                current <=> SettingsState.camera-index;
+                selected(i) => { SettingsLogic.camera-selected(i); }
+            }
+        }
+        Setting {
+            label: Tr.camera-quality;
+            horizontal-stretch: 1;
+            Dropdown {
+                options: SettingsState.camera-qualities;
+                current <=> SettingsState.camera-quality-index;
+                selected(i) => { SettingsLogic.camera-quality-selected(i); }
+            }
+        }
+    }
+    Hint { text: Tr.camera-quality-hint; }
+    // The preview: what the others would see (mirrored as your own
+    // tile shows it, when the mirror is on).
+    HorizontalLayout {
+        alignment: start;
+        Rectangle {
+            width: 320px;
+            height: 180px;
+            border-radius: Theme.radius-md;
+            background: #000000;
+            clip: true;
+            if SettingsState.camera-has-preview : Image {
+                width: parent.width;
+                height: parent.height;
+                source: SettingsState.camera-preview;
+                image-fit: contain;
+            }
+            if !SettingsState.camera-has-preview : Text {
+                width: parent.width - 24px;
+                x: 12px;
+                height: parent.height;
+                text: SettingsState.camera-previewing ? Tr.camera-starting : Tr.camera-preview-hint;
+                color: Theme.text-muted;
+                font-size: Theme.font-sm;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                wrap: word-wrap;
+            }
+        }
+    }
+    HorizontalLayout {
+        alignment: start;
+        Btn {
+            text: SettingsState.camera-previewing ? Tr.camera-preview-stop : Tr.camera-preview-start;
+            clicked => { SettingsLogic.camera-preview-toggle(); }
+        }
+    }
+    Sep { }
+    CheckRow {
+        text: Tr.camera-mirror;
+        hint: Tr.camera-mirror-hint;
+        checked <=> SettingsState.camera-mirror;
+        toggled(on) => { SettingsLogic.camera-mirror-changed(on); }
     }
 }
 
@@ -1611,6 +1710,7 @@ component SettingsNav inherits VerticalLayout {
     NavItem { text: Tr.tab-profile;   icon: IconSet.UserRound;         tall: root.narrow; active: !root.narrow && root.tab == 0; clicked => { root.picked(0); } }
     NavItem { text: Tr.tab-general;   icon: IconSet.SlidersHorizontal; tall: root.narrow; active: !root.narrow && root.tab == 1; clicked => { root.picked(1); } }
     NavItem { text: Tr.tab-audio;     icon: IconSet.Volume2;           tall: root.narrow; active: !root.narrow && root.tab == 2; clicked => { root.picked(2); } }
+    if SettingsState.camera-supported : NavItem { text: Tr.tab-camera; icon: IconSet.Video; tall: root.narrow; active: !root.narrow && root.tab == 11; clicked => { root.picked(11); } }
     NavItem { text: Tr.sounds-header; icon: IconSet.Bell;              tall: root.narrow; active: !root.narrow && root.tab == 3; clicked => { root.picked(3); } }
     // Shortcuts need a keyboard the OS lets us watch: not on a phone.
     if !State.touch-host : NavItem { text: Tr.tab-keyboard;  icon: IconSet.Keyboard; tall: root.narrow; active: !root.narrow && root.tab == 4; clicked => { root.picked(4); } }
@@ -1691,6 +1791,7 @@ component SettingsContent inherits ScrollView {
                 if root.tab == 7 : AboutPanel { }
                 if root.tab == 8 : DebugPanel { }
                 if root.tab == 10 : StreamPanel { }
+                if root.tab == 11 : CameraPanel { }
             }
             Rectangle { horizontal-stretch: 1; }
         }

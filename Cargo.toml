@@ -33,7 +33,7 @@ resolver = "2"
 # nowhere else. It was eight manifests kept equal by hand (review P2-61).
 # Keep `version = "…"` at the start of its line: those readers match it.
 [workspace.package]
-version = "1.4.0"
+version = "1.5.0"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -133,3 +133,7 @@ opt-level = 3
 # upstream exposes the client.
 [patch.crates-io]
 wasapi = { path = "third_party/wasapi" }
+# nokhwa's macOS camera bindings with one fix in `set_all` (1.5; the
+# camera thread panicked opening a C920 at 720p): see
+# third_party/nokhwa-bindings-macos/BAUCORD-PATCH.md.
+nokhwa-bindings-macos = { path = "third_party/nokhwa-bindings-macos" }

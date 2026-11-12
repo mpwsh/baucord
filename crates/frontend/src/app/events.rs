@@ -85,6 +85,13 @@ impl AppState {
         }
         more |= !st.voice.event_rx.is_empty();
 
+        // Our camera (1.5): its few events, and the self-view's newest
+        // picture.
+        while let Ok(evt) = st.camera.event_rx.try_recv() {
+            st.handle_camera_event(evt);
+        }
+        st.take_camera_preview();
+
         // Non-frame screen events, forwarded by the present-prep
         // thread (which owns screen.event_rx now — see present.rs).
         for _ in 0..64 {
@@ -142,6 +149,11 @@ impl AppState {
     /// under a millisecond, which is what lets the UI keep up with
     /// 60 fps streams.
     pub(super) fn present_frame(&mut self, f: crate::present::PreparedFrame) {
+        // A camera's picture goes to its tile in Channel view.
+        if f.meta.client_id & client::protocol::recording::CAMERA_TRACK_BIT != 0 {
+            self.camera_frame(f);
+            return;
+        }
         let Some(viewer) = self.viewers.get_mut(&f.meta.client_id) else {
             return;
         };
@@ -198,8 +210,14 @@ impl AppState {
     #[allow(clippy::too_many_lines)]
     pub(super) fn handle_network_message(&mut self, msg: NetworkMessage) {
         match msg {
-            NetworkMessage::Connected { lobby, safety } => {
+            NetworkMessage::Connected {
+                lobby,
+                safety,
+                cameras,
+            } => {
                 self.connected = true;
+                self.session.stage.server_cameras = cameras;
+                self.sync_camera_button();
                 // Keybinds act only in a session: watched from here to
                 // `teardown_connection` (review P1-3).
                 if let Some(hotkeys) = &mut self.hotkeys {
@@ -434,18 +452,8 @@ impl AppState {
                 // Custom names on the cards, and in the roster's menu.
                 self.update_user_list();
             }
-            NetworkMessage::AuditLine { entry } => {
-                self.ensure_admin_channel();
-                let line = audit_line_text(&entry);
-                let open = self.session.chat.active_dm == Some(ADMIN_CHANNEL_KEY);
-                self.with_conversation(Some(ADMIN_CHANNEL_KEY), |app| {
-                    app.push_system_here(&line);
-                });
-                if !open && let Some(meta) = self.session.chat.dm_meta.get_mut(&ADMIN_CHANNEL_KEY) {
-                    meta.unread += 1;
-                    self.rebuild_dms_model();
-                }
-            }
+            // The log lives in the admin panel's Audit tab (1.5).
+            NetworkMessage::AuditLine { entry } => crate::adminui::audit_line(self, &entry),
             NetworkMessage::FileMessage {
                 conv,
                 from,
@@ -905,7 +913,14 @@ impl AppState {
             NetworkMessage::UserMovedChannel {
                 client_id,
                 channel_id,
-            } => self.handle_user_moved(client_id, channel_id),
+            } => {
+                let was = self.our_channel();
+                self.handle_user_moved(client_id, channel_id);
+                if Some(client_id) == self.session.our_client_id && was != Some(channel_id) {
+                    self.arrived_in(channel_id);
+                    self.cameras_after_our_move();
+                }
+            }
             NetworkMessage::ChannelJoinDenied { channel_id, reason } => {
                 self.handle_channel_join_denied(channel_id, reason);
             }
@@ -920,6 +935,10 @@ impl AppState {
                 if matches!(self.menu_target, Some(MenuTarget::Channel(_))) {
                     self.close_menu();
                 }
+                // Ids renumbered: the server sends the timers and the
+                // recordings again, by their new ids (1.5).
+                self.session.live.clocks.clear();
+                self.session.live.recording.clear();
                 self.handle_channels_updated(&channels, &memberships);
             }
             NetworkMessage::UserLeft {
@@ -1160,6 +1179,46 @@ impl AppState {
                 }
             }
             NetworkMessage::Authors { authors } => self.take_authors(authors),
+            // ── 1.5: timers, recordings, large files, cameras ────────
+            NetworkMessage::ChannelClock {
+                channel_id,
+                running_ms,
+            } => self.take_channel_clock(channel_id, running_ms),
+            NetworkMessage::RecordingStarted {
+                channel_id,
+                elapsed_ms,
+                by_name,
+                ..
+            } => self.take_recording_started(channel_id, elapsed_ms, &by_name),
+            NetworkMessage::RecordingStopped {
+                channel_id,
+                duration_ms,
+                reason,
+                by_name,
+                ..
+            } => self.take_recording_stopped(channel_id, duration_ms, reason, by_name),
+            NetworkMessage::RecordingDenied { reason, .. } => self.take_recording_denied(reason),
+            NetworkMessage::RecordingReady { item } => self.take_recording_ready(&item),
+            NetworkMessage::Recordings { items, more } => self.take_recordings(&items, more),
+            NetworkMessage::DownloadProgress { blob_id, pct } => {
+                self.download_progress(blob_id, pct);
+            }
+            NetworkMessage::DownloadDone { blob_id, path } => self.download_done(blob_id, path),
+            NetworkMessage::DownloadFailed { blob_id } => self.download_failed(blob_id),
+            NetworkMessage::CameraStarted {
+                client_id,
+                width,
+                height,
+            } => self.take_camera_started(client_id, width, height),
+            NetworkMessage::CameraStopped { client_id } => self.take_camera_stopped(client_id),
+            NetworkMessage::CameraDenied { target_id, reason } => {
+                self.take_camera_denied(target_id, reason);
+            }
+            NetworkMessage::CameraKeyframeRequested => self.camera_keyframe_requested(),
+            NetworkMessage::CameraHealth {
+                worst_loss,
+                viewers,
+            } => self.camera_health(worst_loss, viewers),
             NetworkMessage::ProfileDenied { reason } => {
                 self.show_toast(ToastKind::Warning, &t!(profile_denied_key(reason)));
             }
@@ -1390,6 +1449,7 @@ impl AppState {
                             last_ts: 0,
                             last_msg_id: 0,
                             fetched: false,
+                            ..Default::default()
                         });
                     meta.name = dm.name;
                     meta.unread = if blocked { 0 } else { dm.unread };
@@ -1399,13 +1459,14 @@ impl AppState {
                         self.session.chat.dm_order.push(dm.user_id);
                     }
                 }
-                // The admin channel is ours, not the store's: it keeps
-                // its place at the top.
-                if self.session.chat.dm_meta.contains_key(&ADMIN_CHANNEL_KEY) {
-                    self.session.chat.dm_order.insert(0, ADMIN_CHANNEL_KEY);
+                // The Server conversation is ours, not the store's: it
+                // keeps its place at the top.
+                if self.session.chat.dm_meta.contains_key(&SERVER_CONV_KEY) {
+                    self.session.chat.dm_order.insert(0, SERVER_CONV_KEY);
                 }
                 self.rebuild_dms_model();
             }
+            NetworkMessage::ConversationPreviews { previews } => self.take_dm_previews(previews),
             // ── 1.2: blocks, reports, deleting the account ──────────
             NetworkMessage::Blocks { users } => self.take_blocks(users),
             NetworkMessage::ReportAck { result } => self.take_report_ack(result),

@@ -28,6 +28,8 @@ import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
 import { State, Logic, UserRow } from "globals.slint";
 import { IconBtn, Btn, AvatarTile, RoleGlyph, Tip, LongPress } from "widgets.slint";
+import { RecChip } from "views.slint";
+import { MicBtn, DeafenBtn, ShareBtn, CameraBtn, HangUpBtn } from "controls.slint";
 
 component UserRowView inherits Rectangle {
     in property <UserRow> user;
@@ -120,6 +122,18 @@ component UserRowView inherits Rectangle {
             overflow: elide;
             horizontal-stretch: 1;
         }
+        // 1.5: REC (the stop, for whoever may); a recording starts from
+        // the channel's menu or `/record`. The timer sits with the count
+        // below.
+        if user.recording : Rectangle {
+            width: rec.width;
+            rec := RecChip {
+                y: (parent.height - self.height) / 2;
+                can-stop: user.can-stop-recording;
+                tip: user.rec-tip;
+                channel-id: user.channel-id;
+            }
+        }
         if user.temporary : Rectangle {
             width: 12px;
             IconDisplay {
@@ -143,6 +157,12 @@ component UserRowView inherits Rectangle {
                 size: 12px;
                 stroke: Theme.text-muted;
             }
+        }
+        if user.timer-label != "" : Text {
+            text: user.timer-label;
+            color: Theme.text-muted;
+            font-size: Theme.font-xs;
+            vertical-alignment: center;
         }
         Text {
             text: user.member-label;
@@ -397,13 +417,12 @@ component LatencyLine inherits HorizontalLayout {
 }
 
 export component Sidebar inherits Rectangle {
-    /// The Messages height the divider is being dragged to (-1 = no drag).
-    property <length> divider-preview: -1px;
+    /// A narrow window (the rail and one column).
+    in property <bool> narrow: false;
     /// Too short for the full stack — a phone on its side (~370 px
     /// tall), a small desktop window. Everything stays on screen by
-    /// giving up room, not controls: tighter gaps, Messages capped to a
-    /// share of the height, the status on one line, Disconnect as a
-    /// button in the control bar (ANDROID-SPEC.md D42, IOS-SPEC.md
+    /// giving up room, not controls: tighter gaps, the status on one
+    /// line, Disconnect as a button in the control bar (ANDROID-SPEC.md D42, IOS-SPEC.md
     /// D35). The full stack needs about 600 px.
     property <bool> compact: root.height < 600px;
     background: Theme.bg-secondary;
@@ -413,12 +432,10 @@ export component Sidebar inherits Rectangle {
     // language) they become icons. Measured off-layout, per language.
     invite-words := Text { visible: false; text: Tr.invite-button; font-size: Theme.font-sm; font-weight: 500; }
     channel-words := Text { visible: false; text: Tr.channel-new; font-size: Theme.font-sm; font-weight: 500; }
-    admin-words := Text { visible: false; text: Tr.admin-button; font-size: Theme.font-sm; font-weight: 500; }
     property <length> chip-frame: 2 * Theme.gap-sm + 14px + Theme.gap-xs + Theme.gap-sm;
     property <length> chips-with-words:
         (State.perm-create-invites ? invite-words.preferred-width + root.chip-frame : 0px)
-        + (State.perm-create-channels ? channel-words.preferred-width + root.chip-frame : 0px)
-        + (State.perm-panel ? admin-words.preferred-width + root.chip-frame : 0px);
+        + (State.perm-create-channels ? channel-words.preferred-width + root.chip-frame : 0px);
     property <bool> chip-words:
         root.width - 2 * (root.compact ? Theme.gap-sm : Theme.gap-md) - root.chips-with-words >= 96px;
 
@@ -428,9 +445,9 @@ export component Sidebar inherits Rectangle {
 
         // ── The server, and what this session may add to it ───────
         // One row: its name (the title — the greeting in chat no longer
-        // repeats it), then Invite users, New channel and Admin, each
-        // only for whoever the server lets (spec §3.1, §5, §8). They
-        // used to take a row of their own under the name.
+        // repeats it), then Invite users and New channel, each only for
+        // whoever the server lets (spec §3.1, §5). Admin and Settings
+        // are on the rail (1.5).
         HorizontalLayout {
             spacing: Theme.gap-sm;
             Text {
@@ -456,15 +473,8 @@ export component Sidebar inherits Rectangle {
                 show-text: root.chip-words;
                 clicked => { Logic.channel-create(); }
             }
-            // Admin: the panel (spec §8), for whoever holds `panel`.
-            if State.perm-panel : ChipButton {
-                icon: IconSet.Shield;
-                text: Tr.admin-button;
-                tint: Theme.admin;
-                show-text: root.chip-words;
-                clicked => { Logic.admin-open(); }
-            }
         }
+
 
         // The lobby (spec §12, 1.1.5): connected, invisible, silent,
         // until a channel is picked. The row itself is hidden; this
@@ -519,280 +529,6 @@ export component Sidebar inherits Rectangle {
             }
         }
 
-        // ── Messages (spec §6): the lower half of the sidebar ──────
-        // General first, then one row per DM partner, newest first,
-        // with an unread badge; the open conversation is highlighted.
-        // Only when the session may DM at all, or has conversations
-        // to read. The header folds the list away (a setting) so the
-        // voice channels get the room; while folded, the unread total
-        // moves up onto the header.
-        // The divider, and the grip on it: drag to give Messages more
-        // or less of the sidebar (the section's own height; the voice
-        // list takes the rest).
-        if State.perm-dm || State.dms.length > 0 : Rectangle {
-            height: 1px;
-            background: Theme.border;
-            divider-grip := TouchArea {
-                y: -4px;
-                height: 9px;
-                // Compact caps the height (below): no dragging there.
-                enabled: !State.messages-collapsed && !root.compact;
-                mouse-cursor: MouseCursor.row-resize;
-                // Dragging the divider up grows Messages. Only a line
-                // moves during the drag; the height lands on release
-                // (re-laying out both lists per move flickered).
-                pure function target() -> length {
-                    return Math.clamp(State.messages-height - (self.mouse-y - self.pressed-y),
-                        100px, 480px);
-                }
-                pointer-event(ev) => {
-                    if (ev.kind == PointerEventKind.down) {
-                        root.divider-preview = State.messages-height;
-                    } else if (ev.kind == PointerEventKind.up && root.divider-preview >= 0px) {
-                        State.messages-height = self.target();
-                        root.divider-preview = -1px;
-                        Logic.messages-resized(State.messages-height);
-                    } else if (ev.kind == PointerEventKind.cancel) {
-                        root.divider-preview = -1px;
-                    }
-                }
-                moved => { if (self.pressed) { root.divider-preview = self.target(); } }
-            }
-            // Where the divider will land: offset by how much the
-            // height changes (up for taller).
-            if root.divider-preview >= 0px : Rectangle {
-                y: -(root.divider-preview - State.messages-height) - 1px;
-                width: 100%;
-                height: 2px;
-                background: Theme.accent-text;
-            }
-        }
-        if State.perm-dm || State.dms.length > 0 : fold := Rectangle {
-            property <int> hidden-unread: State.dm-unread-total
-                + (State.active-dm >= 0 ? State.general-unread : 0);
-            height: 28px;
-            border-radius: Theme.radius-sm;
-            background: fold-t.has-hover ? Theme.hover : transparent;
-            animate background { duration: 150ms; }
-            fold-t := TouchArea {
-                mouse-cursor: pointer;
-                clicked => { Logic.messages-toggle(); }
-            }
-            HorizontalLayout {
-                padding-left: Theme.gap-xs;
-                padding-right: 2px;
-                spacing: Theme.gap-sm;
-                Text {
-                    text: Tr.messages-header;
-                    color: Theme.text-secondary;
-                    font-size: Theme.font-body;
-                    font-weight: 600;
-                    vertical-alignment: center;
-                    horizontal-stretch: 1;
-                }
-                if State.messages-collapsed && fold.hidden-unread > 0 : Rectangle {
-                    width: fold-badge.preferred-width + 12px;
-                    height: 18px;
-                    y: (parent.height - self.height) / 2;
-                    border-radius: 9px;
-                    background: Theme.accent;
-                    fold-badge := Text {
-                        text: fold.hidden-unread;
-                        color: Theme.on-accent;
-                        font-size: Theme.font-xs;
-                        font-weight: 700;
-                        vertical-alignment: center;
-                        horizontal-alignment: center;
-                    }
-                }
-                Rectangle {
-                    width: 24px;
-                    IconBtn {
-                        y: (parent.height - self.height) / 2;
-                        size: 24px;
-                        icon-size: 16px;
-                        icon: State.messages-collapsed ? IconSet.ChevronUp : IconSet.ChevronDown;
-                        tooltip: State.messages-collapsed ? Tr.messages-expand : Tr.messages-collapse;
-                        clicked => { Logic.messages-toggle(); }
-                    }
-                }
-            }
-        }
-        if (State.perm-dm || State.dms.length > 0) && !State.messages-collapsed : dm-list := ScrollView {
-            // A short list: the roster keeps the room. Compact: at
-            // most 30 % of the sidebar (about three rows on a phone on
-            // its side) and no taller than its rows (General and each
-            // DM: 32 px + 2 px apart), so the voice list and the
-            // controls keep theirs.
-            height: root.compact
-                ? Math.min(State.messages-height, Math.max(64px, root.height * 0.3),
-                    (State.dms.length + 1) * 34px)
-                : State.messages-height;
-            vertical-stretch: 0;
-            mouse-drag-pan-enabled: State.touch-host;   // D27
-            VerticalLayout {
-            spacing: 2px;
-            // General
-            Rectangle {
-                height: 32px;
-                border-radius: Theme.radius-md;
-                background: State.active-dm < 0 ? Theme.row-volume-tint
-                    : general-t.has-hover ? Theme.hover : transparent;
-                animate background { duration: 150ms; }
-                HorizontalLayout {
-                    padding-left: Theme.gap-sm;
-                    padding-right: 16px;
-                    spacing: Theme.gap-sm;
-                    Rectangle {
-                        width: 16px;
-                        IconDisplay {
-                            icon: IconSet.Hash;
-                            size: 16px;
-                            stroke: State.active-dm < 0 ? Theme.accent-text : Theme.text-muted;
-                        }
-                    }
-                    Text {
-                        text: Tr.dm-general;
-                        color: State.active-dm < 0 ? Theme.accent-text
-                            : State.general-unread > 0 ? Theme.text-primary
-                            : Theme.text-secondary;
-                        font-size: Theme.font-body;
-                        font-weight: 600;
-                        vertical-alignment: center;
-                        horizontal-stretch: 1;
-                    }
-                    if State.general-unread > 0 && State.active-dm >= 0 : Rectangle {
-                        width: general-badge.preferred-width + 12px;
-                        height: 18px;
-                        y: (parent.height - self.height) / 2;
-                        border-radius: 9px;
-                        background: Theme.accent;
-                        general-badge := Text {
-                            text: State.general-unread;
-                            color: Theme.on-accent;
-                            font-size: Theme.font-xs;
-                            font-weight: 700;
-                            vertical-alignment: center;
-                            horizontal-alignment: center;
-                        }
-                    }
-                }
-                general-t := TouchArea {
-                    mouse-cursor: pointer;
-                    clicked => {
-                        Logic.general-clicked();
-                        // The narrow layout turns the page to the chat.
-                        State.narrow-chat-open = true;
-                    }
-                }
-            }
-            for dm[i] in State.dms : dm-row := Rectangle {
-                height: 32px;
-                border-radius: Theme.radius-md;
-                background: dm.active ? Theme.row-volume-tint
-                    : dm-t.has-hover ? Theme.hover : transparent;
-                animate background { duration: 150ms; }
-                // The rightmost 28 px of the row are the ✕: one
-                // TouchArea decides by position, so the hover that
-                // reveals the button never ends under it and the
-                // click reaches the right handler (a button on top
-                // of the row's area got neither).
-                property <bool> on-close: dm-t.has-hover && dm-t.mouse-x > dm-t.width - 28px - 16px;
-                dm-t := TouchArea {
-                    mouse-cursor: pointer;
-                    clicked => {
-                        if (self.mouse-x > self.width - 28px - 16px) {
-                            Logic.dm-closed(i);
-                        } else {
-                            Logic.dm-clicked(i);
-                            State.narrow-chat-open = true;
-                        }
-                    }
-                }
-                HorizontalLayout {
-                    padding-left: Theme.gap-sm;
-                    // Clear of the ScrollView's scrollbar (14 px at
-                    // the right edge, over the content).
-                    padding-right: 16px;
-                    spacing: Theme.gap-sm;
-                    // The picture at the `#`'s size; the ring means
-                    // "online".
-                    Rectangle {
-                        width: 16px;
-                        if !dm.admin : AvatarTile {
-                            y: (parent.height - self.height) / 2;
-                            source: dm.avatar;
-                            has-image: dm.has-avatar;
-                            initial: dm.initial;
-                            tint: dm.tile-tint;
-                            side: 16px;
-                            corner: 4px;
-                            // No ring here: rings are for speaking in
-                            // voice rows, not for a conversation.
-                            ring: false;
-                            ring-room: false;
-                        }
-                        // Admin logs: a channel like General, so a `#`.
-                        if dm.admin : IconDisplay {
-                            icon: IconSet.Hash;
-                            size: 16px;
-                            stroke: dm.active ? Theme.accent-text : Theme.text-muted;
-                        }
-                    }
-                    Text {
-                        text: dm.name;
-                        color: dm.active ? Theme.accent-text
-                            : dm.unread > 0 ? Theme.text-primary
-                            : Theme.text-secondary;
-                        font-size: Theme.font-body;
-                        font-weight: dm.unread > 0 || dm.active ? 600 : 400;
-                        vertical-alignment: center;
-                        overflow: elide;
-                        horizontal-stretch: 1;
-                    }
-                    if dm.unread > 0 : Rectangle {
-                        width: badge.preferred-width + 12px;
-                        height: 18px;
-                        y: (parent.height - self.height) / 2;
-                        border-radius: 9px;
-                        background: Theme.accent;
-                        badge := Text {
-                            text: dm.unread;
-                            color: Theme.on-accent;
-                            font-size: Theme.font-xs;
-                            font-weight: 700;
-                            vertical-alignment: center;
-                            horizontal-alignment: center;
-                        }
-                    }
-                    // Close: hides the conversation from the list; the
-                    // messages stay on the server and it comes back on
-                    // the next message. General cannot be closed. Pure
-                    // affordance: the row's TouchArea handles the click.
-                    // A touch screen has no hover to reveal it, and the
-                    // zone answers taps either way, so there it always
-                    // shows.
-                    if dm-t.has-hover || State.touch-host : Rectangle {
-                        width: 20px;
-                        Rectangle {
-                            y: (parent.height - self.height) / 2;
-                            width: 20px;
-                            height: 20px;
-                            border-radius: Theme.radius-sm;
-                            background: dm-row.on-close ? Theme.subtle : transparent;
-                            animate background { duration: 100ms; }
-                            IconDisplay {
-                                icon: IconSet.X;
-                                size: 12px;
-                                stroke: Theme.text-secondary;
-                            }
-                        }
-                    }
-                }
-            }
-            }
-        }
-
         // Stream stats — visible while sharing, amber when the sender
         // is shedding fps for lossy viewers.
         if State.stream-stats != "" : Rectangle {
@@ -828,7 +564,7 @@ export component Sidebar inherits Rectangle {
             }
         }
 
-        // ── Control bar: mic / headphones / screen ─────────────────
+        // ── Control bar: mic / headphones / screen / camera ────────
         Rectangle {
             height: root.compact ? 44px : 52px;
             border-radius: Theme.radius-md;
@@ -837,58 +573,24 @@ export component Sidebar inherits Rectangle {
                 padding: root.compact ? 2px : 6px;
                 spacing: Theme.gap-xs;
                 alignment: space-around;
-                // In push-to-talk mode the mic lights up while the key
-                // is held; a click still toggles the hard mute.
-                IconBtn {
-                    icon: State.muted ? IconSet.MicOff : IconSet.Mic;
-                    active: State.muted || (State.ptt-mode && State.ptt-held);
-                    active-danger: State.muted;
-                    // In the lobby the mic goes nowhere: greyed, and
-                    // the tooltip says why (the toggle still sets the
-                    // preference for the room to come).
-                    idle-color: State.in-lobby ? Theme.text-muted : Theme.text-secondary;
-                    tooltip: State.in-lobby ? Tr.lobby-mic-hint
-                        : State.muted ? Tr.unmute
-                        : State.ptt-mode ? State.ptt-tooltip : Tr.mute;
-                    clicked => { Logic.toggle-mute(); }
-                }
-                IconBtn {
-                    icon: State.deafened ? IconSet.HeadphoneOff : IconSet.Headphones;
-                    active: State.deafened;
-                    active-danger: true;
-                    tooltip: State.deafened ? Tr.undeafen : Tr.deafen;
-                    clicked => { Logic.toggle-deafen(); }
-                }
+                MicBtn { }
+                DeafenBtn { }
                 // A phone cannot share its screen (ANDROID-SPEC.md §9.4):
                 // no button that could only fail.
-                if !State.touch-host : IconBtn {
-                    icon: State.sharing ? IconSet.MonitorOff : IconSet.Monitor;
-                    active: State.sharing;
-                    active-danger: true;
-                    tooltip: State.sharing ? Tr.stop-sharing : Tr.share-screen;
-                    clicked => { Logic.toggle-share(); }
-                }
-                IconBtn {
-                    icon: IconSet.Settings;
-                    tooltip: Tr.settings;
-                    clicked => { Logic.open-settings(); }
-                }
-                // Compact: Disconnect joins the bar — a red hang-up,
-                // not filled, so it does not read as a toggle that is
-                // on (muted and deafened are filled red).
-                if root.compact : IconBtn {
-                    icon: IconSet.PhoneOff;
-                    idle-color: Theme.danger;
-                    tooltip: Tr.disconnect;
-                    clicked => { Logic.disconnect(); }
-                }
+                if !State.touch-host : ShareBtn { }
+                if State.camera-available : CameraBtn { }
+                // Compact: Disconnect joins the bar.
+                if root.compact : HangUpBtn { }
             }
         }
 
+        // In a call: Leave call, red, back to the lobby. In the lobby:
+        // Disconnect, blue, back to the connect page.
         if !root.compact : Btn {
-            text: Tr.disconnect;
-            accent: true;
-            clicked => { Logic.disconnect(); }
+            text: State.in-call ? Tr.leave-call : Tr.disconnect;
+            accent: !State.in-call;
+            danger: State.in-call;
+            clicked => { Logic.hang-up(); }
         }
     }
 

@@ -18,6 +18,7 @@
 
 pub mod buffer;
 pub mod capture;
+pub mod camera;
 #[cfg(target_os = "windows")]
 pub mod dxgi;
 
@@ -76,6 +77,14 @@ pub enum Quality {
     /// IDR is slightly softer until P-frames sharpen it. Prefer FHD
     /// unless viewers genuinely need to read fine detail at 1:1.
     QHD30,
+    /// Camera sizes (1.5), [`Quality::CAMERA`]: not share presets, not
+    /// in [`Quality::ALL`]. Settings → Camera offers 1080p, 720p (the
+    /// default) and 480p, and 240p for a camera that has no more; the
+    /// sender steps down under its viewers' loss, never below 480p.
+    Cam1080,
+    Cam720,
+    Cam480,
+    Cam240,
 }
 impl std::fmt::Display for Quality {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -93,6 +102,10 @@ impl Quality {
             Self::FHD30 => "1080p 30fps",
             Self::FHD60 => "1080p 60fps",
             Self::QHD30 => "1440p 30fps",
+            Self::Cam1080 => "1080p",
+            Self::Cam720 => "720p",
+            Self::Cam480 => "480p",
+            Self::Cam240 => "240p",
         }
     }
 
@@ -101,9 +114,11 @@ impl Quality {
     #[must_use]
     pub const fn width(self) -> u32 {
         match self {
-            Self::HD30 | Self::HD60 => 1280,
-            Self::FHD30 | Self::FHD60 => 1920,
+            Self::HD30 | Self::HD60 | Self::Cam720 => 1280,
+            Self::FHD30 | Self::FHD60 | Self::Cam1080 => 1920,
             Self::QHD30 => 2560,
+            Self::Cam480 => 854,
+            Self::Cam240 => 426,
         }
     }
 
@@ -112,16 +127,24 @@ impl Quality {
     #[must_use]
     pub const fn height(self) -> u32 {
         match self {
-            Self::HD30 | Self::HD60 => 720,
-            Self::FHD30 | Self::FHD60 => 1080,
+            Self::HD30 | Self::HD60 | Self::Cam720 => 720,
+            Self::FHD30 | Self::FHD60 | Self::Cam1080 => 1080,
             Self::QHD30 => 1440,
+            Self::Cam480 => 480,
+            Self::Cam240 => 240,
         }
     }
 
     #[must_use]
     pub const fn fps(self) -> u32 {
         match self {
-            Self::HD30 | Self::FHD30 | Self::QHD30 => 30,
+            Self::HD30
+            | Self::FHD30
+            | Self::QHD30
+            | Self::Cam1080
+            | Self::Cam720
+            | Self::Cam480
+            | Self::Cam240 => 30,
             Self::HD60 | Self::FHD60 => 60,
         }
     }
@@ -148,6 +171,12 @@ impl Quality {
             Self::FHD30 => 7_500_000,
             // 1440p at 30 has about the pixel rate of 1080p at 60.
             Self::FHD60 | Self::QHD30 => 10_000_000,
+            // Camera content: soft edges, little to keep sharp — about
+            // half what a screen needs at the same size.
+            Self::Cam1080 => 3_000_000,
+            Self::Cam720 => 1_700_000,
+            Self::Cam480 => 850_000,
+            Self::Cam240 => 350_000,
         }
     }
 
@@ -191,6 +220,10 @@ impl Quality {
             Self::FHD30 => "fhd30",
             Self::FHD60 => "fhd60",
             Self::QHD30 => "qhd30",
+            Self::Cam1080 => "cam1080",
+            Self::Cam720 => "cam720",
+            Self::Cam480 => "cam480",
+            Self::Cam240 => "cam240",
         }
     }
 
@@ -198,7 +231,50 @@ impl Quality {
     /// (e.g. a settings file written by a newer version).
     #[must_use]
     pub fn from_key(key: &str) -> Option<Self> {
-        Self::ALL.iter().copied().find(|q| q.key() == key)
+        Self::ALL
+            .iter()
+            .chain(Self::CAMERA)
+            .copied()
+            .find(|q| q.key() == key)
+    }
+
+    /// The camera sizes, largest first.
+    pub const CAMERA: &'static [Quality] = &[Self::Cam1080, Self::Cam720, Self::Cam480, Self::Cam240];
+
+    /// The default camera size.
+    pub const CAMERA_DEFAULT: Quality = Self::Cam720;
+
+    /// The size a camera steps down to under loss, at the least: the
+    /// picture stays sharp on a high-density screen.
+    pub const CAMERA_FLOOR: Quality = Self::Cam480;
+
+    /// The largest camera size no taller than `height` (240p below it).
+    #[must_use]
+    pub fn camera_for_height(height: u32) -> Self {
+        Self::CAMERA
+            .iter()
+            .copied()
+            .find(|q| q.height() <= height)
+            .unwrap_or(Self::Cam240)
+    }
+
+    /// What Settings → Camera offers for a camera whose tallest picture
+    /// is `max_height` (`None`: not known): 1080p, 720p and 480p as far
+    /// as the camera goes, and its own size when that is below 480p.
+    #[must_use]
+    pub fn camera_choices(max_height: Option<u32>) -> Vec<Self> {
+        let Some(max) = max_height else {
+            return vec![Self::Cam1080, Self::Cam720, Self::Cam480];
+        };
+        let mut out: Vec<Self> = Self::CAMERA
+            .iter()
+            .copied()
+            .filter(|q| q.height() <= max && q.height() >= Self::CAMERA_FLOOR.height())
+            .collect();
+        if out.is_empty() {
+            out.push(Self::camera_for_height(max));
+        }
+        out
     }
 }
 
@@ -684,5 +760,35 @@ mod tests {
         fn lowers_overshoot_to_100() {
             assert_eq!(clamp_bitrate_scale_pct(u32::MAX), 100);
         }
+    }
+}
+
+#[cfg(test)]
+mod camera_quality_tests {
+    use super::Quality;
+
+    #[test]
+    fn the_choices_follow_the_camera() {
+        assert_eq!(
+            Quality::camera_choices(None),
+            vec![Quality::Cam1080, Quality::Cam720, Quality::Cam480]
+        );
+        assert_eq!(
+            Quality::camera_choices(Some(720)),
+            vec![Quality::Cam720, Quality::Cam480]
+        );
+        assert_eq!(Quality::camera_choices(Some(1440)).len(), 3);
+        // A 240p camera: its own size, though it is under the floor.
+        assert_eq!(Quality::camera_choices(Some(240)), vec![Quality::Cam240]);
+        assert_eq!(Quality::camera_choices(Some(360)), vec![Quality::Cam240]);
+    }
+
+    #[test]
+    fn camera_keys_round_trip_and_a_size_finds_its_rung() {
+        for q in Quality::CAMERA {
+            assert_eq!(Quality::from_key(q.key()), Some(*q));
+        }
+        assert_eq!(Quality::camera_for_height(800), Quality::Cam720);
+        assert_eq!(Quality::camera_for_height(100), Quality::Cam240);
     }
 }

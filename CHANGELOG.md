@@ -4,6 +4,128 @@ What changed from one release to the next, for the people who run a
 baucord server and the people who use the apps. Releases before this
 file are summed up in SESSION-GUIDE.md §3 ("Shipped").
 
+## 1.5.0 (unreleased)
+
+Recording a voice channel, the channel timer, and a new way around the
+app: Channel, Chat and Messages. Built on 1.4.0; the two can ship
+together.
+
+### Before you update a server
+
+- **The database moves to schema 8, one way.** Migration
+  `0008_recordings` adds the `recordings` and `recording_access`
+  tables and the `recorder` role. A server older than this release
+  refuses the upgraded database; to go back, restore a backup taken
+  before.
+- **The server image now builds libopus** (the recorder decodes
+  voice); building it yourself needs `cmake`, as the gateway's does.
+- **A new `recording:` section** in `server.yaml` (readme): on by
+  default on a persistent server, 4 hours at most a recording, 2 at
+  once, 10 GB on disk, kept 30 days — `retain_days: 0` keeps them for
+  good. Running recordings spool to `recordings/` beside `blobs/`.
+
+### Recording
+
+- **Record a voice channel, natively.** Someone with the new `record`
+  permission — admins, and the new built-in `recorder` role — starts
+  it from the channel's right-click menu or `/record`, and stops it
+  from the REC label, the menu or `/record stop`. The
+  channel shows a bordered **REC** label to everyone (the same in
+  every language) and a chime plays in the room; a client too old to
+  show the label cannot join while it records, and a recording does
+  not start while such a client is in the room.
+- **One WAV of every voice**, mixed on the server from the voice it
+  already relays — no bot, nothing extra from the clients. It ends by
+  hand, when the room empties, at `max_minutes`, or at shutdown (the
+  file is finished at the next start).
+- **Delivered by Server, to the people in it.** Everyone who was in
+  the channel while it recorded gets the file in a "Server"
+  conversation at the top of Messages, named with the channel, date, time
+  and length; nobody else can fetch it. Large files download in
+  pieces straight to disk.
+- **Logged.** Start and stop are activity lines for everyone and
+  audit entries (`recording.start`, `recording.stop`).
+- **Recorded alone, too.** The app only sends your voice when someone
+  is there to hear it; a recording counts as someone, so a channel you
+  record by yourself keeps your voice.
+
+### The channel timer
+
+- A voice channel with people in it shows how long it has been
+  occupied, `HH:MM:SS`, from the first join to the last leave, beside
+  its member count.
+
+### Channel, Chat and Messages
+
+- **One typeface everywhere: Inter**, built into the app (about 1 MB,
+  the weights it uses, cut to Latin, Greek and Cyrillic; anything else
+  falls back to the system's fonts), so a Mac, a Windows PC, Linux and
+  the phones look alike. Chat messages are a step larger (14 px) and
+  brighter, with a little more room between people.
+- **A rail down the left, at every width** — a phone's too. Its first
+  two buttons pick the main column, the channel list or (in a call)
+  Channel view; pressing the one showing hides it, leaving the chat.
+  Chat shows or hides the chat beside it. Then Messages, and the admin
+  panel and Settings at the foot. Too narrow for two columns, one
+  shows: the list or Channel view, or the chat in their place. The
+  layout is kept; the Messages section and its view bar are gone.
+- **Joining a channel opens Channel view**: your channel as a grid of
+  tiles, with its name, timer and REC label, and the call's bar at the
+  bottom — mic, headphones, screen, camera and **Leave call**. Its back
+  arrow swaps it for the channel list; the chat's arrow hides the chat,
+  and Messages has one back to the channels.
+- **The chat is a step lighter** beside another column, so its edge
+  reads, and the strips between columns carry a grip to drag them.
+- **Messages is an inbox** ("Mensajes" in Spanish): each conversation
+  with the person, the newest line and its time, unread counts, and a
+  search; pick one and it opens beside the inbox as bubbles, ours on
+  the right, with where the person is in its header. The window shows
+  nothing else, and in a call the inbox's foot keeps mute, deafen and
+  leave. Messaging someone from their menu opens Messages on them. A
+  server sends the newest lines with the list (new feature bit
+  `DM_PREVIEW`); an older server's inbox fills them in as messages
+  come.
+- **Telemetry can be turned off.** Settings → General → Privacy has
+  *Send telemetry to servers*; off, no telemetry line or event leaves
+  the app (calls work the same). The line now also names your camera
+  when it is on.
+- **Tiles show the whole picture**, with the person's role icon and
+  level beside their name and their progress to the next level along
+  the bottom.
+- **"General" is now "Chat"**: there is one text room, so it is named
+  for what it is.
+- **Admin logs moved to the admin panel.** The audit is the panel's
+  Audit tab, live while it is open; the "Admin logs" conversation is
+  gone. Slash commands work in any conversation, as before.
+- **Cameras in Channel view, from the desktops.** The camera button,
+  beside the screen-share button, turns yours on — at 720p and 30 fps
+  by default, or 1080p or 480p (240p for a camera with no more),
+  stepping down a size when the people watching lose packets, never
+  below 480p; it shows on your tile for everyone in the channel and,
+  mirrored, for you. Leaving the channel turns it off. Members and up
+  may (the new `camera` permission). **Settings → Camera** picks the
+  camera and its quality (the sizes it really has), previews it, and
+  mirrors your own picture (on by default). The phones show cameras; sending from them is
+  next. macOS asks for camera access the first time. The app opens the
+  camera in a format it really lists (a Mac's camera has no MJPEG), at
+  the closest size of 24 fps or more.
+
+### Calls
+
+- **Leave call, without leaving.** In a voice channel the red button
+  is **Leave call**: it takes you back to the lobby, still connected
+  and unseen, with chat and messages where they were. From the lobby
+  the button is **Disconnect**, as before. A server without a lobby
+  (older than 1.1.5) disconnects either way.
+- **The join chime is for joining voice.** Connecting into the lobby
+  is silent; picking a channel plays it, and leaving a call (or
+  disconnecting from one) plays the leave sound.
+- **No DM chime while you are reading it.** A direct message chimes
+  only when the app is not focused or that conversation is not on
+  screen.
+- **Watching a stream is not idle.** Auto-AFK leaves alone anyone
+  subscribed to a screen share, however quiet they are.
+
 ## 1.4.0 (unreleased)
 
 Numbered for the bot and plugin framework planned on it (the spec is

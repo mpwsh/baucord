@@ -418,6 +418,15 @@ impl ChatServer {
 
     // ── Sweeps (every 30 s) ─────────────────────────────────────────
 
+    /// Subscribed to someone's screen share: auto-AFK leaves it alone
+    /// (a viewer says nothing for an hour and is still there).
+    fn watching_a_share(&self, client: ClientId) -> bool {
+        self.video
+            .sharers()
+            .keys()
+            .any(|sharer| self.video.is_subscribed(client, *sharer))
+    }
+
     /// Temporary channels evaporate after `temporary_after_min` empty;
     /// idle members go to the AFK channel after their channel's
     /// `afk_after_min` (spec §5).
@@ -469,6 +478,8 @@ impl ChatServer {
             .channel_of
             .iter()
             .filter(|(_, ch)| **ch != afk && **ch != lobby)
+            // Watching a screen share is being there, silent or not.
+            .filter(|(client, _)| !self.watching_a_share(**client))
             .filter_map(|(client, ch)| {
                 let after_min = self
                     .user_channel_at(*ch)

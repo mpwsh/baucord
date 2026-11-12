@@ -63,6 +63,13 @@ export struct UserRow {
     name-style: int,        // 0 normal, 1 bold, 2 italic
     members-only: bool,     // channels: a min-role gate exists
     temporary: bool,        // channels: evaporates when left empty
+    // 1.5 — channels: the timer ("01:05:00", "" when empty) and
+    // recording: the REC label, and what we may do about it.
+    timer-label: string,
+    recording: bool,
+    can-record: bool,
+    can-stop-recording: bool,
+    rec-tip: string,
     // What only the menu needs (the rank rule, channel powers, who
     // owns a channel) is not here: the host works it out when the
     // menu opens (review P1-9).
@@ -81,6 +88,41 @@ export struct DmRow {
     initial: string,
     tile-tint: color,
     admin: bool,         // the admin channel (spec §8): a shield, not a person
+    // 1.5 — the Messages inbox
+    preview: string,     // the newest line ("You: …" when ours)
+    when: string,        // its time: "21:14", "Yesterday", "Tue", "Nov 3"
+    status: string,      // "In General", "Online", or nothing
+    shown: bool,         // matches `State.dm-filter`
+}
+
+/// One person in Channel view (1.5): their picture or their camera.
+export struct StageTile {
+    name: string,
+    index: int,          // their roster row, for the menu
+    client-id-lo: int,
+    client-id-hi: int,
+    avatar: image,
+    has-avatar: bool,
+    initial: string,
+    tile-tint: color,
+    name-color: color,
+    has-name-color: bool,
+    speaking: bool,
+    self-muted: bool,
+    self-deafened: bool,
+    sharing: bool,
+    is-us: bool,
+    camera: bool,        // a camera is on and its picture is here
+    frame: image,
+    // The roster row's role glyph (a custom role's own, or the built-in
+    // marks), the level as a short label ("Lv 3", "" = unknown) and
+    // the progress to the next one (0…100, -1 = unknown).
+    role: int,
+    role-icon: string,
+    role-color: color,
+    has-role-color: bool,
+    level-short: string,
+    xp-pct: int,
 }
 
 /// The toast's register: what color and glyph it carries.
@@ -196,13 +238,8 @@ export global State {
     /// The server's greeting (`Init`): the General header's second line.
     in property <string> greeting;
     in property <string> users-count-label;
-    /// The Messages section is folded to its header (a setting).
-    in property <bool> messages-collapsed: false;
     /// The sidebar's width: dragged at its edge, kept in settings.
     in-out property <length> sidebar-width: 260px;
-    /// The Messages section's height: dragged at its divider, kept in
-    /// settings.
-    in-out property <length> messages-height: 200px;
     /// The narrow layout (a phone held upright; ANDROID-SPEC.md D26)
     /// shows one page at a time: the sidebar as a list, or the chat.
     /// Set by tapping General or a DM (or opening one from a menu),
@@ -386,6 +423,10 @@ export global State {
     /// Connected but in no room yet: the server's lobby (spec §12,
     /// 1.1.5). The banner shows, the mic hint says why.
     in property <bool> in-lobby: false;
+    /// In a voice room with the lobby to go back to: hanging up leaves
+    /// the call, not the server ("Leave call", 1.5). Otherwise it
+    /// disconnects.
+    in property <bool> in-call: false;
     in property <bool> perm-create-channels: false;
     in property <bool> perm-create-invites: false;
     in property <bool> perm-manage-invites: false;  // longer expiries
@@ -411,6 +452,35 @@ export global State {
     /// pane zeroes it once the reader is back at the bottom.
     in-out property <int> chat-new-count: 0;
     in property <string> chat-new-label;
+    // ── 1.5: the rail and Channel view ──────────────────────────────
+    // A rail down the left at every width. Its first two buttons pick
+    // the main column — the channel list or, in a call, Channel view —
+    // or none (`view-main`: 0 none, 1 the list, 2 Channel view; 2
+    // outside a call shows the list); Chat shows or hides the chat
+    // (`view-chat`); with neither, the chat shows. Too narrow for two
+    // columns (`MainWindow.narrow`), only one shows: the main column if
+    // there is one, else the chat. `view-messages`: the inbox and a
+    // conversation instead — narrow, the conversation slides in over
+    // the inbox as `narrow-chat-open` says.
+    in-out property <bool> view-messages: false;
+    in-out property <int> view-main: 1;
+    in-out property <bool> view-chat: true;
+    /// The chat's width beside Channel view: dragged, kept.
+    in-out property <length> panel-width: 360px;
+    /// The inbox's search: rows whose name does not match are hidden.
+    in-out property <string> dm-filter;
+    /// Channel view: the people in our channel.
+    in property <[StageTile]> stage-tiles;
+    in property <string> stage-name;
+    in property <string> stage-timer;
+    in property <bool> stage-recording;
+    in property <bool> stage-can-stop;
+    in property <string> stage-rec-tip;
+    in property <int> stage-channel: -1;
+    /// Our camera is on (1.5); `camera-available` hides the button
+    /// where this build has no camera to send.
+    in property <bool> camera-on: false;
+    in property <bool> camera-available: false;
     /// General's two views (1.2): the conversation, or the room's
     /// activity — who came, went, moved, shared — kept apart so it
     /// does not bury the messages. In memory only, this session only.
@@ -487,6 +557,9 @@ export global Logic {
     callback toggle-deafen();
     callback toggle-share();
     callback disconnect();
+    /// The hang-up button: leave the call for the lobby while
+    /// `State.in-call`, disconnect otherwise.
+    callback hang-up();
     /// The LIVE chip on a user row was clicked: open (or raise) that
     /// sharer's viewer.
     callback watch-user(index: int);
@@ -524,11 +597,29 @@ export global Logic {
     // 1.1.1 — the Messages section
     callback dm-clicked(int);                  // index into State.dms
     callback dm-closed(int);                   // hide the conversation (nothing is deleted)
-    callback general-clicked();                // back to the general chat
     /// General's header toggle: the conversation (`false`) or the activity.
     callback general-view(activity: bool);
-    /// The Messages header's chevron: fold the section or open it.
-    callback messages-toggle();
+    // ── 1.5 ─────────────────────────────────────────────────────────
+    /// The REC label as a stop: asked first.
+    callback channel-stop-recording(channel-id: int);
+    /// A rail button: 0 the channel list, 1 Channel view (either one
+    /// as the main column), 2 Chat (shown or hidden), 3 Messages (in or
+    /// back out; the inbox's back arrow too).
+    callback view-picked(view: int);
+    /// Channel view's back arrow: the channel list instead.
+    callback stage-back();
+    /// The chat's back arrow: hide it (the main column comes back).
+    callback chat-back();
+    /// The inbox's search changed (`State.dm-filter`).
+    callback dm-filter-changed();
+    /// A tile in Channel view: its person's menu.
+    callback tile-context(index: int, x: length, y: length);
+    /// Channel view's tiles on screen changed (cameras to watch).
+    callback stage-shown(shown: bool);
+    /// The right panel's edge was dragged and let go.
+    callback panel-resized(length);
+    /// Our camera on or off.
+    callback toggle-camera();
     /// The sidebar's edge was dragged and let go: keep the width.
     callback sidebar-resized(length);
     callback moderation-confirm();             // reads State.moderation-*
@@ -561,8 +652,6 @@ export global Logic {
     callback file-open(int);
     /// Stop the card's transfer, whichever way it goes.
     callback file-cancel(int);
-    /// The Voice/Messages divider was let go: keep the height.
-    callback messages-resized(length);
     // Wipe the local chat history/images (each user clears their own).
     callback clear-chat();
     callback emoji-picked(string);

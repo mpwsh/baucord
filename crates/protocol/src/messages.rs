@@ -544,6 +544,19 @@ pub enum TelemetryEvent {
         /// The reason, as shown to the user.
         reason: String,
     },
+    // ── 1.5, sent only to a server with `features::CAMERA` ──────────
+    /// Our camera went on: the device, how it was opened, the encoder.
+    CameraStarted {
+        /// The device's name as the system gives it ("HD Pro Webcam C920").
+        camera: String,
+        /// What it was opened at and the size sent ("1280x720 30 fps
+        /// Nv12, sending 720p").
+        mode: String,
+        /// The encoder it opened on (`h264_videotoolbox`, ...).
+        encoder: String,
+    },
+    /// Our camera went off.
+    CameraStopped,
 }
 
 // ── Client → Server ─────────────────────────────────────────────────────
@@ -857,6 +870,42 @@ pub enum ClientMessage {
     /// Answered with [`ServerMessage::AccountDeleted`] (then the
     /// session ends) or [`ServerMessage::AccountDeleteRefused`].
     DeleteAccount,
+
+    // ── 1.5: recording (feature bit `RECORDING`) ─────────────────────
+    /// Start recording `channel_id` (needs `record`, and being in it).
+    /// Answered by [`ServerMessage::RecordingStarted`] to everyone who
+    /// sees the channel, or [`ServerMessage::RecordingDenied`].
+    StartRecording { channel_id: u16 },
+    /// Stop the recording in `channel_id` (needs `record`, from
+    /// anywhere). Answered by [`ServerMessage::RecordingStopped`].
+    StopRecording { channel_id: u16 },
+    /// Older recordings of this user: those with an id below `before`
+    /// (`None` = the newest). Answered with [`ServerMessage::Recordings`].
+    FetchRecordings { before: Option<u64> },
+    /// Take a recording off this user's list; others keep theirs.
+    RemoveRecording { rec_id: u64 },
+    /// Every recording up to `up_to` has been seen.
+    MarkRecordingsSeen { up_to: u64 },
+
+    // ── 1.5: large files (feature bit `LARGE_BLOBS`) ─────────────────
+    /// The bytes of a blob from `offset` on, as
+    /// [`ServerMessage::BlobPart`]s; resumable. For files over
+    /// [`MAX_BLOB_BYTES`] (recordings), and any other.
+    FetchBlobFrom { blob_id: BlobId, offset: u64 },
+
+    // ── 1.5: cameras (feature bit `CAMERA`) ──────────────────────────
+    /// Our camera is on: its groups ride the uplink track
+    /// [`crate::recording::CAMERA_UPLINK_TRACK`]. Needs `camera`;
+    /// seen by our channel only.
+    CameraStart { width: u16, height: u16 },
+    /// Our camera is off.
+    CameraStop,
+    /// Watch someone's camera (a tile on screen).
+    SubscribeCamera { target_id: ClientId },
+    /// Stop watching someone's camera.
+    UnsubscribeCamera { target_id: ClientId },
+    /// Ask a camera we watch for a fresh keyframe.
+    RequestCameraKeyframe { target_id: ClientId },
 }
 
 impl ClientMessage {
@@ -871,7 +920,11 @@ impl ClientMessage {
             | ClientMessage::UnsubscribeScreen { .. }
             | ClientMessage::JoinChannel { .. }
             | ClientMessage::UploadBegin { .. }
-            | ClientMessage::FetchBlob { .. } => Lane::Signal,
+            | ClientMessage::FetchBlob { .. }
+            | ClientMessage::FetchBlobFrom { .. }
+            | ClientMessage::SubscribeCamera { .. }
+            | ClientMessage::UnsubscribeCamera { .. }
+            | ClientMessage::RequestCameraKeyframe { .. } => Lane::Signal,
             // Bulk rides its own stream per upload.
             ClientMessage::ChatImageChunk { .. }
             | ClientMessage::LogUploadChunk { .. }
@@ -903,7 +956,14 @@ impl ClientMessage {
             | ClientMessage::Block { .. }
             | ClientMessage::Unblock { .. }
             | ClientMessage::Report { .. }
-            | ClientMessage::DeleteAccount => Lane::Control,
+            | ClientMessage::DeleteAccount
+            | ClientMessage::StartRecording { .. }
+            | ClientMessage::StopRecording { .. }
+            | ClientMessage::FetchRecordings { .. }
+            | ClientMessage::RemoveRecording { .. }
+            | ClientMessage::MarkRecordingsSeen { .. }
+            | ClientMessage::CameraStart { .. }
+            | ClientMessage::CameraStop => Lane::Control,
         }
     }
 
@@ -1324,6 +1384,92 @@ pub enum ServerMessage {
         request_id: u32,
         rows: crate::admin::AdminOutcome,
     },
+
+    // ── 1.5: the channel timer (feature bit `CHANNEL_CLOCK`) ─────────
+    /// How long `channel_id` has had someone in it, in milliseconds as
+    /// of sending; `None` = empty. On each edge (first in, last out),
+    /// and for every channel after `Init` and `ChannelListUpdated`.
+    /// The client counts on from its own monotonic clock.
+    ChannelClock {
+        channel_id: u16,
+        running_ms: Option<u64>,
+    },
+
+    // ── 1.5: recording (feature bit `RECORDING`) ─────────────────────
+    /// `channel_id` is recording, for `elapsed_ms` so far: on start, and
+    /// for each running recording after `Init` and `ChannelListUpdated`.
+    RecordingStarted {
+        channel_id: u16,
+        rec_id: u64,
+        elapsed_ms: u64,
+        by: UserId,
+        by_name: String,
+    },
+    /// The recording in `channel_id` ended. `by_name` is who stopped
+    /// it, `None` when the server did.
+    RecordingStopped {
+        channel_id: u16,
+        rec_id: u64,
+        duration_ms: u64,
+        reason: crate::recording::RecordingStopReason,
+        by_name: Option<String>,
+    },
+    /// A `StartRecording` or `StopRecording` was refused.
+    RecordingDenied {
+        channel_id: u16,
+        reason: crate::recording::RecordingDenyReason,
+    },
+    /// A recording this user was in is ready: a message from Server.
+    RecordingReady {
+        item: crate::recording::RecordingItem,
+    },
+    /// This user's recordings, newest first: after `Session`, and in
+    /// answer to `FetchRecordings`. `more`: older ones exist.
+    Recordings {
+        items: Vec<crate::recording::RecordingItem>,
+        more: bool,
+    },
+
+    // ── 1.5: large files (feature bit `LARGE_BLOBS`) ─────────────────
+    /// One piece of a blob fetched with `FetchBlobFrom`, on a Media
+    /// stream paced like `BlobChunk`. `total` is the blob's size; the
+    /// last piece ends there. The client checks the SHA-256 at the end.
+    BlobPart {
+        blob_id: BlobId,
+        offset: u64,
+        total: u64,
+        data: Vec<u8>,
+    },
+
+    // ── 1.5: cameras (feature bit `CAMERA`) ──────────────────────────
+    /// Someone in our channel turned their camera on. Its groups reach
+    /// a subscriber on the track `client_id | CAMERA_TRACK_BIT`.
+    CameraStarted {
+        client_id: ClientId,
+        width: u16,
+        height: u16,
+    },
+    /// A camera went off, or out of our view (a channel move).
+    CameraStopped { client_id: ClientId },
+    /// A `CameraStart` (`target_id: None`) or `SubscribeCamera` was
+    /// refused.
+    CameraDenied {
+        target_id: Option<ClientId>,
+        reason: DenyReason,
+    },
+    /// A viewer needs a keyframe from our camera.
+    CameraKeyframeRequested { viewer_id: ClientId },
+    /// Our camera's viewers, as `StreamHealth` is for a share.
+    CameraHealth {
+        worst_loss: f32,
+        worst_rtt_ms: f32,
+        viewers: u16,
+    },
+
+    // ── 1.5: the Messages inbox (feature bit `DM_PREVIEW`) ───────────
+    /// Right after `Conversations`: the newest line of each, for the
+    /// inbox's second line.
+    ConversationPreviews { previews: Vec<DmPreview> },
 }
 
 /// Why a DM was not sent (spec §6).
@@ -1413,6 +1559,22 @@ pub struct DmSummary {
     /// The newest message's id (the client's paging cursor).
     pub last_msg_id: u64,
 }
+
+/// The newest line of one DM conversation (1.5,
+/// [`ServerMessage::ConversationPreviews`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DmPreview {
+    /// The other party, as in [`DmSummary::user_id`].
+    pub user_id: UserId,
+    /// We wrote it.
+    pub mine: bool,
+    /// Its text on one line, cut to [`DM_PREVIEW_CHARS`]; a file's
+    /// name when it is a file.
+    pub text: String,
+}
+
+/// How much of a line [`DmPreview::text`] carries, in characters.
+pub const DM_PREVIEW_CHARS: usize = 100;
 
 /// One author in [`ServerMessage::Authors`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1584,11 +1746,14 @@ impl ServerMessage {
     #[must_use]
     pub fn lane(&self) -> Lane {
         match self {
-            ServerMessage::KeyframeRequested { .. } | ServerMessage::StreamHealth { .. } => {
-                Lane::Signal
-            }
-            ServerMessage::ChatImageChunk { .. } | ServerMessage::BlobChunk { .. } => Lane::Media,
-            ServerMessage::UploadAccept { .. }
+            ServerMessage::ChatImageChunk { .. }
+            | ServerMessage::BlobChunk { .. }
+            | ServerMessage::BlobPart { .. } => Lane::Media,
+            ServerMessage::KeyframeRequested { .. }
+            | ServerMessage::StreamHealth { .. }
+            | ServerMessage::CameraKeyframeRequested { .. }
+            | ServerMessage::CameraHealth { .. }
+            | ServerMessage::UploadAccept { .. }
             | ServerMessage::UploadDone { .. }
             | ServerMessage::UploadRejected { .. }
             | ServerMessage::BlobMissing { .. } => Lane::Signal,
@@ -1647,7 +1812,17 @@ impl ServerMessage {
             | ServerMessage::AccountDeleted
             | ServerMessage::AccountDeleteRefused { .. }
             | ServerMessage::ChatFrom { .. }
-            | ServerMessage::Authors { .. } => Lane::Control,
+            | ServerMessage::Authors { .. }
+            | ServerMessage::ChannelClock { .. }
+            | ServerMessage::RecordingStarted { .. }
+            | ServerMessage::RecordingStopped { .. }
+            | ServerMessage::RecordingDenied { .. }
+            | ServerMessage::RecordingReady { .. }
+            | ServerMessage::Recordings { .. }
+            | ServerMessage::CameraStarted { .. }
+            | ServerMessage::CameraStopped { .. }
+            | ServerMessage::CameraDenied { .. }
+            | ServerMessage::ConversationPreviews { .. } => Lane::Control,
         }
     }
 
@@ -1735,6 +1910,19 @@ impl ServerMessage {
             | ServerMessage::ChatFrom { .. }
             | ServerMessage::Authors { .. } => features::SAFETY,
             ServerMessage::AdminRows { .. } => features::ADMIN_PAGES,
+            ServerMessage::ChannelClock { .. } => features::CHANNEL_CLOCK,
+            ServerMessage::RecordingStarted { .. }
+            | ServerMessage::RecordingStopped { .. }
+            | ServerMessage::RecordingDenied { .. }
+            | ServerMessage::RecordingReady { .. }
+            | ServerMessage::Recordings { .. } => features::RECORDING,
+            ServerMessage::BlobPart { .. } => features::LARGE_BLOBS,
+            ServerMessage::CameraStarted { .. }
+            | ServerMessage::CameraStopped { .. }
+            | ServerMessage::CameraDenied { .. }
+            | ServerMessage::CameraKeyframeRequested { .. }
+            | ServerMessage::CameraHealth { .. } => features::CAMERA,
+            ServerMessage::ConversationPreviews { .. } => features::DM_PREVIEW,
         }
     }
 }

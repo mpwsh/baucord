@@ -29,7 +29,7 @@ import { ListView } from "std-widgets.slint";
 import { Icon, IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
-import { State, Logic, ChatRow } from "globals.slint";
+import { State, Logic, ChatRow, DmRow } from "globals.slint";
 import { IconBtn, AvatarTile, ProgressRing, LongPress } from "widgets.slint";
 
 // ── Rows ────────────────────────────────────────────────────────────────
@@ -126,8 +126,12 @@ component RowFrame inherits Rectangle {
     in property <bool> header-shown: root.cozy && root.head;
     in property <length> header-x: Theme.chat-gutter;
     in property <length> header-margin: Theme.gap-sm;
-    out property <bool> cozy: !State.compact-rows;
-    out property <bool> head: !root.data.continuation;
+    /// A DM is open: its lines are bubbles, ours on the right, with no
+    /// picture or name (1.5; the header says who it is with).
+    out property <bool> bubble: State.active-dm >= 0;
+    out property <bool> mine: root.bubble && root.data.own;
+    out property <bool> cozy: !State.compact-rows && !root.bubble;
+    out property <bool> head: !root.data.continuation && !root.bubble;
     /// A long press opened the menu and the finger is still down: its
     /// release is not a tap.
     out property <bool> held: lp.fired;
@@ -139,7 +143,7 @@ component RowFrame inherits Rectangle {
     // The TouchArea wraps the content, so its hover holds over the
     // text bodies as well.
     border-radius: Theme.radius-sm;
-    background: ctx.has-hover ? Theme.hover : transparent;
+    background: ctx.has-hover && !root.bubble ? Theme.hover : transparent;
     animate background { duration: 100ms; }
 
     /// A finger on the author's picture: holding it is the person's
@@ -198,10 +202,54 @@ component MessageRow inherits RowFrame {
     // Which view is up: the selectable input for plain rows and for
     // styled rows in select mode, the StyledText otherwise.
     property <bool> plain-view: !root.data.styled || root.select-mode;
-    top: root.cozy ? (root.head ? Theme.gap-sm : 2px) : (root.head ? 4px : 1px);
+    top: root.bubble ? (root.data.continuation ? 2px : 8px)
+        : root.cozy ? (root.head ? Theme.gap-md : 2px) : (root.head ? 4px : 1px);
     property <length> header-h: root.cozy && root.head ? Theme.chat-header : 0px;
-    height: root.top + root.header-h + cell.height + (root.cozy ? 4px : 3px);
+    // A bubble: its text's own width up to three quarters of the row,
+    // the time under it on the right.
+    property <length> pad-x: 12px;
+    property <length> pad-y: 8px;
+    property <length> meta-h: State.show-timestamps ? 15px : 0px;
+    property <length> bubble-max: root.width * 0.75 - 2 * root.pad-x - 24px;
+    property <length> inner-w: Math.max(Math.min(root.bubble-max,
+            measure.preferred-width + 2px),
+        when.preferred-width, 24px);
+    property <length> bubble-x: root.mine ? root.width - 12px - root.inner-w - 2 * root.pad-x : 12px;
+    height: root.bubble ? root.top + cell.height + 2 * root.pad-y + root.meta-h + 2px
+        : root.top + root.header-h + cell.height + (root.cozy ? 4px : 3px);
     selecting: root.select-mode;
+    // Measured off-layout, in a box of no size: an unwrapped text's
+    // width would otherwise become the list's minimum, and a
+    // horizontal scrollbar.
+    Rectangle {
+        width: 0px;
+        height: 0px;
+        visible: false;
+        measure := Text {
+            text: root.data.edited ? "\{root.data.body} \{Tr.chat-edited-mark}" : root.data.body;
+            font-size: Theme.font-message;
+        }
+    }
+    if root.bubble : Rectangle {
+        x: root.bubble-x;
+        y: root.top;
+        width: root.inner-w + 2 * root.pad-x;
+        height: cell.height + 2 * root.pad-y + root.meta-h;
+        background: root.mine ? Theme.bubble-own : Theme.bg-tertiary;
+        border-top-left-radius: 14px;
+        border-top-right-radius: 14px;
+        border-bottom-left-radius: root.mine ? 14px : 4px;
+        border-bottom-right-radius: root.mine ? 4px : 14px;
+        opacity: root.data.pending ? 0.6 : 1.0;
+    }
+    when := Text {
+        visible: root.bubble && State.show-timestamps;
+        x: root.bubble-x + root.pad-x + root.inner-w - self.preferred-width;
+        y: root.top + root.pad-y + cell.height + 1px;
+        text: root.data.ts;
+        color: root.mine ? Theme.bubble-own-meta : Theme.text-muted;
+        font-size: Theme.font-xs;
+    }
 
     // Compact: name and time inline, in front of the body. Always
     // instantiated (hidden in cozy) so the cell can read its width.
@@ -234,11 +282,13 @@ component MessageRow inherits RowFrame {
     // tracks its height. A deleted message keeps its header and
     // shows a muted placeholder instead.
     cell := Rectangle {
-        x: root.cozy ? Theme.chat-gutter
+        x: root.bubble ? root.bubble-x + root.pad-x
+            : root.cozy ? Theme.chat-gutter
             : root.head ? Theme.gap-sm + compact-head.preferred-width + Theme.gap-sm
             : Theme.gap-sm + 20px;
-        y: root.top + root.header-h;
-        width: parent.width - self.x - Theme.gap-sm
+        y: root.bubble ? root.top + root.pad-y : root.top + root.header-h;
+        width: root.bubble ? root.inner-w
+            : parent.width - self.x - Theme.gap-sm
             - (root.data.edited && !root.plain-view && !root.data.deleted ? mark.preferred-width + Theme.gap-sm : 0px);
         height: root.data.deleted ? gone.preferred-height
             : root.plain-view ? body.preferred-height
@@ -257,8 +307,8 @@ component MessageRow inherits RowFrame {
             read-only: true;
             single-line: false;
             // Sent and waiting for the server: muted until acked.
-            color: root.data.pending ? Theme.text-muted : Theme.text-secondary;
-            font-size: Theme.font-body;
+            color: root.data.pending ? Theme.text-muted : Theme.text-primary;
+            font-size: Theme.font-message;
             wrap: word-wrap;
             selection-background-color: Theme.accent;
             selection-foreground-color: Theme.on-accent;
@@ -280,8 +330,8 @@ component MessageRow inherits RowFrame {
             width: 100%;
             visible: !root.plain-view && !root.data.deleted;
             text: root.data.body-styled;
-            default-color: Theme.text-secondary;
-            default-font-size: Theme.font-body;
+            default-color: Theme.text-primary;
+            default-font-size: Theme.font-message;
             link-color: Theme.accent-text;
             link-clicked(url) => { if (!root.held) { Logic.link-clicked(url); } }
         }
@@ -301,7 +351,7 @@ component MessageRow inherits RowFrame {
     mark := Text {
         x: cell.x + cell.width + Theme.gap-sm;
         y: cell.y;
-        visible: root.data.edited && !root.plain-view && !root.data.deleted;
+        visible: root.data.edited && !root.plain-view && !root.data.deleted && !root.bubble;
         text: Tr.chat-edited-mark;
         color: Theme.text-muted;
         font-size: Theme.font-sm;
@@ -352,10 +402,13 @@ component FileRow inherits RowFrame {
     height: root.top + (root.cozy && root.head ? 20px : 0px) + 60px + Theme.gap-xs;
     header-margin: Theme.gap-md;
 
+    property <length> card-w: Math.min(360px, root.width
+        - (root.bubble ? 24px : (root.cozy ? Theme.chat-gutter : Theme.gap-sm) + Theme.gap-md));
     card := Rectangle {
-        x: root.cozy ? Theme.chat-gutter : Theme.gap-sm;
+        x: root.mine ? parent.width - root.card-w - 12px
+            : root.bubble ? 12px : root.cozy ? Theme.chat-gutter : Theme.gap-sm;
         y: root.top + (root.cozy && root.head ? 20px : 0px);
-        width: Math.min(360px, parent.width - self.x - Theme.gap-md);
+        width: root.card-w;
         height: 60px;
         border-radius: Theme.radius-md;
         background: Theme.bg-secondary;
@@ -558,7 +611,7 @@ component DayMarkerRow inherits Rectangle {
 component CodeRow inherits RowFrame {
     top: root.head ? (root.cozy ? Theme.gap-sm : 4px) : 2px;
     property <length> header-h: root.head ? Theme.chat-header : 0px;
-    property <length> left: root.cozy ? Theme.chat-gutter : Theme.gap-sm;
+    property <length> left: root.bubble ? 12px : root.cozy ? Theme.chat-gutter : Theme.gap-sm;
     height: root.top + root.header-h + panel.height + 6px;
     header-shown: root.head;
     header-x: root.left;
@@ -608,7 +661,8 @@ component CodeRow inherits RowFrame {
 component ImageRow inherits RowFrame {
 
     // Fit within 360×280 like before, and never wider than the view.
-    property <length> avail: root.width - root.left - Theme.gap-sm;
+    property <length> avail: root.width - (root.bubble ? 24px
+        : (root.cozy ? Theme.chat-gutter : Theme.gap-sm) + Theme.gap-sm);
     property <float> maxw: Math.min(360.0, avail / 1px);
     property <float> scale: Math.min(1.0, Math.min(
         maxw / Math.max(1.0, root.data.img-w),
@@ -618,7 +672,8 @@ component ImageRow inherits RowFrame {
 
     top: root.head ? (root.cozy ? Theme.gap-sm : 4px) : 2px;
     property <length> header-h: root.head ? Theme.chat-header : 0px;
-    property <length> left: root.cozy ? Theme.chat-gutter : Theme.gap-sm;
+    property <length> left: root.mine ? root.width - root.disp-w - 12px
+        : root.bubble ? 12px : root.cozy ? Theme.chat-gutter : Theme.gap-sm;
     height: root.top + root.header-h + disp-h + 6px;
     header-shown: root.head;
     header-x: root.left;
@@ -871,7 +926,10 @@ export component ChatPane inherits Rectangle {
     /// waits, and is done when the pane is back: it ran 8 to 90 frames
     /// a message whether or not anyone saw it (review 2026-10, P1-3).
     in property <bool> drawn: true;
-    background: Theme.bg-primary;
+    /// The pane's ground: a step lighter beside Channel view or the
+    /// channel list, so its edge reads (1.5); the window's in Messages.
+    in property <brush> ground: Theme.bg-primary;
+    background: root.ground;
 
     public function scroll-to-end() {
         list.content-y = -Math.max(0px, list.content-height - list.visible-height);
@@ -1011,15 +1069,23 @@ export component ChatPane inherits Rectangle {
                 // The same slot the DM header's back button takes, so
                 // the title sits at one x in both. Narrow: the way back
                 // to the list instead.
-                if root.narrow : NavBack {
+                // Slid in over another page (narrow): back to it.
+                // Otherwise (1.5) the arrow hides the chat, as Chat on
+                // the rail does.
+                if root.narrow && State.narrow-chat-open : NavBack {
                     clicked => { State.narrow-chat-open = false; }
                 }
-                if !root.narrow : Rectangle {
-                    width: 28px;
-                    IconDisplay {
-                        icon: IconSet.Hash;
-                        size: 18px;
-                        stroke: Theme.accent-text;
+                if !root.narrow || !State.narrow-chat-open : Rectangle {
+                    width: State.touch-host ? 40px : 32px;
+                    IconBtn {
+                        y: (parent.height - self.height) / 2;
+                        size: parent.width;
+                        icon-size: 18px;
+                        icon: IconSet.ArrowLeft;
+                        idle-color: Theme.text-primary;
+                        tooltip: Tr.chat-hide;
+                        tooltip-below: true;
+                        clicked => { Logic.chat-back(); }
                     }
                 }
                 VerticalLayout {
@@ -1065,7 +1131,10 @@ export component ChatPane inherits Rectangle {
                 }
             }
         }
-        if State.active-dm >= 0 : Rectangle {
+        // A DM: the person — their picture, name and where they are —
+        // the way back to the inbox on a phone (wide, it is beside).
+        if State.active-dm >= 0 : dm-box := Rectangle {
+            property <DmRow> who: State.dms[State.active-dm];
             height: dm-head.preferred-height + 2 * Theme.gap-sm;
             border-radius: Theme.radius-sm;
             background: Theme.bg-secondary;
@@ -1073,18 +1142,37 @@ export component ChatPane inherits Rectangle {
                 padding-left: Theme.gap-sm;
                 padding-right: Theme.gap-xs;
                 spacing: Theme.gap-sm;
-                // Wide: back to General. Narrow: back to the list
-                // (General is a row there, like this DM).
                 if root.narrow : NavBack {
                     clicked => { State.narrow-chat-open = false; }
                 }
-                if !root.narrow : IconBtn {
-                    size: 28px;
-                    icon-size: 16px;
-                    icon: IconSet.ArrowLeft;
-                    tooltip: Tr.dm-back;
-                    tooltip-below: true;
-                    clicked => { Logic.general-clicked(); }
+                if !dm-box.who.admin : Rectangle {
+                    width: 36px;
+                    AvatarTile {
+                        y: (parent.height - self.height) / 2;
+                        source: dm-box.who.avatar;
+                        has-image: dm-box.who.has-avatar;
+                        initial: dm-box.who.initial;
+                        tint: dm-box.who.tile-tint;
+                        side: 36px;
+                        corner: 18px;
+                        ring: false;
+                        ring-room: false;
+                    }
+                }
+                if dm-box.who.admin : Rectangle {
+                    width: 36px;
+                    Rectangle {
+                        y: (parent.height - self.height) / 2;
+                        width: 36px;
+                        height: 36px;
+                        border-radius: 10px;
+                        background: Theme.border;
+                        IconDisplay {
+                            icon: IconSet.Server;
+                            size: 18px;
+                            stroke: Theme.text-primary;
+                        }
+                    }
                 }
                 VerticalLayout {
                     alignment: center;
@@ -1093,13 +1181,14 @@ export component ChatPane inherits Rectangle {
                     Text {
                         text: State.conv-name;
                         color: Theme.text-primary;
-                        font-size: Theme.font-body;
+                        font-size: Theme.font-md;
                         font-weight: 600;
                         overflow: elide;
                     }
                     Text {
-                        text: State.server-persistent ? Tr.dm-direct-message : Tr.dm-note-memory;
-                        color: Theme.text-muted;
+                        text: dm-box.who.status != "" ? dm-box.who.status
+                            : State.server-persistent ? Tr.dm-direct-message : Tr.dm-note-memory;
+                        color: dm-box.who.status != "" ? Theme.success : Theme.text-muted;
                         font-size: Theme.font-xs;
                         overflow: elide;
                     }
@@ -1182,6 +1271,10 @@ export component ChatPane inherits Rectangle {
             list := ListView {
                 width: 100%;
                 height: 100%;
+                // Rows wrap to the pane, never widen it: a bubble
+                // measures its text's natural width, and that width
+                // must not become the list's (a horizontal scrollbar).
+                content-width: self.visible-width;
                 // The app compiles with Slint's default widget style, fluent, on
                 // every target — and fluent's ScrollView never pans on a drag
                 // (a mouse drag selects). A finger has nothing else to scroll

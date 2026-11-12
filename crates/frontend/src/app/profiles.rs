@@ -45,7 +45,11 @@ impl AppState {
     /// Something about who is here changed: the room-dependent state
     /// follows now, the rows at the end of this pass of the event loop.
     pub fn update_user_list(&mut self) {
-        self.main.global::<State>().set_in_lobby(self.in_lobby());
+        let in_lobby = self.in_lobby();
+        self.main.global::<State>().set_in_lobby(in_lobby);
+        self.main
+            .global::<State>()
+            .set_in_call(self.lobby && !in_lobby && self.our_channel().is_some());
         // Every presence change lands here: a phone's microphone follows
         // the room (ANDROID-SPEC.md D53), and so does the type of what
         // keeps it alive off screen (D63). Both at once, never deferred.
@@ -76,6 +80,8 @@ impl AppState {
         if self.roster_sync.dirty && self.main_on_screen() {
             self.rebuild_roster();
         }
+        // The channel timers' tick, which stops out of sight.
+        self.sync_clock_timer();
     }
 
     fn rebuild_roster(&mut self) {
@@ -96,9 +102,14 @@ impl AppState {
         let mut converted: Vec<UserRow> = Vec::with_capacity(items.len());
         for (i, item) in items.iter().enumerate() {
             let mut row = ui::convert::roster_item(item);
-            if let roster::RosterItem::User(user) = item {
-                self.decorate_user_row(&mut row, user);
-                self.roster_sync.rows.insert(user.client_id, i);
+            match item {
+                roster::RosterItem::User(user) => {
+                    self.decorate_user_row(&mut row, user);
+                    self.roster_sync.rows.insert(user.client_id, i);
+                }
+                roster::RosterItem::Channel(channel) => {
+                    self.decorate_channel_row(&mut row, channel.id);
+                }
             }
             converted.push(row);
         }
@@ -121,6 +132,10 @@ impl AppState {
         self.main
             .global::<State>()
             .set_users_count_label(t!("users-count", "count" => self.session.users.len()).into());
+        // Channel view follows the roster (1.5).
+        self.rebuild_stage();
+        // The inbox says where each person is.
+        self.rebuild_dms_model();
     }
 
     /// A speaking or audio-state edge: rewrite that one row, no re-sort
@@ -162,6 +177,8 @@ impl AppState {
         row.self_muted = muted;
         row.self_deafened = deafened;
         self.users_model.set_row_data(index, row);
+        // Channel view's tile shows the same edge.
+        self.refresh_stage_tile(client_id, speaking, muted, deafened);
     }
 
     /// What the row and its card show beyond the view model: the look,

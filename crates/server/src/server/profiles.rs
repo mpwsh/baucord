@@ -700,6 +700,11 @@ impl ChatServer {
     /// A client wants a blob's bytes: from memory at once; from disk
     /// through the persistence thread; `BlobMissing` otherwise.
     pub(super) fn handle_fetch_blob(&mut self, client: ClientId, blob_id: BlobId) {
+        // A recording's file is its participants' alone (1.5).
+        if !self.may_fetch(client, &blob_id) {
+            self.send_msg(client, &ServerMessage::BlobMissing { blob_id });
+            return;
+        }
         if let Some(bytes) = self.blob_bytes.get(&blob_id).cloned() {
             self.touch_blob(&blob_id);
             self.send_blob(client, blob_id, &bytes);

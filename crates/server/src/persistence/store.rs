@@ -39,6 +39,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0005_message_counter.sql"),
     include_str!("migrations/0006_file_references.sql"),
     include_str!("migrations/0007_drop_unused.sql"),
+    include_str!("migrations/0008_recordings.sql"),
 ];
 
 /// The schema version this build produces.
@@ -74,6 +75,8 @@ pub struct Retention {
     pub telemetry_days: u32,
     /// Unreferenced blobs older than this go (spec §7).
     pub file_days: u32,
+    /// Recordings older than this go, file and all (1.5); 0 keeps them.
+    pub recording_days: u32,
 }
 
 /// What one retention pass did ([`Sqlite::prune_with_files`]).
@@ -139,6 +142,9 @@ pub struct Sqlite {
     /// Where blob bytes live: `blobs/` next to the database (spec §2),
     /// a per-process temp dir for an in-memory database.
     blobs: PathBuf,
+    /// Where recordings are spooled while they run (1.5): `recordings/`
+    /// beside `blobs/`.
+    spool: PathBuf,
     /// Opened with `SQLITE_OPEN_READ_ONLY` ([`Sqlite::open_read_only`]):
     /// no checkpoint on close.
     read_only: bool,
@@ -230,6 +236,7 @@ impl Sqlite {
             Self {
                 conn,
                 data_version,
+                spool: spool_dir(&blobs),
                 blobs,
                 read_only: false,
                 _tidy: None,
@@ -284,6 +291,7 @@ impl Sqlite {
             conn,
             data_version,
             blobs: blobs_dir(path),
+            spool: spool_dir(&blobs_dir(path)),
             read_only: true,
             _tidy: Some(tidy),
         })
@@ -401,7 +409,9 @@ impl Sqlite {
                             (SELECT COUNT(*) FROM messages m
                              WHERE m.blob_id = b.blob_id AND m.deleted_at IS NULL)
                           + (SELECT COUNT(*) FROM users u
-                             WHERE u.avatar_blob = b.blob_id) AS live
+                             WHERE u.avatar_blob = b.blob_id)
+                          + (SELECT COUNT(*) FROM recordings r
+                             WHERE r.blob_id = b.blob_id) AS live
                      FROM blobs b)
                  WHERE refs != live",
             )?;
@@ -426,7 +436,8 @@ impl Sqlite {
         self.conn.query_row(
             "SELECT (SELECT COUNT(*) FROM messages
                      WHERE blob_id = ?1 AND deleted_at IS NULL)
-                  + (SELECT COUNT(*) FROM users WHERE avatar_blob = ?1)",
+                  + (SELECT COUNT(*) FROM users WHERE avatar_blob = ?1)
+                  + (SELECT COUNT(*) FROM recordings WHERE blob_id = ?1)",
             params![blob_id],
             |r| r.get(0),
         )
@@ -694,6 +705,36 @@ impl Sqlite {
         rows.collect()
     }
 
+    /// The newest line of each of `user_id`'s DM conversations (1.5,
+    /// the inbox): its text on one line and cut short, or a file's
+    /// name, and whether `user_id` wrote it.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn conversation_previews_of(
+        &self,
+        user_id: &UserId,
+    ) -> Result<Vec<protocol::DmPreview>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT CASE WHEN c.user_a = ?1 THEN c.user_b ELSE c.user_a END,
+                    m.user_id = ?1,
+                    CASE WHEN m.body != '' THEN m.body ELSE COALESCE(b.name, '') END
+             FROM conversations c
+             JOIN messages m ON m.msg_id = (SELECT MAX(n.msg_id) FROM messages n
+                                            WHERE n.conv_id = c.conv_id AND n.deleted_at IS NULL)
+             LEFT JOIN blobs b ON b.blob_id = m.blob_id
+             WHERE c.kind = 1 AND (c.user_a = ?1 OR c.user_b = ?1)",
+        )?;
+        let rows = stmt.query_map(params![user_id], |row| {
+            Ok(protocol::DmPreview {
+                user_id: row.get(0)?,
+                mine: row.get(1)?,
+                text: preview_line(&row.get::<_, String>(2)?),
+            })
+        })?;
+        rows.collect()
+    }
+
     /// See [`Scope`].
     fn scope(&self) -> Result<Scope<'_>, rusqlite::Error> {
         let open = self.conn.is_autocommit();
@@ -734,6 +775,57 @@ impl Sqlite {
     /// `SQLite` failure.
     pub fn checkpoint(&self) -> Result<(), rusqlite::Error> {
         self.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
+    }
+
+    /// Recordings older than `recording.retain_days` (1.5): their rows,
+    /// every recipient's access, and the reference each held on its
+    /// file — a file nothing else points at goes now. Returns the files
+    /// deleted.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn prune_recordings(&self, cutoff: WallMs) -> Result<Vec<[u8; 32]>, rusqlite::Error> {
+        let blobs: Vec<[u8; 32]> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT blob_id FROM recordings WHERE started_at < ?1 AND blob_id IS NOT NULL",
+            )?;
+            stmt.query_map(params![ordered(cutoff)], |r| r.get(0))?
+                .collect::<Result<_, _>>()?
+        };
+        let finished: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM recordings WHERE started_at < ?1 AND stop_reason IS NOT NULL",
+            params![ordered(cutoff)],
+            |r| r.get(0),
+        )?;
+        if finished == 0 {
+            return Ok(Vec::new());
+        }
+        let tx = self.scope()?;
+        tx.execute(
+            "DELETE FROM recordings WHERE started_at < ?1 AND stop_reason IS NOT NULL",
+            params![ordered(cutoff)],
+        )?;
+        for blob in &blobs {
+            tx.execute(
+                "UPDATE blobs SET refs = MAX(refs - 1, 0) WHERE blob_id = ?1",
+                params![blob],
+            )?;
+        }
+        tx.commit()?;
+        let mut gone = Vec::new();
+        for blob in blobs {
+            let refs: Option<i64> = self
+                .conn
+                .query_row("SELECT refs FROM blobs WHERE blob_id = ?1", params![blob], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            if refs == Some(0) {
+                self.delete_blob(&blob)?;
+                gone.push(blob);
+            }
+        }
+        Ok(gone)
     }
 
     /// Unreferenced blobs older than the file window (spec §7): the
@@ -824,9 +916,15 @@ impl Sqlite {
                 params![ordered(cutoff)],
             )?);
         }
+        if let Some(cut) = cutoff(now, retention.recording_days) {
+            let gone = self.prune_recordings(cut)?;
+            pruned.removed += gone.len() as u64;
+            pruned.files.extend(gone);
+        }
         if let Some(cut) = cutoff(now, retention.file_days) {
-            pruned.files = self.prune_blobs(cut)?;
-            pruned.removed += pruned.files.len() as u64;
+            let files = self.prune_blobs(cut)?;
+            pruned.removed += files.len() as u64;
+            pruned.files.extend(files);
         }
         Ok(pruned)
     }
@@ -2778,9 +2876,384 @@ impl CheckReport {
     }
 }
 
+// ── Recordings (1.5, migration 8) ───────────────────────────────────────
+
+/// A recording as it starts: its row before it has a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordingRow {
+    pub rec_id: u64,
+    pub channel: String,
+    pub started_at: WallMs,
+    pub started_by: Option<UserId>,
+    pub starter: String,
+    pub sample_rate: u32,
+}
+
+/// A recording as it ends: the file the recorder made, moved into the
+/// blob store already, and why it ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordingEnd {
+    pub rec_id: u64,
+    pub duration_ms: u64,
+    pub stopped_by: Option<UserId>,
+    pub reason: protocol::recording::RecordingStopReason,
+    /// `None`: the recorder made no file (a write failed); the row is
+    /// closed with nothing to list.
+    pub file: Option<RecordingFile>,
+}
+
+/// A finished recording's file in the blob store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordingFile {
+    pub blob_id: [u8; 32],
+    pub size: u64,
+    pub name: String,
+    pub created_at: WallMs,
+}
+
+/// What the tick needs about recordings at startup.
+#[derive(Debug, Clone, Default)]
+pub struct RecordingState {
+    /// One past the highest recording id ever used.
+    pub next_rec_id: u64,
+    /// Who may fetch each recording's file.
+    pub access: HashMap<[u8; 32], std::collections::HashSet<UserId>>,
+    /// Each finished recording's file.
+    pub blob_of: HashMap<u64, [u8; 32]>,
+}
+
+/// Where recordings are spooled while they run: `recordings/` beside
+/// `blobs/`; for an in-memory database's temporary blob folder, a
+/// folder of its own per open, so tests in one process never share
+/// a spool.
+fn spool_dir(blobs: &Path) -> PathBuf {
+    if blobs.file_name().is_some_and(|n| n == "blobs") {
+        blobs.with_file_name("recordings")
+    } else {
+        let n: u64 = rand::random();
+        blobs.with_file_name(format!(
+            "{}-recordings-{n:x}",
+            blobs.file_name().and_then(|f| f.to_str()).unwrap_or("baucord")
+        ))
+    }
+}
+
+impl Sqlite {
+    /// The blob store's directory.
+    #[must_use]
+    pub fn blobs_path(&self) -> &Path {
+        &self.blobs
+    }
+
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn insert_recording(&self, row: &RecordingRow) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "INSERT INTO recordings (rec_id, channel, started_at, started_by, starter, sample_rate)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                ordered(row.rec_id),
+                row.channel,
+                ordered(row.started_at),
+                row.started_by,
+                row.starter,
+                i64::from(row.sample_rate)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// These users were recorded: they may fetch the file once it is
+    /// there.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn grant_recording(&self, rec_id: u64, users: &[UserId]) -> Result<(), rusqlite::Error> {
+        let mut stmt = self.conn.prepare_cached(
+            "INSERT OR IGNORE INTO recording_access (rec_id, user_id) VALUES (?1, ?2)",
+        )?;
+        for user in users {
+            stmt.execute(params![ordered(rec_id), user])?;
+        }
+        Ok(())
+    }
+
+    /// Close a recording: its file joins the blob store (one reference,
+    /// the recording's own) and the row says how it ended.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn finish_recording(&self, end: &RecordingEnd) -> Result<(), rusqlite::Error> {
+        let tx = self.scope()?;
+        if let Some(file) = &end.file {
+            tx.execute(
+                "INSERT INTO blobs (blob_id, mime, size, name, created_by, created_at, refs)
+                 VALUES (?1, 'audio/wav', ?2, ?3, NULL, ?4, 1)
+                 ON CONFLICT(blob_id) DO UPDATE SET refs = refs + 1",
+                params![
+                    file.blob_id,
+                    i64::try_from(file.size).unwrap_or(i64::MAX),
+                    file.name,
+                    ordered(file.created_at)
+                ],
+            )?;
+        }
+        tx.execute(
+            "UPDATE recordings SET duration_ms = ?2, stopped_by = ?3, stop_reason = ?4,
+                                   size = ?5, blob_id = ?6
+             WHERE rec_id = ?1",
+            params![
+                ordered(end.rec_id),
+                ordered(end.duration_ms),
+                end.stopped_by,
+                i64::from(end.reason.code()),
+                end.file
+                    .as_ref()
+                    .map_or(0, |f| i64::try_from(f.size).unwrap_or(i64::MAX)),
+                end.file.as_ref().map(|f| f.blob_id)
+            ],
+        )?;
+        tx.commit()
+    }
+
+    /// Take a recording off one user's list.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn remove_recording_access(
+        &self,
+        rec_id: u64,
+        user: &UserId,
+    ) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "DELETE FROM recording_access WHERE rec_id = ?1 AND user_id = ?2",
+            params![ordered(rec_id), user],
+        )?;
+        Ok(())
+    }
+
+    /// Every recording up to `up_to` has been seen by `user`.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn mark_recordings_seen(&self, user: &UserId, up_to: u64) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "UPDATE recording_access SET seen = 1 WHERE user_id = ?1 AND rec_id <= ?2",
+            params![user, ordered(up_to)],
+        )?;
+        Ok(())
+    }
+
+    /// One user's finished recordings, newest first: at most `limit`
+    /// below `before`, and whether older ones exist.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn recordings_of(
+        &self,
+        user: &UserId,
+        before: Option<u64>,
+        limit: u16,
+    ) -> Result<(Vec<protocol::recording::RecordingItem>, bool), rusqlite::Error> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT r.rec_id, r.channel, r.started_at, r.duration_ms, r.starter, r.stop_reason,
+                    r.blob_id, r.size, r.sample_rate, a.seen
+             FROM recording_access a JOIN recordings r ON r.rec_id = a.rec_id
+             WHERE a.user_id = ?1 AND r.blob_id IS NOT NULL AND r.rec_id < ?2
+             ORDER BY r.rec_id DESC LIMIT ?3",
+        )?;
+        let below = before.map_or(i64::MAX, ordered);
+        let mut items: Vec<protocol::recording::RecordingItem> = stmt
+            .query_map(params![user, below, i64::from(limit) + 1], |r| {
+                let rec_id = unordered(r.get(0)?);
+                let channel: String = r.get(1)?;
+                let started_at = unordered(r.get(2)?);
+                let duration_ms = unordered(r.get(3)?);
+                Ok(protocol::recording::RecordingItem {
+                    rec_id,
+                    file_name: protocol::recording::file_name(&channel, started_at, duration_ms),
+                    channel,
+                    started_at,
+                    duration_ms,
+                    started_by: r.get(4)?,
+                    reason: protocol::recording::RecordingStopReason::from_code(
+                        u8::try_from(r.get::<_, i64>(5)?).unwrap_or(u8::MAX),
+                    ),
+                    blob_id: r.get(6)?,
+                    size: u64::try_from(r.get::<_, i64>(7)?).unwrap_or(0),
+                    sample_rate: u32::try_from(r.get::<_, i64>(8)?).unwrap_or(0),
+                    seen: r.get::<_, i64>(9)? != 0,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        let more = items.len() > usize::from(limit);
+        items.truncate(usize::from(limit));
+        Ok((items, more))
+    }
+
+    /// The highest recording id and who may fetch which file.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn recording_state(&self) -> Result<RecordingState, rusqlite::Error> {
+        let max: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(rec_id), 0) FROM recordings",
+            [],
+            |r| r.get(0),
+        )?;
+        let mut state = RecordingState {
+            next_rec_id: unordered(max).saturating_add(1),
+            ..RecordingState::default()
+        };
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT rec_id, blob_id FROM recordings WHERE blob_id IS NOT NULL")?;
+            for row in stmt.query_map([], |r| Ok((unordered(r.get(0)?), r.get::<_, [u8; 32]>(1)?)))? {
+                let (rec, blob) = row?;
+                state.blob_of.insert(rec, blob);
+                state.access.entry(blob).or_default();
+            }
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT r.blob_id, a.user_id FROM recording_access a
+             JOIN recordings r ON r.rec_id = a.rec_id
+             WHERE r.blob_id IS NOT NULL",
+        )?;
+        for row in stmt.query_map([], |r| Ok((r.get::<_, [u8; 32]>(0)?, r.get::<_, UserId>(1)?)))? {
+            let (blob, user) = row?;
+            state.access.entry(blob).or_default().insert(user);
+        }
+        Ok(state)
+    }
+
+    /// The spool folder.
+    #[must_use]
+    pub fn spool_path(&self) -> &Path {
+        &self.spool
+    }
+
+    /// Recordings a shutdown or a crash left without their file: each
+    /// spool in `recordings/` whose row has no file yet is finished
+    /// from what was written (the WAV header patched to the data's
+    /// length), hashed and moved into the blob store, and its row
+    /// closed — `Interrupted` unless the server had said why it
+    /// stopped — so its people find it. A row with no spool is closed
+    /// with nothing to list. Run at startup, before the tick.
+    ///
+    /// # Errors
+    /// `SQLite` failure.
+    pub fn repair_recordings(&self) -> Result<usize, rusqlite::Error> {
+        let open: Vec<(u64, String, u64, u32, Option<i64>, u64)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT rec_id, channel, started_at, sample_rate, stop_reason, duration_ms
+                 FROM recordings WHERE blob_id IS NULL AND (stop_reason IS NULL OR size = 0)",
+            )?;
+            stmt.query_map([], |r| {
+                Ok((
+                    unordered(r.get(0)?),
+                    r.get(1)?,
+                    unordered(r.get(2)?),
+                    u32::try_from(r.get::<_, i64>(3)?).unwrap_or(48_000),
+                    r.get(4)?,
+                    unordered(r.get(5)?),
+                ))
+            })?
+            .collect::<Result<_, _>>()?
+        };
+        let mut repaired = 0;
+        for (rec_id, channel, started_at, rate, reason, said_ms) in &open {
+            let part = crate::recorder::spool_path(&self.spool, *rec_id);
+            let finished = match crate::recorder::wav::finish_spool(&part, *rate, &self.blobs) {
+                Ok(found) => found,
+                Err(e) => {
+                    warn!("recording {rec_id} could not be repaired: {e}");
+                    None
+                }
+            };
+            if finished.is_none() && reason.is_some() {
+                // Closed by the server with nothing written: leave it.
+                continue;
+            }
+            let reason = reason
+                .and_then(|r| u8::try_from(r).ok())
+                .map_or(protocol::recording::RecordingStopReason::Interrupted, |r| {
+                    protocol::recording::RecordingStopReason::from_code(r)
+                });
+            let file = finished.map(|(blob_id, size, ms)| {
+                let ms = if *said_ms > 0 { *said_ms } else { ms };
+                RecordingFile {
+                    blob_id,
+                    size,
+                    name: protocol::recording::file_name(channel, *started_at, ms),
+                    created_at: started_at.saturating_add(ms),
+                }
+            });
+            let duration_ms = if *said_ms > 0 {
+                *said_ms
+            } else {
+                file.as_ref()
+                    .map_or(0, |f| (f.size.saturating_sub(44)) / 2 * 1000 / u64::from((*rate).max(1)))
+            };
+            self.finish_recording(&RecordingEnd {
+                rec_id: *rec_id,
+                duration_ms,
+                stopped_by: None,
+                reason,
+                file,
+            })?;
+            repaired += 1;
+            info!("recording {rec_id} of '{channel}' finished at startup ({})", reason.describe());
+        }
+        Ok(repaired)
+    }
+
+    /// `len` bytes of a blob from `offset`, and its whole size; `None`
+    /// when the file is missing. Not verified against the hash — the
+    /// receiver checks the whole file at the end.
+    #[must_use]
+    pub fn read_blob_range(&self, blob_id: &[u8; 32], offset: u64, len: usize) -> Option<(Vec<u8>, u64)> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = File::open(self.blobs.join(hex(blob_id))).ok()?;
+        let total = file.metadata().ok()?.len();
+        if offset > total {
+            return None;
+        }
+        file.seek(SeekFrom::Start(offset)).ok()?;
+        let take = usize::try_from((total - offset).min(len as u64)).unwrap_or(len);
+        let mut buf = vec![0u8; take];
+        file.read_exact(&mut buf).ok()?;
+        Some((buf, total))
+    }
+}
+
+/// A message as the inbox's one line: whitespace runs (newlines too)
+/// as one space, cut to [`protocol::DM_PREVIEW_CHARS`] characters with
+/// an ellipsis.
+fn preview_line(body: &str) -> String {
+    let words: Vec<&str> = body.split_whitespace().collect();
+    let line = words.join(" ");
+    if line.chars().count() <= protocol::DM_PREVIEW_CHARS {
+        return line;
+    }
+    let mut cut: String = line.chars().take(protocol::DM_PREVIEW_CHARS - 1).collect();
+    cut.push('…');
+    cut
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_preview_is_one_line_cut_short() {
+        assert_eq!(super::preview_line("hello\n  there\tyou"), "hello there you");
+        let long = "x".repeat(protocol::DM_PREVIEW_CHARS + 20);
+        let cut = super::preview_line(&long);
+        assert_eq!(cut.chars().count(), protocol::DM_PREVIEW_CHARS);
+        assert!(cut.ends_with('…'));
+        assert_eq!(super::preview_line(""), "");
+    }
 
     #[test]
     fn a_restored_blob_path_stays_in_its_folder() {
@@ -2933,6 +3406,7 @@ mod tests {
                     history_days: 30,
                     telemetry_days: 0,
                     file_days: 0,
+                    recording_days: 0,
                 },
             )
             .expect("prune");
@@ -3064,6 +3538,7 @@ mod tests {
                     history_days: 30,
                     telemetry_days: 0,
                     file_days: 30,
+                    recording_days: 0,
                 },
             )
             .expect("prune");
@@ -3122,6 +3597,7 @@ mod tests {
                     history_days: 0,
                     telemetry_days: 0,
                     file_days: 0,
+                    recording_days: 0,
                 },
             )
             .expect("prune");
@@ -3324,6 +3800,7 @@ mod tests {
                 history_days: 1,
                 telemetry_days: 1,
                 file_days: 1,
+                recording_days: 0,
             },
         )
         .expect("prune runs on a stopped server");
@@ -3483,3 +3960,4 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 }
+

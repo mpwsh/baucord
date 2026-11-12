@@ -326,7 +326,7 @@ impl ChatServer {
     }
 
     pub(super) fn resolve_conversations_answer(&mut self, client: ClientId, outcome: Outcome) {
-        if let Outcome::Answered(Answer::Conversations(mut dms)) = outcome {
+        if let Outcome::Answered(Answer::Conversations(mut dms, mut previews)) = outcome {
             // The client replaces its list with each one it gets: one
             // message, the conversations that fit (the store lists the
             // most recent first).
@@ -338,7 +338,14 @@ impl ChatServer {
                 );
             }
             self.send_authors(client, dms.iter().map(|d| d.user_id));
+            // The inbox's second lines, for the conversations listed.
+            previews.retain(|p| dms.iter().any(|d| d.user_id == p.user_id));
+            previews.sort_by_key(|p| dms.iter().position(|d| d.user_id == p.user_id));
+            protocol::keep_prefix_that_fits(&mut previews, protocol::LIST_ITEMS_BUDGET);
             self.send_msg(client, &ServerMessage::Conversations { dms });
+            if self.has_feature(client, features::DM_PREVIEW) {
+                self.send_msg(client, &ServerMessage::ConversationPreviews { previews });
+            }
         }
     }
 

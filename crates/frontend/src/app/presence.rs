@@ -32,6 +32,9 @@ impl AppState {
         // A session opens on the list: in the narrow layout that is the
         // sidebar's page, not whichever chat was showing last time.
         s.set_narrow_chat_open(false);
+        // Not in Messages: the lobby's channels and chat (1.5).
+        s.set_view_messages(false);
+        s.set_dm_filter("".into());
         s.set_phase(Phase::Main);
 
         self.session.our_client_id = Some(client_id);
@@ -89,8 +92,13 @@ impl AppState {
         self.kept_alive = None;
         self.sync_keep_alive(false);
         // Join ding, queued behind Start on the same channel so it
-        // plays on the freshly started (or still-running) engine.
-        self.play_chime(SoundType::UserJoined);
+        // plays on the freshly started (or still-running) engine — for
+        // a voice room only (1.5): connecting puts us in the lobby,
+        // silent, and the ding is for joining voice. A reconnect that
+        // puts us straight back in our room still dings.
+        if !self.in_lobby() {
+            self.play_chime(SoundType::UserJoined);
+        }
 
         // Sync per-user audio settings to voice engine
         for (&id, user) in &self.session.users {
@@ -321,11 +329,18 @@ impl AppState {
             // this, and ding into the new room. Back into the lobby
             // (an admin's move, a kick) there is no room to ding
             // into: the banner says where we are.
-            self.session.pending_channel_join = None;
+            let asked = self.session.pending_channel_join.take() == Some(channel_id);
+            let from_lobby = our_channel_before
+                .is_none_or(|c| Some(self.channel_name(c)) == self.lobby_name);
             let state = self.main.global::<State>();
             state.set_channel_prompt_open(false);
             state.set_channel_password("".into());
             if self.in_lobby() {
+                // Out of a voice room (Leave call, an admin's move): the
+                // leave chime, as hanging up sounds.
+                if our_channel_before.is_some_and(|c| Some(self.channel_name(c)) != self.lobby_name) {
+                    self.play_chime(SoundType::UserLeft);
+                }
                 self.update_user_list();
                 return;
             }
@@ -335,6 +350,11 @@ impl AppState {
             // now, D53), then the ding — on the new output, not the old.
             self.sync_voice_room();
             self.play_chime(SoundType::UserJoined);
+            // Into a call by our own hand, or out of the lobby: Channel
+            // view shows it.
+            if asked || from_lobby {
+                self.joined_voice();
+            }
         } else {
             let name = self.username_of(client_id);
             let channel = self.channel_name(channel_id);
@@ -469,13 +489,8 @@ impl AppState {
         s.set_perm_panel(has(p::PANEL));
         s.set_perm_dm(has(p::DM));
         s.set_server_persistent(self.session.server_persistent);
+        self.sync_camera_button();
         crate::settingsui::refresh_role_line(self);
-        // The channel's row, for whoever may read it (the borrow of
-        // the window's globals is over by here).
-        if p::has(self.session.permissions, p::ADMIN_CHANNEL) {
-            self.ensure_admin_channel();
-            self.rebuild_dms_model();
-        }
     }
 
     /// Does a message name us — the nickname as a whole word, or
@@ -495,19 +510,8 @@ impl AppState {
         let s = self.main.global::<State>();
         s.set_show_timestamps(self.settings.ui.show_timestamps);
         s.set_compact_rows(self.settings.ui.compact_rows);
-        s.set_messages_collapsed(self.settings.ui.messages_collapsed);
         s.set_sidebar_width(f32::from(self.settings.ui.sidebar_width.clamp(220, 480)));
-        s.set_messages_height(f32::from(self.settings.ui.messages_height.clamp(100, 480)));
-    }
-
-    /// The Voice/Messages divider was let go: keep the height.
-    pub(super) fn messages_resized(&mut self, height: f32) {
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let height = height.clamp(100.0, 480.0).round() as u16;
-        if height != self.settings.ui.messages_height {
-            self.settings.ui.messages_height = height;
-            self.save_settings();
-        }
+        self.push_view_prefs();
     }
 
     /// The sidebar's edge was let go: keep the width.
@@ -518,14 +522,6 @@ impl AppState {
             self.settings.ui.sidebar_width = width;
             self.save_settings();
         }
-    }
-
-    /// The Messages header's chevron: fold the section or open it,
-    /// and remember which.
-    pub(super) fn toggle_messages(&mut self) {
-        self.settings.ui.messages_collapsed = !self.settings.ui.messages_collapsed;
-        self.save_settings();
-        self.push_ui_prefs();
     }
 
     /// Push-to-talk on or off: tell the engine, and the mic button

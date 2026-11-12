@@ -139,6 +139,7 @@ pub struct UserSettings {
 // A key missing from the file takes its default, not the whole file
 // with it (review 2026-10, P3-43).
 #[serde(default)]
+#[allow(clippy::struct_excessive_bools)] // independent switches, kept as the file has them
 pub struct UiSettings {
     /// Multiplier on every font size in the UI (1.0 = the design size).
     #[serde(default = "default_text_scale")]
@@ -153,18 +154,24 @@ pub struct UiSettings {
     /// cap (`protocol::MAX_CHAT_IMAGE_BYTES`) is the ceiling.
     #[serde(default = "default_image_max_kb")]
     pub image_max_kb: u32,
-    /// The sidebar's Messages section is folded to its header, giving
-    /// the voice channels the room.
-    #[serde(default)]
-    pub messages_collapsed: bool,
     /// The sidebar's width in logical pixels (dragged at its edge).
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: u16,
-    /// The Messages section's height (dragged at its divider).
-    #[serde(default = "default_messages_height")]
-    pub messages_height: u16,
+    /// The columns a wide window shows (1.5; the rail's channel list
+    /// and Chat — Channel view comes with joining a call). The 1.4
+    /// `messages_collapsed` / `messages_height` keys and the 1.5 betas'
+    /// `view_channels` / `view_stage` / `view_panel` an old file
+    /// carries are ignored.
+    #[serde(default = "default_true")]
+    pub view_list: bool,
+    #[serde(default = "default_true")]
+    pub view_chat: bool,
+    /// The right panel's width beside Channel view (dragged at its
+    /// edge).
+    #[serde(default = "default_panel_width")]
+    pub panel_width: u16,
     /// Conversations closed with their ✕ (user ids, hex): they stay
-    /// out of the Messages list across logins until a new message
+    /// out of the DMs list across logins until a new message
     /// arrives or "Message" is picked on that person again.
     #[serde(default)]
     pub hidden_dms: Vec<String>,
@@ -174,8 +181,8 @@ fn default_sidebar_width() -> u16 {
     260
 }
 
-fn default_messages_height() -> u16 {
-    200
+fn default_panel_width() -> u16 {
+    360
 }
 
 impl Default for UiSettings {
@@ -185,9 +192,10 @@ impl Default for UiSettings {
             show_timestamps: true,
             compact_rows: false,
             image_max_kb: default_image_max_kb(),
-            messages_collapsed: false,
             sidebar_width: default_sidebar_width(),
-            messages_height: default_messages_height(),
+            view_list: true,
+            view_chat: true,
+            panel_width: default_panel_width(),
             hidden_dms: Vec::new(),
         }
     }
@@ -538,6 +546,31 @@ impl Default for WindowSettings {
     }
 }
 
+/// Settings → Camera (1.5).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CameraSettings {
+    /// The camera by the name the system gives it; `None` (or one not
+    /// plugged in) is the first.
+    pub device: Option<String>,
+    /// Our own tile shows us as a mirror does. What is sent is never
+    /// mirrored.
+    pub mirror: bool,
+    /// The size to send (`video::Quality::key()` of a camera size,
+    /// "cam720" by default); the camera's own size when smaller.
+    pub quality: String,
+}
+
+impl Default for CameraSettings {
+    fn default() -> Self {
+        Self {
+            device: None,
+            mirror: true,
+            quality: "cam720".to_string(),
+        }
+    }
+}
+
 /// The screen share's settings: Settings → Stream on the desktop
 /// (1.4.0), and what the share dialog and the global share hotkey
 /// start with. The dialog's own picks (quality, monitor, visibility)
@@ -631,6 +664,9 @@ pub struct Settings {
     pub language: Option<String>,
     #[serde(default)]
     pub share: ShareSettings,
+    /// Settings → Camera (1.5).
+    #[serde(default)]
+    pub camera: CameraSettings,
     #[serde(default)]
     pub ui: UiSettings,
     #[serde(default)]
@@ -643,6 +679,26 @@ pub struct Settings {
     pub logging: LoggingSettings,
     #[serde(default)]
     pub notifications: NotificationSettings,
+    /// Settings → General → Privacy (1.5).
+    #[serde(default)]
+    pub privacy: PrivacySettings,
+}
+
+/// What this app tells servers about itself.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PrivacySettings {
+    /// Send telemetry — the link, the devices, the encoders, the camera
+    /// model — to servers that ask for it. Off, none leaves.
+    pub send_telemetry: bool,
+}
+
+impl Default for PrivacySettings {
+    fn default() -> Self {
+        Self {
+            send_telemetry: true,
+        }
+    }
 }
 
 /// How much `baucord.log` records (1.1.5). `RUST_LOG` in the
@@ -711,12 +767,14 @@ impl Default for Settings {
             peer_settings: HashMap::new(),
             language: None,
             share: ShareSettings::default(),
+            camera: CameraSettings::default(),
             ui: UiSettings::default(),
             profile: ProfileSettings::default(),
             startup: StartupSettings::default(),
             sounds: SoundSettings::default(),
             logging: LoggingSettings::default(),
             notifications: NotificationSettings::default(),
+            privacy: PrivacySettings::default(),
         }
     }
 }
@@ -1149,6 +1207,14 @@ pub fn avatar_path() -> PathBuf {
 #[must_use]
 pub fn avatar_cache_dir() -> PathBuf {
     config_base_dir().join("avatar-cache")
+}
+
+/// Where a large download (a recording, 1.5) is written while it
+/// arrives, before it moves into Downloads: `downloads-partial/` next
+/// to the settings. Emptied at startup.
+#[must_use]
+pub fn partial_downloads_dir() -> PathBuf {
+    config_base_dir().join("downloads-partial")
 }
 
 /// Delete the avatar cache's folder up to 1.2.1, `avatars/`: every

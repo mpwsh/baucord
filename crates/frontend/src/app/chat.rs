@@ -291,6 +291,10 @@ impl AppState {
         {
             self.session.transfers.picture_acks.insert(client_ref, png);
         }
+        if let Some(user) = upload.conv {
+            self.note_dm_line(user, &upload.name, true);
+            self.rebuild_dms_model();
+        }
         let conv = match upload.conv {
             None => client::ConvRef::General,
             Some(user) => client::ConvRef::Dm(user),
@@ -339,7 +343,7 @@ impl AppState {
     }
 
     /// The file is in Downloads, or could not be written.
-    fn download_saved(
+    pub(super) fn download_saved(
         &mut self,
         blob_id: [u8; 32],
         name: &str,
@@ -534,6 +538,11 @@ impl AppState {
             return;
         }
         let conv = self.session.chat.active_dm;
+        // A recording goes to disk as it comes (1.5).
+        if self.is_recording(&file.blob) {
+            self.save_recording(file.blob, conv, msg_id);
+            return;
+        }
         self.session.transfers.pending_downloads.insert(
             file.blob,
             PendingDownload {
@@ -688,6 +697,7 @@ impl AppState {
         s.set_confirm_open(false);
         match self.session.chat.pending_confirm.take() {
             Some(Confirm::ClearChat) => self.clear_chat(),
+            Some(Confirm::StopRecording { channel_id }) => self.stop_recording(channel_id),
             Some(Confirm::DeleteMessage { msg_id, by_admin }) => {
                 if by_admin {
                     self.send_admin(AdminCommand::DeleteMessage { msg_id }, PendingAdmin::Show);

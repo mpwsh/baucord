@@ -384,6 +384,8 @@ pub enum NetworkMessage {
         /// The server takes blocks, reports and account deletion
         /// (1.2, `features::SAFETY`): the UI offers them only then.
         safety: bool,
+        /// The server relays cameras (1.5, `features::CAMERA`).
+        cameras: bool,
     },
     /// The server presented `fingerprint`. `first_use` when we had no
     /// pin for this server (trust on first use): the app stores it on
@@ -696,6 +698,73 @@ pub enum NetworkMessage {
         blob_id: protocol::BlobId,
         data: Vec<u8>,
     },
+
+    // ── 1.5: the channel timer, recordings, large files, cameras ─────
+    /// A channel's timer: running for `running_ms` as of now, or empty.
+    ChannelClock {
+        channel_id: u16,
+        running_ms: Option<u64>,
+    },
+    RecordingStarted {
+        channel_id: u16,
+        rec_id: u64,
+        elapsed_ms: u64,
+        by_name: String,
+    },
+    RecordingStopped {
+        channel_id: u16,
+        rec_id: u64,
+        duration_ms: u64,
+        reason: protocol::recording::RecordingStopReason,
+        by_name: Option<String>,
+    },
+    RecordingDenied {
+        channel_id: u16,
+        reason: protocol::recording::RecordingDenyReason,
+    },
+    /// A recording we were in, from Server.
+    RecordingReady {
+        item: protocol::recording::RecordingItem,
+    },
+    /// Our recordings, newest first.
+    Recordings {
+        items: Vec<protocol::recording::RecordingItem>,
+        more: bool,
+    },
+    /// A streamed download moved (`DownloadBlob`), 0–100.
+    DownloadProgress {
+        blob_id: protocol::BlobId,
+        pct: u8,
+    },
+    /// Every byte is on disk at `path` and it is the file asked for.
+    DownloadDone {
+        blob_id: protocol::BlobId,
+        path: std::path::PathBuf,
+    },
+    /// The download failed: missing on the server, a write error, or
+    /// bytes that do not hash to the file.
+    DownloadFailed {
+        blob_id: protocol::BlobId,
+    },
+    CameraStarted {
+        client_id: ClientId,
+        width: u16,
+        height: u16,
+    },
+    CameraStopped {
+        client_id: ClientId,
+    },
+    CameraDenied {
+        target_id: Option<ClientId>,
+        reason: protocol::DenyReason,
+    },
+    /// A viewer of our camera asked for a keyframe.
+    CameraKeyframeRequested,
+    /// How our camera's viewers are doing, once a second while it is on.
+    CameraHealth {
+        worst_loss: f32,
+        viewers: u16,
+    },
     BlobMissing {
         blob_id: protocol::BlobId,
     },
@@ -722,6 +791,10 @@ pub enum NetworkMessage {
     /// replay on join).
     Conversations {
         dms: Vec<protocol::DmSummary>,
+    },
+    /// The newest line of each, for the Messages inbox (1.5).
+    ConversationPreviews {
+        previews: Vec<protocol::DmPreview>,
     },
 
     // ── 1.2: blocks, reports, deleting one's account ─────────────────
@@ -1055,6 +1128,8 @@ pub(crate) struct NetworkClient {
     incoming_images: RelayedImages,
     /// Blobs being fetched, keyed by hash (spec §7).
     incoming_blobs: HashMap<[u8; 32], Reassembly>,
+    /// Streamed downloads being written (1.5).
+    downloads: crate::downloads::Downloads,
     /// The stream each of those arrives on, to stop it if the user
     /// cancels (`Driver::stop_media`, review 2026-10 P3-44).
     blob_streams: HashMap<[u8; 32], transport::MediaStream>,
@@ -1086,6 +1161,8 @@ pub(crate) struct NetworkClient {
     telemetry_baseline: Option<LinkStats>,
     /// Telemetry negotiated with the server.
     telemetry_enabled: bool,
+    /// The server takes the 1.5 telemetry events (`features::CAMERA`).
+    camera_events: bool,
     last_telemetry: Instant,
     /// When a telemetry sample last went out (`QUIET_TELEMETRY_INTERVAL`).
     last_telemetry_sent: Option<Instant>,
@@ -1095,6 +1172,8 @@ pub(crate) struct NetworkClient {
     /// before the first keyframe, or after a reset). Logged once per
     /// episode.
     video_no_group: bool,
+    /// The same for our camera's track (1.5).
+    camera_no_group: bool,
     /// Keyframe requests we sent per sharer (viewing telemetry).
     keyframe_requests_sent: HashMap<ClientId, u64>,
     /// `DatagramsBlocked` reports (telemetry).
@@ -1190,6 +1269,7 @@ impl NetworkClient {
             upload_pct: HashMap::new(),
             incoming_images: RelayedImages::default(),
             incoming_blobs: HashMap::new(),
+            downloads: crate::downloads::Downloads::default(),
             blob_streams: HashMap::new(),
             pending_blobs: HashMap::new(),
             preparing: HashSet::new(),
@@ -1201,11 +1281,13 @@ impl NetworkClient {
             stats_baseline: None,
             telemetry_baseline: None,
             telemetry_enabled: false,
+            camera_events: false,
             last_telemetry: now,
             last_telemetry_sent: None,
             telemetry: TelemetryInputs::default(),
             last_log_upload: None,
             video_no_group: false,
+            camera_no_group: false,
             keyframe_requests_sent: HashMap::new(),
             datagrams_blocked: 0,
             backlog: false,
@@ -1285,7 +1367,7 @@ impl NetworkClient {
     /// socket is polled every [`BUSY_TICK`].
     pub fn loop_wait(&mut self, now: Instant) -> Duration {
         let mut due = self.last_stats_check + NETWORK_STATS_INTERVAL;
-        if self.telemetry_enabled && self.phase == Phase::Admitted {
+        if self.telemetry_enabled && telemetry_allowed() && self.phase == Phase::Admitted {
             due = due.min(self.last_telemetry + TELEMETRY_INTERVAL);
         }
         if let Some(deadline) = self.driver.next_deadline() {
@@ -1588,6 +1670,7 @@ impl NetworkClient {
     #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     fn maybe_send_telemetry(&mut self, now: Instant) {
         if !self.telemetry_enabled
+            || !telemetry_allowed()
             || self.phase != Phase::Admitted
             || now.duration_since(self.last_telemetry) < TELEMETRY_INTERVAL
         {
@@ -1644,7 +1727,16 @@ impl NetworkClient {
 
     /// Send a telemetry event now (a handful per session).
     pub fn send_event(&mut self, now: Instant, event: TelemetryEvent) {
-        if self.telemetry_enabled && self.phase == Phase::Admitted {
+        // An older server cannot read the 1.5 events: it would drop the
+        // message as undecodable and log it.
+        let camera = matches!(
+            event,
+            TelemetryEvent::CameraStarted { .. } | TelemetryEvent::CameraStopped
+        );
+        if camera && !self.camera_events {
+            return;
+        }
+        if self.telemetry_enabled && telemetry_allowed() && self.phase == Phase::Admitted {
             self.send_control(now, &ClientMessage::TelemetryEvent(event));
         }
     }
@@ -1709,6 +1801,10 @@ impl NetworkClient {
                     features::negotiate(features::CLIENT_1_0, server_features),
                     features::TELEMETRY,
                 );
+                self.camera_events = features::has(
+                    features::negotiate(features::CLIENT_1_1, server_features),
+                    features::CAMERA,
+                );
                 self.last_telemetry = now;
                 self.last_report = now;
                 self.quiet_reports = features::has(
@@ -1734,6 +1830,7 @@ impl NetworkClient {
                 self.message_queue.push(NetworkMessage::Connected {
                     lobby: features::has(server_features, features::LOBBY),
                     safety: features::has(server_features, features::SAFETY),
+                    cameras: features::has(server_features, features::CAMERA),
                 });
             }
             ServerMessage::Refused { reason } => {
@@ -2231,6 +2328,10 @@ impl NetworkClient {
                 self.message_queue
                     .push(NetworkMessage::Conversations { dms });
             }
+            ServerMessage::ConversationPreviews { previews } => {
+                self.message_queue
+                    .push(NetworkMessage::ConversationPreviews { previews });
+            }
             ServerMessage::Blocks { users } => {
                 self.message_queue.push(NetworkMessage::Blocks { users });
             }
@@ -2270,6 +2371,107 @@ impl NetworkClient {
                     }
                 }
                 self.message_queue.push(NetworkMessage::Authors { authors });
+            }
+            // ── 1.5 ─────────────────────────────────────────────────
+            ServerMessage::ChannelClock {
+                channel_id,
+                running_ms,
+            } => {
+                self.message_queue.push(NetworkMessage::ChannelClock {
+                    channel_id,
+                    running_ms,
+                });
+            }
+            ServerMessage::RecordingStarted {
+                channel_id,
+                rec_id,
+                elapsed_ms,
+                by_name,
+                ..
+            } => {
+                info!("Recording #{rec_id} in channel {channel_id} (by {by_name})");
+                self.message_queue.push(NetworkMessage::RecordingStarted {
+                    channel_id,
+                    rec_id,
+                    elapsed_ms,
+                    by_name,
+                });
+            }
+            ServerMessage::RecordingStopped {
+                channel_id,
+                rec_id,
+                duration_ms,
+                reason,
+                by_name,
+            } => {
+                info!("Recording #{rec_id} ended ({})", reason.describe());
+                self.message_queue.push(NetworkMessage::RecordingStopped {
+                    channel_id,
+                    rec_id,
+                    duration_ms,
+                    reason,
+                    by_name,
+                });
+            }
+            ServerMessage::RecordingDenied { channel_id, reason } => {
+                info!("Recording refused: {}", reason.describe());
+                self.message_queue
+                    .push(NetworkMessage::RecordingDenied { channel_id, reason });
+            }
+            ServerMessage::RecordingReady { item } => {
+                self.message_queue
+                    .push(NetworkMessage::RecordingReady { item });
+            }
+            ServerMessage::Recordings { items, more } => {
+                self.message_queue
+                    .push(NetworkMessage::Recordings { items, more });
+            }
+            ServerMessage::BlobPart {
+                blob_id,
+                offset,
+                total: _,
+                data,
+            } => self.accept_blob_part(blob_id, offset, &data),
+            ServerMessage::CameraStarted {
+                client_id,
+                width,
+                height,
+            } => {
+                self.message_queue.push(NetworkMessage::CameraStarted {
+                    client_id,
+                    width,
+                    height,
+                });
+            }
+            ServerMessage::CameraStopped { client_id } => {
+                self.reassembler
+                    .forget_sender(client_id | protocol::recording::CAMERA_TRACK_BIT);
+                self.message_queue
+                    .push(NetworkMessage::CameraStopped { client_id });
+            }
+            ServerMessage::CameraDenied { target_id, reason } => {
+                info!("Camera refused: {}", reason.describe());
+                self.message_queue
+                    .push(NetworkMessage::CameraDenied { target_id, reason });
+            }
+            // For our camera: to the UI, which hands them to the camera
+            // thread (one a second at most, and a keyframe now and then:
+            // the hop costs nothing that matters).
+            ServerMessage::CameraKeyframeRequested { viewer_id } => {
+                debug!("camera keyframe asked by {viewer_id:#x}");
+                self.message_queue
+                    .push(NetworkMessage::CameraKeyframeRequested);
+            }
+            ServerMessage::CameraHealth {
+                worst_loss,
+                viewers,
+                ..
+            } => {
+                self.message_queue
+                    .push(NetworkMessage::CameraHealth {
+                        worst_loss,
+                        viewers,
+                    });
             } // No catch-all: the match is exhaustive on purpose, so a
               // new ServerMessage variant is a compile error here (a
               // reminder to handle it) instead of a silent log line.
@@ -2321,12 +2523,20 @@ impl NetworkClient {
                     log::debug!("video group from {track:#x} reset by the relay (we were behind)");
                     // The relay gave up on that group; a keyframe is
                     // what gets us back in.
-                    self.send_request_keyframe(now, track);
+                    if track & protocol::recording::CAMERA_TRACK_BIT == 0 {
+                        self.send_request_keyframe(now, track);
+                    } else {
+                        let target_id = track & !protocol::recording::CAMERA_TRACK_BIT;
+                        self.send_control(now, &ClientMessage::RequestCameraKeyframe { target_id });
+                    }
                 }
                 VideoItem::Chunk(message) => {
                     let Some((sender_id, chunk)) = split_sender(&message) else {
                         continue;
                     };
+                    // A camera is a stream of its own: its id carries
+                    // the camera bit from here to the decoder (1.5).
+                    let sender_id = sender_id | (track & protocol::recording::CAMERA_TRACK_BIT);
                     if let Some(frame) = self.reassembler.push_chunk(sender_id, chunk) {
                         self.message_queue.push(Hot::VideoFrame {
                             client_id: frame.sender_id,
@@ -2539,6 +2749,74 @@ impl NetworkClient {
     fn forget_incoming_blob(&mut self, blob_id: &[u8; 32]) {
         self.incoming_blobs.remove(blob_id);
         self.blob_streams.remove(blob_id);
+    }
+
+    /// Start a streamed download (1.5).
+    fn begin_download(&mut self, now: Instant, blob_id: [u8; 32], size: u64, path: &std::path::Path) {
+        match crate::downloads::Download::create(path, size) {
+            Ok(d) => {
+                self.downloads.running.insert(blob_id, d);
+                self.send_control(now, &ClientMessage::FetchBlobFrom { blob_id, offset: 0 });
+            }
+            Err(e) => {
+                warn!("Download not started: {e}");
+                self.message_queue
+                    .push(NetworkMessage::DownloadFailed { blob_id });
+            }
+        }
+    }
+
+    /// One part of a streamed download; the last one starts the check.
+    fn accept_blob_part(&mut self, blob_id: [u8; 32], offset: u64, data: &[u8]) {
+        let Some(d) = self.downloads.running.get_mut(&blob_id) else {
+            return;
+        };
+        match d.write(offset, data) {
+            Ok(Some(pct)) => self
+                .message_queue
+                .push(NetworkMessage::DownloadProgress { blob_id, pct }),
+            Ok(None) => {}
+            Err(e) => {
+                warn!("Download write failed: {e}");
+                self.downloads.running.remove(&blob_id);
+                self.message_queue
+                    .push(NetworkMessage::DownloadFailed { blob_id });
+                return;
+            }
+        }
+        if !self
+            .downloads
+            .running
+            .get(&blob_id)
+            .is_some_and(crate::downloads::Download::complete)
+        {
+            return;
+        }
+        let Some(d) = self.downloads.running.remove(&blob_id) else {
+            return;
+        };
+        let path = match d.finish() {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("Download not closed: {e}");
+                self.message_queue
+                    .push(NetworkMessage::DownloadFailed { blob_id });
+                return;
+            }
+        };
+        let Some(tx) = self.self_tx.clone() else {
+            return;
+        };
+        let spawned = thread::Builder::new()
+            .name("download-check".into())
+            .spawn(move || {
+                let ok = crate::downloads::check(&path, &blob_id);
+                tx.send(NetworkControl::DownloadChecked { blob_id, path, ok }).ok();
+            });
+        if spawned.is_err() {
+            self.message_queue
+                .push(NetworkMessage::DownloadFailed { blob_id });
+        }
     }
 
     fn accept_blob_chunk(
@@ -2918,6 +3196,53 @@ impl NetworkClient {
         }
     }
 
+    /// One encoded frame of our camera, on its own uplink track (1.5):
+    /// as [`Self::send_video_frame`], with its own group state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_camera_frame(
+        &mut self,
+        now: Instant,
+        seq: u32,
+        is_keyframe: bool,
+        width: u16,
+        height: u16,
+        timestamp_ms: u32,
+        data: &[u8],
+    ) {
+        let track = protocol::recording::CAMERA_UPLINK_TRACK;
+        if is_keyframe {
+            self.driver.video_new_group(now, self.server, track);
+        }
+        if !self.driver.video_group_open(self.server, track) {
+            self.camera_no_group = true;
+            return;
+        }
+        if std::mem::take(&mut self.camera_no_group) {
+            debug!("Camera resumed at keyframe seq={seq}");
+        }
+        match pack_video_frame(seq, is_keyframe, width, height, timestamp_ms, data) {
+            Some(chunks) => {
+                for chunk in chunks {
+                    let _ = self.driver.send_video(now, self.server, track, &chunk);
+                }
+            }
+            None => warn!("Camera frame seq={seq} not packable ({} bytes), dropping", data.len()),
+        }
+    }
+
+    /// Our camera on: the room is told its size (frames follow).
+    pub fn send_camera_start(&mut self, now: Instant, width: u16, height: u16) {
+        self.camera_no_group = false;
+        self.send_control(now, &ClientMessage::CameraStart { width, height });
+    }
+
+    /// Our camera off: close its group cleanly, then tell the room.
+    pub fn send_camera_stop(&mut self, now: Instant) {
+        self.driver
+            .video_finish_group(now, self.server, protocol::recording::CAMERA_UPLINK_TRACK);
+        self.send_control(now, &ClientMessage::CameraStop);
+    }
+
     /// Stop sharing: close the open group cleanly, then tell the room.
     pub fn send_screen_share_stop(&mut self, now: Instant) {
         self.driver.video_finish_group(now, self.server, OWN_TRACK);
@@ -2938,7 +3263,19 @@ impl NetworkClient {
     /// behind chat or presence traffic.
     pub fn send_request_keyframe(&mut self, now: Instant, target_id: u64) {
         *self.keyframe_requests_sent.entry(target_id).or_insert(0) += 1;
-        self.send_control(now, &ClientMessage::RequestKeyframe { target_id });
+        // A camera's stream id carries the camera bit: its keyframe is
+        // asked for through the camera's own gate.
+        let bit = protocol::recording::CAMERA_TRACK_BIT;
+        if target_id & bit == 0 {
+            self.send_control(now, &ClientMessage::RequestKeyframe { target_id });
+        } else {
+            self.send_control(
+                now,
+                &ClientMessage::RequestCameraKeyframe {
+                    target_id: target_id & !bit,
+                },
+            );
+        }
     }
 
     /// What the session produced this pass. The caller drains it and
@@ -3068,6 +3405,25 @@ pub enum NetworkControl {
     CancelFetch {
         blob_id: protocol::BlobId,
     },
+    /// Fetch a blob of `size` bytes in streamed parts, written to
+    /// `path` as they come (1.5). Ends in `DownloadDone` or
+    /// `DownloadFailed`.
+    DownloadBlob {
+        blob_id: protocol::BlobId,
+        size: u64,
+        path: std::path::PathBuf,
+    },
+    /// Stop a streamed download; its file is left for the app to
+    /// delete.
+    CancelDownload {
+        blob_id: protocol::BlobId,
+    },
+    /// A download-check worker's verdict (internal).
+    DownloadChecked {
+        blob_id: protocol::BlobId,
+        path: std::path::PathBuf,
+        ok: bool,
+    },
     Disconnect,
     /// Send a message that needs nothing else from the network thread:
     /// an edit, a channel change, an admin command, a block. Each of
@@ -3092,6 +3448,13 @@ pub enum NetworkControl {
     // ── Screen share ────────────────────────────────────────────────
     /// Signal that we stopped sharing.
     ScreenShareStop,
+    /// Our camera's frames flow at this size (1.5).
+    CameraStart {
+        width: u16,
+        height: u16,
+    },
+    /// Our camera closed.
+    CameraStop,
     /// Request a fresh keyframe from the user we're watching
     /// (viewer → server → sharer).
     RequestKeyframe {
@@ -3290,6 +3653,30 @@ fn handle_control(
                 c.blob_prepared(now, prep);
             }
         }
+        NetworkControl::DownloadBlob {
+            blob_id,
+            size,
+            path,
+        } => {
+            if let Some(c) = client {
+                c.begin_download(now, blob_id, size, &path);
+            }
+        }
+        NetworkControl::CancelDownload { blob_id } => {
+            if let Some(c) = client {
+                c.downloads.running.remove(&blob_id);
+            }
+        }
+        NetworkControl::DownloadChecked { blob_id, path, ok } => {
+            let msg = if ok {
+                NetworkMessage::DownloadDone { blob_id, path }
+            } else {
+                warn!("A download did not hash to its file; dropped");
+                NetworkMessage::DownloadFailed { blob_id }
+            };
+            msg_tx.send(msg).ok();
+            wake();
+        }
         NetworkControl::CancelImage { token } => {
             if let Some(c) = client {
                 c.cancel_image(now, token);
@@ -3327,6 +3714,16 @@ fn handle_control(
         }
 
         // ── Screen share controls ───────────────────────────────────
+        NetworkControl::CameraStart { width, height } => {
+            if let Some(c) = client {
+                c.send_camera_start(now, width, height);
+            }
+        }
+        NetworkControl::CameraStop => {
+            if let Some(c) = client {
+                c.send_camera_stop(now);
+            }
+        }
         NetworkControl::ScreenShareStop => {
             if let Some(c) = client {
                 c.send_screen_share_stop(now);
@@ -3372,6 +3769,20 @@ fn handle_control(
         }
     }
     true
+}
+
+/// The user lets this app send telemetry (Settings → General →
+/// Privacy, 1.5): off, no sample and no event leaves, whatever the
+/// server offers. Any thread.
+static TELEMETRY_ALLOWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Allow or stop telemetry to every server, from now on.
+pub fn set_telemetry_allowed(allowed: bool) {
+    TELEMETRY_ALLOWED.store(allowed, Ordering::Relaxed);
+}
+
+fn telemetry_allowed() -> bool {
+    TELEMETRY_ALLOWED.load(Ordering::Relaxed)
 }
 
 /// Whether anyone can see the app (`set_ui_visible`): what only feeds
@@ -3722,6 +4133,15 @@ pub enum MediaOut {
         timestamp_ms: u32,
         data: Vec<u8>,
     },
+    /// An encoded H.264 frame of our camera (1.5), for its own track.
+    CameraFrame {
+        seq: u32,
+        is_keyframe: bool,
+        width: u16,
+        height: u16,
+        timestamp_ms: u32,
+        data: Vec<u8>,
+    },
     /// An Opus stereo system-audio packet for the system audio lane.
     SystemAudio {
         seq: u32,
@@ -3935,6 +4355,14 @@ fn send_media(client: Option<&mut NetworkClient>, media: MediaOut) {
             timestamp_ms,
             data,
         } => c.send_video_frame(now, seq, is_keyframe, width, height, timestamp_ms, &data),
+        MediaOut::CameraFrame {
+            seq,
+            is_keyframe,
+            width,
+            height,
+            timestamp_ms,
+            data,
+        } => c.send_camera_frame(now, seq, is_keyframe, width, height, timestamp_ms, &data),
         MediaOut::SystemAudio {
             seq,
             channels,

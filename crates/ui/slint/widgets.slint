@@ -220,6 +220,8 @@ export component IconBtn inherits Rectangle {
     in property <length> size: 40px;
     in property <length> icon-size: 18px;
     in property <color> idle-color: Theme.text-secondary;
+    /// On a panel of its own at rest (Channel view's back arrow).
+    in property <bool> filled: false;
     callback clicked;
 
     width: size;
@@ -227,7 +229,8 @@ export component IconBtn inherits Rectangle {
     border-radius: Theme.radius-md;
     background:
         active ? (active-danger ? Theme.danger : Theme.accent)
-        : touch.has-hover ? Theme.hover : transparent;
+        : touch.has-hover ? (filled ? Theme.subtle : Theme.hover)
+        : filled ? Theme.bg-tertiary : transparent;
     animate background { duration: 150ms; }
 
     IconDisplay {

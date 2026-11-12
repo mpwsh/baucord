@@ -542,6 +542,31 @@ Store is not decided yet.
   cache; hardware decode on the desktop; hot-reload beyond
   `channels`; channel topics, reserved names, an away toggle
   (PERSISTENCE-SPEC §11 "later").
+- [ ] **CAM-1 [P1][S] Desktop cameras, on real machines.** Sending is
+  written (`video::camera` over nokhwa's Media Foundation,
+  `AVFoundation` and V4L2 backends; the client's `camera` thread;
+  ARCHITECTURE §5) and compiled on Linux only: the Windows and macOS
+  backends have not met a compiler in this repository, and no camera
+  has been opened. Done = DEVICE-CHECKLIST §5a's camera lines hold on
+  each desktop. A camera picker in Settings (today: the first camera)
+  belongs here too. Upstream the two nokhwa macOS fixes (the
+  vendored `set_all`, the inverted format listing) and drop
+  `third_party/nokhwa-bindings-macos`.
+- [ ] **CAM-3 [P1][L] Cameras on the phones.** Per the spec's webcam
+  plan: Camera2 into MediaCodec's input surface on Android,
+  `AVCaptureSession` into a VideoToolbox compression session on the
+  iPhone — both encoders are new (the phones only decode today) — a
+  `video::camera::Camera` backend each, and the rotation in the chunk
+  flags' two reserved bits. Done = a phone's camera seen on a desktop
+  tile and the other way round.
+- [ ] **BLOB-2 [P2][M] Resuming a streamed download** across a
+  reconnect (the server takes `FetchBlobFrom { offset }`; the client
+  starts over today and empties `downloads-partial/` at launch), and
+  saving a recording on the phones straight to the share sheet without
+  a second copy.
+- [ ] **REC-2 [P2][S] Stereo or per-speaker tracks** — a recording is
+  one mono mix today; a multi-track WAV (or a zip of one WAV per
+  speaker) is the next ask from people who edit podcasts.
 - [ ] **PRD-7 The Android 16 predictive-back API** and the mobile
   `.slint` root (ANDROID-SPEC §9) when the shared one stops fitting.
 - [ ] **PRD-8 [P2] Rough edges** (from SESSION-GUIDE's old §6): dialog
@@ -1725,6 +1750,21 @@ One line each; the spec decision named holds the detail.
   video (FFmpeg + x264, GPL-3.0, LEG-1) and keybinds (Accessibility)
   would need VideoToolbox encoding and Input Monitoring first. Not yet
   run on a Mac (DEVICE-CHECKLIST §4.4).
+
+- **2026-11-12 — 1.5: recordings, the channel timer, the places.**
+  REC-1: native server-side recording of a voice channel (permission
+  `record`, the `recorder` role, `/record` and the channel menu, the
+  REC label, `recording.*` settings), one mixed WAV delivered by
+  "Server" to the people in it and nobody else, start and stop in the
+  activity and the audit; CLK-1: the channel timer from first join to
+  last leave; BLOB-1: streamed downloads of any size; NAV-1: the
+  rail (the channel list or Channel view, Chat, Messages) at every width,
+  replacing the Messages section — joining a call opens Channel view,
+  Messages is an inbox with previews (`DM_PREVIEW`) and the
+  conversation, Leave call keeps the connection — "General" renamed
+  Chat, the admin logs moved to the admin panel; CAM-0/CAM-2: cameras on the wire, received on Channel view's
+  tiles and sent from the desktops with a mirrored self-view (checked
+  on devices as CAM-1; the phones are CAM-3). Decisions in PERSISTENCE-SPEC §12.
 
 ## 8. Facts this plan rests on
 

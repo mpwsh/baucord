@@ -3169,6 +3169,44 @@ fn idle_members_are_moved_to_the_afk_channel_where_voice_goes_nowhere() {
 }
 
 #[test]
+fn a_member_watching_a_screen_share_is_not_moved_to_afk() {
+    let mut config = test_config(vec![
+        open_channel("Lobby", true),
+        open_channel("AFK", false),
+    ]);
+    config.user_channels.afk_channel = Some("AFK".to_string());
+    config.user_channels.afk_after_min = 1;
+    let mut w = World::new(config);
+    let mut alice = w.connect_member("alice");
+    let mut bob = w.connect_member("bob");
+    let alice_id = alice.id;
+    alice.send(
+        &mut w,
+        &ClientMessage::ScreenShareStart {
+            width: 1280,
+            height: 720,
+            scope: ShareScope::Channel,
+        },
+    );
+    bob.wait_for(&mut w, &mut [&mut alice], |m| {
+        matches!(m, ServerMessage::ScreenShareStarted { client_id, .. } if *client_id == alice_id)
+            .then_some(())
+    });
+    bob.send(&mut w, &ClientMessage::SubscribeScreen { target_id: alice_id });
+    // Bob says nothing for 93 s, the share on his screen the whole time;
+    // the same idle stretch moves a member who is not watching.
+    for _ in 0..3 {
+        alice.send(&mut w, &ClientMessage::Speaking(true));
+        w.settle(&mut [&mut alice, &mut bob], Duration::from_secs(31));
+    }
+    assert_eq!(w.server().channel_of(bob.id), Some(0));
+    assert!(!bob
+        .inbox
+        .iter()
+        .any(|m| matches!(m, ServerMessage::MovedIdle { .. })));
+}
+
+#[test]
 fn a_refused_connection_is_closed_after_the_verdict() {
     let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
     let mut c = w.open();
@@ -5660,6 +5698,15 @@ fn dms_are_stored_first_wait_for_the_offline_and_count_unread() {
     assert_eq!(list[0].name, "alice");
     assert_eq!(list[0].unread, 2);
     assert_eq!(list[0].last_msg_id, second);
+    // Then the inbox's line for it: alice's newest, not ours.
+    let previews = bob.wait_for(&mut w, &mut [&mut alice], |m| match m {
+        ServerMessage::ConversationPreviews { previews } => Some(previews.clone()),
+        _ => None,
+    });
+    assert_eq!(previews.len(), 1);
+    assert_eq!(previews[0].user_id, alice_user);
+    assert_eq!(previews[0].text, "two");
+    assert!(!previews[0].mine);
     bob.send(
         &mut w,
         &ClientMessage::FetchHistory {
@@ -6793,4 +6840,392 @@ fn a_cli_grant_messages_only_what_changed() {
     assert_eq!(reload_messages(&carol), (vec![alice_id], 0, 0));
     drop(w);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── 1.5: the channel timer, recording, streamed downloads, cameras ─────
+
+/// Pump the world and give the server's other threads (the recorder,
+/// the store) real time to answer, until `pred` matches in `who`'s
+/// inbox or ten real seconds pass.
+fn wait_real<T>(
+    world: &mut World,
+    who: &mut TestClient,
+    others: &mut [&mut TestClient],
+    mut pred: impl FnMut(&ServerMessage) -> Option<T>,
+) -> T {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(found) = who.inbox.iter().find_map(&mut pred) {
+            return found;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out; inbox: {:?}",
+            who.inbox
+        );
+        let mut all: Vec<&mut TestClient> = vec![who];
+        all.extend(others.iter_mut().map(|c| &mut **c));
+        world.settle(&mut all, Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_channel_timer_runs_from_the_first_join_to_the_last_leave() {
+    let mut w = World::new(test_config(vec![
+        open_channel("General", true),
+        open_channel("Games", false),
+    ]));
+    let mut alice = w.connect("alice");
+    alice.wait_for(&mut w, &mut [], |m| match m {
+        ServerMessage::ChannelClock {
+            channel_id: 0,
+            running_ms: Some(0),
+        } => Some(()),
+        _ => None,
+    });
+    w.settle(&mut [&mut alice], Duration::from_secs(3));
+    // A newcomer is told how long it has run, from the server's clock.
+    let mut bob = w.connect_lobby("bob");
+    let ms = bob.wait_for(&mut w, &mut [&mut alice], |m| match m {
+        ServerMessage::ChannelClock {
+            channel_id: 0,
+            running_ms: Some(ms),
+        } => Some(*ms),
+        _ => None,
+    });
+    assert!((3_000..4_000).contains(&ms), "{ms}");
+    // The last one out stops it, and the room it went to starts.
+    alice.inbox.clear();
+    alice.join(&mut w, 1, None);
+    alice.wait_for(&mut w, &mut [&mut bob], |m| match m {
+        ServerMessage::ChannelClock {
+            channel_id: 0,
+            running_ms: None,
+        } => Some(()),
+        _ => None,
+    });
+    alice.wait_for(&mut w, &mut [&mut bob], |m| match m {
+        ServerMessage::ChannelClock {
+            channel_id: 1,
+            running_ms: Some(0),
+        } => Some(()),
+        _ => None,
+    });
+    // An older client is sent none of it.
+    let mut old = w.open();
+    old.features = features::CLIENT_1_1 & !features::CHANNEL_CLOCK;
+    let code = w.guest_code.clone();
+    old.hello(&mut w, "old", Auth::Invite { code });
+    w.settle(&mut [&mut old, &mut alice, &mut bob], Duration::from_secs(1));
+    assert!(!old
+        .inbox
+        .iter()
+        .any(|m| matches!(m, ServerMessage::ChannelClock { .. })));
+}
+
+#[test]
+fn a_recording_reaches_the_people_in_it_and_nobody_else() {
+    let dir = temp_dir("recording");
+    let mut w = World::new(persistent_config(
+        vec![open_channel("General", true), open_channel("Games", false)],
+        &dir,
+    ));
+    let boot = w.bootstrap_code();
+    let mut admin = w.connect_as("mpw", Auth::Invite { code: boot });
+    let mut alice = w.connect_member("alice");
+    let mut guest = w.connect("guest");
+    // Recording needs the permission: a guest is refused.
+    guest.send(&mut w, &ClientMessage::StartRecording { channel_id: 0 });
+    let why = guest.wait_for(&mut w, &mut [&mut admin, &mut alice], |m| match m {
+        ServerMessage::RecordingDenied { reason, .. } => Some(*reason),
+        _ => None,
+    });
+    assert_eq!(why, protocol::recording::RecordingDenyReason::NoPermission);
+    // The guest steps out before it starts.
+    guest.join(&mut w, 1, None);
+    w.settle(&mut [&mut guest, &mut admin, &mut alice], Duration::from_millis(500));
+
+    admin.send(&mut w, &ClientMessage::StartRecording { channel_id: 0 });
+    let rec_id = alice.wait_for(&mut w, &mut [&mut admin, &mut guest], |m| match m {
+        ServerMessage::RecordingStarted {
+            channel_id: 0,
+            rec_id,
+            by_name,
+            ..
+        } if by_name == "mpw" => Some(*rec_id),
+        _ => None,
+    });
+    // Everyone sees the label, the guest in the other room too.
+    guest.wait_for(&mut w, &mut [&mut admin, &mut alice], |m| {
+        matches!(m, ServerMessage::RecordingStarted { channel_id: 0, .. }).then_some(())
+    });
+    // A second start is refused.
+    admin.send(&mut w, &ClientMessage::StartRecording { channel_id: 0 });
+    admin.wait_for(&mut w, &mut [&mut alice, &mut guest], |m| match m {
+        ServerMessage::RecordingDenied {
+            reason: protocol::recording::RecordingDenyReason::AlreadyRecording,
+            ..
+        } => Some(()),
+        _ => None,
+    });
+    // Real speech-like sound: a 440 Hz tone, encoded as the client
+    // encodes, so the file can be checked for it (a silent frame let a
+    // silent recording pass).
+    let mut enc = opus::Encoder::new(48_000, opus::Channels::Mono, opus::Application::Voip)
+        .expect("encoder");
+    let mut opus_buf = vec![0u8; 512];
+    for seq in 0..50u32 {
+        let pcm: Vec<f32> = (0..960)
+            .map(|i| {
+                #[allow(clippy::cast_precision_loss)]
+                let t = (seq * 960 + i) as f32 / 48_000.0;
+                0.4 * (std::f32::consts::TAU * 440.0 * t).sin()
+            })
+            .collect();
+        let n = enc.encode_float(&pcm, &mut opus_buf).expect("encode");
+        let pkt = protocol::pack_voice(seq, seq * 960, &opus_buf[..n]).expect("voice");
+        let now = w.net.now();
+        w.net
+            .driver(alice.node)
+            .send(now, alice.peer, Lane::Voice, &pkt)
+            .expect("send voice");
+        w.settle(
+            &mut [&mut alice, &mut admin, &mut guest],
+            Duration::from_millis(20),
+        );
+    }
+    admin.send(&mut w, &ClientMessage::StopRecording { channel_id: 0 });
+    let (duration_ms, reason) = alice.wait_for(&mut w, &mut [&mut admin, &mut guest], |m| match m {
+        ServerMessage::RecordingStopped {
+            rec_id: id,
+            duration_ms,
+            reason,
+            ..
+        } if *id == rec_id => Some((*duration_ms, *reason)),
+        _ => None,
+    });
+    assert_eq!(reason, protocol::recording::RecordingStopReason::Stopped);
+    assert!(duration_ms >= 1_000, "{duration_ms}");
+
+    // The file comes from Server to the two who were in it.
+    let item = wait_real(&mut w, &mut alice, &mut [&mut admin, &mut guest], |m| match m {
+        ServerMessage::RecordingReady { item } => Some(item.clone()),
+        _ => None,
+    });
+    assert_eq!(item.rec_id, rec_id);
+    assert_eq!(item.channel, "General");
+    assert!(std::path::Path::new(&item.file_name)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("wav")));
+    assert!(!item.seen);
+    // 48 kHz mono 16-bit: 96 bytes a millisecond, plus the header.
+    let expected = 44 + duration_ms * 96;
+    assert!(item.size.abs_diff(expected) <= 96 * 30, "{} vs {expected}", item.size);
+    wait_real(&mut w, &mut admin, &mut [&mut alice, &mut guest], |m| {
+        matches!(m, ServerMessage::RecordingReady { .. }).then_some(())
+    });
+    w.settle(&mut [&mut alice, &mut admin, &mut guest], Duration::from_secs(1));
+    assert!(!guest
+        .inbox
+        .iter()
+        .any(|m| matches!(m, ServerMessage::RecordingReady { .. })));
+
+    // The guest knows the hash and still gets nothing.
+    guest.send(
+        &mut w,
+        &ClientMessage::FetchBlob {
+            blob_id: item.blob_id,
+        },
+    );
+    guest.wait_for(&mut w, &mut [&mut admin, &mut alice], |m| match m {
+        ServerMessage::BlobMissing { blob_id } if *blob_id == item.blob_id => Some(()),
+        _ => None,
+    });
+
+    // Alice downloads it in parts, and it is the file.
+    alice.send(
+        &mut w,
+        &ClientMessage::FetchBlobFrom {
+            blob_id: item.blob_id,
+            offset: 0,
+        },
+    );
+    let mut got = vec![0u8; usize::try_from(item.size).unwrap()];
+    let mut filled = 0usize;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while filled < got.len() {
+        assert!(std::time::Instant::now() < deadline, "download stalled at {filled}");
+        w.settle(&mut [&mut alice, &mut admin, &mut guest], Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(2));
+        for m in alice.inbox.drain(..) {
+            if let ServerMessage::BlobPart {
+                blob_id,
+                offset,
+                total,
+                data,
+            } = m
+                && blob_id == item.blob_id
+            {
+                assert_eq!(total, item.size);
+                let at = usize::try_from(offset).unwrap();
+                got[at..at + data.len()].copy_from_slice(&data);
+                filled += data.len();
+            }
+        }
+    }
+    assert_eq!(transport::sha256::digest(&got), item.blob_id);
+    assert_eq!(&got[0..4], b"RIFF");
+    // And it holds the tone, not silence.
+    let samples: Vec<i16> = got[44..]
+        .chunks_exact(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+        .collect();
+    let peak = samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+    let loud = samples.iter().filter(|s| s.unsigned_abs() > 3_000).count();
+    assert!(
+        peak > 8_000 && loud > 48_000 / 4,
+        "the recording is silent: peak {peak}, {loud} loud samples of {}",
+        samples.len()
+    );
+
+    // Next visit, the list has it; removing it takes it off that list.
+    let key = alice.key.clone();
+    alice.leave(&mut w);
+    let mut alice = w.connect_with_key("alice", Auth::Key, key.clone());
+    let items = wait_real(&mut w, &mut alice, &mut [&mut admin, &mut guest], |m| match m {
+        ServerMessage::Recordings { items, .. } => Some(items.clone()),
+        _ => None,
+    });
+    assert_eq!(items.len(), 1);
+    alice.send(&mut w, &ClientMessage::RemoveRecording { rec_id });
+    w.settle(&mut [&mut alice, &mut admin, &mut guest], Duration::from_secs(1));
+    alice.leave(&mut w);
+    let mut alice = w.connect_with_key("alice", Auth::Key, key);
+    let items = wait_real(&mut w, &mut alice, &mut [&mut admin, &mut guest], |m| match m {
+        ServerMessage::Recordings { items, .. } => Some(items.clone()),
+        _ => None,
+    });
+    assert!(items.is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn recording_waits_for_everyone_to_see_the_label_and_ends_when_the_room_empties() {
+    let dir = temp_dir("recording-old");
+    let mut w = World::new(persistent_config(
+        vec![open_channel("General", true), open_channel("Games", false)],
+        &dir,
+    ));
+    let boot = w.bootstrap_code();
+    let mut admin = w.connect_as("mpw", Auth::Invite { code: boot });
+    let mut old = w.open();
+    old.features = features::CLIENT_1_1 & !features::RECORDING;
+    let code = w.member_code.clone();
+    old.hello(&mut w, "old", Auth::Invite { code });
+    old.wait_for(&mut w, &mut [&mut admin], |m| {
+        matches!(m, ServerMessage::Init { .. }).then_some(())
+    });
+    old.join(&mut w, 0, None);
+    w.settle(&mut [&mut old, &mut admin], Duration::from_millis(500));
+    admin.send(&mut w, &ClientMessage::StartRecording { channel_id: 0 });
+    admin.wait_for(&mut w, &mut [&mut old], |m| match m {
+        ServerMessage::RecordingDenied {
+            reason: protocol::recording::RecordingDenyReason::OldClients,
+            ..
+        } => Some(()),
+        _ => None,
+    });
+    // Once the old client has gone, it starts; and the old client
+    // cannot come back into it.
+    old.join(&mut w, 1, None);
+    w.settle(&mut [&mut old, &mut admin], Duration::from_millis(500));
+    admin.send(&mut w, &ClientMessage::StartRecording { channel_id: 0 });
+    admin.wait_for(&mut w, &mut [&mut old], |m| {
+        matches!(m, ServerMessage::RecordingStarted { channel_id: 0, .. }).then_some(())
+    });
+    old.join(&mut w, 0, None);
+    old.wait_for(&mut w, &mut [&mut admin], |m| match m {
+        ServerMessage::JoinChannelDenied {
+            channel_id: 0,
+            reason: ChannelDenyReason::NotPermitted,
+        } => Some(()),
+        _ => None,
+    });
+    // The last one out ends it.
+    admin.join(&mut w, 1, None);
+    let reason = admin.wait_for(&mut w, &mut [&mut old], |m| match m {
+        ServerMessage::RecordingStopped { reason, .. } => Some(*reason),
+        _ => None,
+    });
+    assert_eq!(reason, protocol::recording::RecordingStopReason::Empty);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_camera_is_seen_by_its_channel_on_a_track_of_its_own() {
+    let mut w = World::new(test_config(vec![
+        open_channel("General", true),
+        open_channel("Games", false),
+    ]));
+    let mut alice = w.connect_member("alice");
+    let mut bob = w.connect_member("bob");
+    let mut carol = w.connect_member("carol");
+    let alice_id = alice.id;
+    carol.join(&mut w, 1, None);
+    w.settle(&mut [&mut alice, &mut bob, &mut carol], Duration::from_millis(500));
+    alice.send(
+        &mut w,
+        &ClientMessage::CameraStart {
+            width: 640,
+            height: 360,
+        },
+    );
+    bob.wait_for(&mut w, &mut [&mut alice, &mut carol], |m| match m {
+        ServerMessage::CameraStarted { client_id, .. } if *client_id == alice_id => Some(()),
+        _ => None,
+    });
+    w.settle(&mut [&mut alice, &mut bob, &mut carol], Duration::from_millis(300));
+    assert!(!carol
+        .inbox
+        .iter()
+        .any(|m| matches!(m, ServerMessage::CameraStarted { .. })));
+    bob.send(&mut w, &ClientMessage::SubscribeCamera { target_id: alice.id });
+    alice.wait_for(&mut w, &mut [&mut bob, &mut carol], |m| {
+        matches!(m, ServerMessage::CameraKeyframeRequested { .. }).then_some(())
+    });
+    // A keyframe on the camera track reaches bob on alice's camera
+    // track, not her screen's.
+    let now = w.net.now();
+    w.net
+        .driver(alice.node)
+        .video_new_group(now, alice.peer, protocol::recording::CAMERA_UPLINK_TRACK);
+    let chunks = protocol::pack_video_frame(0, true, 640, 360, 0, &[7u8; 2000]).unwrap();
+    for c in &chunks {
+        let now = w.net.now();
+        w.net
+            .driver(alice.node)
+            .send_video(now, alice.peer, protocol::recording::CAMERA_UPLINK_TRACK, c)
+            .expect("send");
+    }
+    let mut tracks = Vec::new();
+    let deadline = w.net.now() + Duration::from_secs(2);
+    while w.net.now() < deadline && tracks.len() < chunks.len() {
+        w.settle(&mut [&mut alice, &mut bob, &mut carol], Duration::from_millis(20));
+        while let Some((track, item)) = w.net.driver(bob.node).recv_video(bob.peer) {
+            if matches!(item, VideoItem::Chunk(_)) {
+                tracks.push(track);
+            }
+        }
+    }
+    assert_eq!(tracks.len(), chunks.len());
+    assert!(tracks
+        .iter()
+        .all(|t| *t == alice.id | protocol::recording::CAMERA_TRACK_BIT));
+    // Moving away turns it off for the room.
+    alice.join(&mut w, 1, None);
+    bob.wait_for(&mut w, &mut [&mut alice, &mut carol], |m| match m {
+        ServerMessage::CameraStopped { client_id } if *client_id == alice_id => Some(()),
+        _ => None,
+    });
 }

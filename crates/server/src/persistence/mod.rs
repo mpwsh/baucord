@@ -48,7 +48,8 @@ pub use self::store::{
     cli_lift_restriction, cli_list_invites, cli_load_policy, cli_prune, cli_purge, cli_restrict,
     cli_revoke_invite, cli_role_create, cli_role_delete, cli_role_edit, cli_set_key, cli_set_roles,
     cli_telemetry, hex, parse_hex_id, restore_from_tar, BackupReport, CheckReport, RestoreReport,
-    Retention, RoleEdit, TelemetryLine, GENERAL_CONV, SCHEMA_VERSION,
+    RecordingEnd, RecordingFile, RecordingRow, RecordingState, Retention, RoleEdit, TelemetryLine,
+    GENERAL_CONV, SCHEMA_VERSION,
 };
 use crate::clock::WallMs;
 use crate::config::PersistenceSettings;
@@ -426,6 +427,22 @@ pub enum Command {
         by: Option<UserId>,
         ts: WallMs,
     },
+    // ── 1.5: recordings (migration 8) ────────────────────────────────
+    InsertRecording(store::RecordingRow),
+    /// These users were in a recording: they may fetch it.
+    GrantRecording {
+        rec_id: u64,
+        users: Vec<UserId>,
+    },
+    FinishRecording(Box<store::RecordingEnd>),
+    RemoveRecordingAccess {
+        rec_id: u64,
+        user: UserId,
+    },
+    RecordingsSeen {
+        user: UserId,
+        up_to: u64,
+    },
     /// Several writes that are one event — a first visit is the user,
     /// their key, their role, the invite's use and the audit line —
     /// in one transaction: all of it lands or none of it, and in one
@@ -483,7 +500,12 @@ impl Command {
             | Command::Audit(_)
             | Command::MarkRead { .. }
             | Command::InsertReport(_)
-            | Command::ResolveReport { .. } => false,
+            | Command::ResolveReport { .. }
+            | Command::InsertRecording(_)
+            | Command::GrantRecording { .. }
+            | Command::FinishRecording(_)
+            | Command::RemoveRecordingAccess { .. }
+            | Command::RecordingsSeen { .. } => false,
             Command::Together(parts) => parts.iter().any(Command::changes_policy),
         }
     }
@@ -534,6 +556,18 @@ pub enum Query {
     /// that timed out, whose row may or may not have been written
     /// (review 2026-10, P2-24).
     BlobRefs { blob_id: protocol::BlobId },
+    /// A user's finished recordings, newest first (1.5).
+    Recordings {
+        user: UserId,
+        before: Option<u64>,
+        limit: u16,
+    },
+    /// A piece of a blob, for a streamed download (1.5).
+    BlobRange {
+        blob_id: protocol::BlobId,
+        offset: u64,
+        len: usize,
+    },
 }
 
 /// Which conversation a read or a mark is about (spec §6): the general
@@ -553,12 +587,18 @@ pub enum Answer {
     Stored,
     /// Audit entries with their ids, newest first.
     Audit(Vec<(u64, AuditRow)>),
-    Conversations(Vec<protocol::DmSummary>),
+    /// The DM list, and the newest line of each (1.5).
+    Conversations(Vec<protocol::DmSummary>, Vec<protocol::DmPreview>),
     /// Boxed: a whole message row, where every other answer is small.
     ReportedMessage(Option<Box<ReportedMessage>>),
     Reports(Vec<protocol::ReportSummary>),
     /// A count ([`Query::BlobRefs`]).
     Count(u32),
+    /// A page of recordings, and whether older ones exist.
+    Recordings(Vec<protocol::recording::RecordingItem>, bool),
+    /// A piece of a blob and the blob's whole size; `None` when the
+    /// file is not there.
+    BlobRange(Option<(Vec<u8>, u64)>),
     /// Persistence is off: there is nothing to read.
     Unavailable,
     Failed(String),
@@ -714,6 +754,32 @@ pub struct StartupInfo {
     /// The newest general-chat messages, oldest first: the tick's
     /// replay ring starts from these.
     pub recent: Vec<MessageRow>,
+    /// Recordings (1.5): the next id, and who may fetch which file.
+    pub recordings: store::RecordingState,
+    /// Where finished files go, and where recordings spool; `None`
+    /// with persistence off.
+    pub blobs_dir: Option<PathBuf>,
+    pub spool_dir: Option<PathBuf>,
+}
+
+/// The blob store and the recordings' spool, when there is a store.
+type Folders = (Option<PathBuf>, Option<PathBuf>);
+
+/// Recordings at startup (1.5): those a shutdown or a crash left
+/// without their file are finished first — before file references are
+/// counted — then the state the tick starts from, and the folders.
+fn open_recordings(db: &Sqlite) -> Result<(RecordingState, Folders), PersistError> {
+    match db.repair_recordings()? {
+        0 => {}
+        n => info!("Recordings: {n} finished from their spool files"),
+    }
+    Ok((
+        db.recording_state()?,
+        (
+            Some(db.blobs_path().to_path_buf()),
+            Some(db.spool_path().to_path_buf()),
+        ),
+    ))
 }
 
 // ── The tick's handle ───────────────────────────────────────────────────
@@ -767,9 +833,12 @@ impl Persist {
     /// The database could not be opened or migrated, or the thread
     /// could not be spawned.
     pub fn spawn(settings: &PersistenceSettings) -> Result<(Self, StartupInfo), PersistError> {
+        let (mut recordings, mut dirs): (RecordingState, Folders) = Default::default();
+        recordings.next_rec_id = 1;
         let (db, next_message_id, policy, recent) = if settings.enabled {
             let path = PathBuf::from(settings.path.trim());
             let (db, next) = Sqlite::open(&path)?;
+            (recordings, dirs) = open_recordings(&db)?;
             // Before anything reads the counts: from here on the tick
             // keeps them, and this is the one moment nothing else does.
             match db.recount_blob_refs()? {
@@ -819,6 +888,7 @@ impl Persist {
                         history_days: settings.history.retain_days,
                         telemetry_days: settings.telemetry.retain_days,
                         file_days: settings.files.retain_days,
+                        recording_days: settings.recording_retain_days,
                     },
                     last_checkpoint: now,
                     // First prune right away: a server that restarts
@@ -865,6 +935,9 @@ impl Persist {
                 next_message_id,
                 policy,
                 recent,
+                recordings,
+                blobs_dir: dirs.0,
+                spool_dir: dirs.1,
             },
         ))
     }
@@ -1275,8 +1348,11 @@ impl Worker {
                 Ok(rows) => Answer::Audit(rows),
                 Err(e) => Answer::Failed(e.to_string()),
             },
-            Query::Conversations { user_id } => match db.conversations_of(user_id) {
-                Ok(list) => Answer::Conversations(list),
+            Query::Conversations { user_id } => match db
+                .conversations_of(user_id)
+                .and_then(|list| Ok((list, db.conversation_previews_of(user_id)?)))
+            {
+                Ok((list, previews)) => Answer::Conversations(list, previews),
                 Err(e) => Answer::Failed(e.to_string()),
             },
             Query::MessagesBefore {
@@ -1299,6 +1375,19 @@ impl Worker {
                 Ok(n) => Answer::Count(n),
                 Err(e) => Answer::Failed(e.to_string()),
             },
+            Query::Recordings {
+                user,
+                before,
+                limit,
+            } => match db.recordings_of(user, *before, *limit) {
+                Ok((items, more)) => Answer::Recordings(items, more),
+                Err(e) => Answer::Failed(e.to_string()),
+            },
+            Query::BlobRange {
+                blob_id,
+                offset,
+                len,
+            } => Answer::BlobRange(db.read_blob_range(blob_id, *offset, *len)),
         }
     }
 
@@ -1410,6 +1499,13 @@ impl Worker {
             Command::DeleteBlock { blocker, blocked } => db.delete_block(blocker, blocked),
             Command::InsertReport(row) => db.insert_report(row),
             Command::ResolveReport { id, by, ts } => db.resolve_report(*id, by.as_ref(), *ts),
+            Command::InsertRecording(row) => db.insert_recording(row),
+            Command::GrantRecording { rec_id, users } => db.grant_recording(*rec_id, users),
+            Command::FinishRecording(end) => db.finish_recording(end),
+            Command::RemoveRecordingAccess { rec_id, user } => {
+                db.remove_recording_access(*rec_id, user)
+            }
+            Command::RecordingsSeen { user, up_to } => db.mark_recordings_seen(user, *up_to),
         }
     }
 

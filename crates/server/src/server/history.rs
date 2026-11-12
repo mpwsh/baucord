@@ -273,11 +273,13 @@ impl ChatServer {
             Outcome::Answered(
                 Answer::Blob(_)
                 | Answer::Stored
-                | Answer::Conversations(_)
+                | Answer::Conversations(..)
                 | Answer::Audit(_)
                 | Answer::ReportedMessage(_)
                 | Answer::Reports(_)
-                | Answer::Count(_),
+                | Answer::Count(_)
+                | Answer::Recordings(..)
+                | Answer::BlobRange(_),
             ) => {
                 log::warn!("unexpected answer on a history ask; ignored");
             }

@@ -29,6 +29,7 @@ use std::fmt::Debug;
 
 use protocol::admin::*;
 use protocol::messages::*;
+use protocol::recording::*;
 use protocol::safety::*;
 use serde::de::DeserializeOwned;
 
@@ -162,6 +163,18 @@ const CLIENT_MESSAGE: &[Row] = &[
     ("Unblock", 33, Some((33, 0x5022_502c))),
     ("Report", 6, Some((37, 0x6fa6_6a30))),
     ("DeleteAccount", 1, Some((1, 0x5380_0ba5))),
+    // 1.5
+    ("StartRecording", 2, Some((2, 0x3fd4_0bd6))),
+    ("StopRecording", 2, Some((2, 0x02e2_4428))),
+    ("FetchRecordings", 2, Some((3, 0x3458_6298))),
+    ("RemoveRecording", 2, Some((2, 0xc003_fe39))),
+    ("MarkRecordingsSeen", 2, Some((2, 0x526a_0e21))),
+    ("FetchBlobFrom", 34, Some((34, 0xac3f_b971))),
+    ("CameraStart", 3, Some((3, 0xd5df_0bf3))),
+    ("CameraStop", 1, Some((1, 0x151e_cbc6))),
+    ("SubscribeCamera", 2, Some((2, 0xadd3_e16c))),
+    ("UnsubscribeCamera", 2, Some((2, 0x61f3_f53f))),
+    ("RequestCameraKeyframe", 2, Some((2, 0x2175_71cf))),
 ];
 
 #[rustfmt::skip]
@@ -228,6 +241,20 @@ const SERVER_MESSAGE: &[Row] = &[
     ("ChatFrom", 37, Some((38, 0x0902_53ea))),
     ("Authors", 2, Some((74, 0x8a02_ff18))),
     ("AdminRows", 3, Some((78, 0xf8e7_e989))),
+    // 1.5
+    ("ChannelClock", 3, Some((4, 0xba50_c468))),
+    ("RecordingStarted", 37, Some((38, 0x6e9d_de5a))),
+    ("RecordingStopped", 6, Some((8, 0xc3e5_dd11))),
+    ("RecordingDenied", 3, Some((3, 0x5814_b22c))),
+    ("RecordingReady", 43, Some((46, 0x0b83_f220))),
+    ("Recordings", 3, Some((48, 0xa348_02d2))),
+    ("BlobPart", 36, Some((37, 0xbe64_6f4a))),
+    ("CameraStarted", 4, Some((4, 0xca18_f58c))),
+    ("CameraStopped", 2, Some((2, 0x4538_204b))),
+    ("CameraDenied", 3, Some((4, 0xaa1f_3541))),
+    ("CameraKeyframeRequested", 2, Some((2, 0xd812_33f1))),
+    ("CameraHealth", 10, Some((10, 0x4a61_4542))),
+    ("ConversationPreviews", 2, Some((37, 0x8faf_55f6))),
 ];
 
 #[rustfmt::skip]
@@ -386,6 +413,8 @@ const TELEMETRY_EVENT: &[Row] = &[
     ("ShareStarted", 3, Some((5, 0xd98f_f686))),
     ("ShareStopped", 1, Some((1, 0xe3fb_d351))),
     ("Disconnected", 2, Some((3, 0xfae3_6598))),
+    ("CameraStarted", 4, Some((7, 0x2ac9_6c8b))),
+    ("CameraStopped", 1, Some((1, 0xecf4_67d3))),
 ];
 
 #[rustfmt::skip]
@@ -544,7 +573,37 @@ fn every_wire_enum_keeps_its_variants_where_they_shipped() {
     check_enum::<ReportReason>("ReportReason", REPORT_REASON);
     check_enum::<ReportRefusal>("ReportRefusal", REPORT_REFUSAL);
     check_enum::<DeleteRefusal>("DeleteRefusal", DELETE_REFUSAL);
+    check_enum::<RecordingStopReason>("RecordingStopReason", RECORDING_STOP_REASON);
+    check_enum::<RecordingDenyReason>("RecordingDenyReason", RECORDING_DENY_REASON);
 }
+
+#[rustfmt::skip]
+const RECORDING_STOP_REASON: &[Row] = &[
+    ("Stopped", 1, Some((1, 0x863f_19ee))),
+    ("Empty", 1, Some((1, 0xd157_1f8e))),
+    ("TimeLimit", 1, Some((1, 0x8544_3b17))),
+    ("StorageFull", 1, Some((1, 0xcbc7_66cf))),
+    ("ChannelGone", 1, Some((1, 0x60fd_7b93))),
+    ("ServerRestart", 1, Some((1, 0x971c_5b15))),
+    ("Interrupted", 1, Some((1, 0x04df_3df1))),
+];
+
+#[rustfmt::skip]
+const RECORDING_DENY_REASON: &[Row] = &[
+    ("NoPermission", 1, Some((1, 0x1a57_f57d))),
+    ("NotInChannel", 1, Some((1, 0x8ee2_4274))),
+    ("AlreadyRecording", 1, Some((1, 0xe40b_9c92))),
+    ("NotRecording", 1, Some((1, 0x7135_5d79))),
+    ("Unavailable", 1, Some((1, 0xda4b_aaa9))),
+    ("Busy", 1, Some((1, 0xc3dc_8aa0))),
+    ("StorageFull", 1, Some((1, 0xcbc7_66cf))),
+    ("OldClients", 1, Some((1, 0x2c22_b302))),
+];
+
+#[rustfmt::skip]
+const RECORDING_ITEM: Row = ("RecordingItem", 42, Some((45, 0x81cf_76f5)));
+#[rustfmt::skip]
+const DM_PREVIEW: Row = ("DmPreview", 34, Some((35, 0x7d26_6829)));
 
 #[test]
 fn every_wire_struct_keeps_its_layout() {
@@ -577,6 +636,9 @@ fn every_wire_struct_keeps_its_layout() {
     check_struct::<BlockedUser>(next());
     check_struct::<ReportSummary>(next());
     assert!(rows.next().is_none(), "a row with no struct checked");
+    // 1.5, kept apart from the shipped table.
+    check_struct::<RecordingItem>(&RECORDING_ITEM);
+    check_struct::<DmPreview>(&DM_PREVIEW);
 }
 
 /// The server sends a message only to a session that announced the

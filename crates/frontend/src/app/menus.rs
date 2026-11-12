@@ -119,7 +119,9 @@ impl AppState {
                 owned: channel.owned,
                 from_config: channel.from_config,
             };
-            let entries = menu::channel_menu(&session, &facts);
+            let mut entries =
+                menu::recording_entries(channel.id, row.can_record, row.can_stop_recording);
+            entries.extend(menu::channel_menu(&session, &facts));
             self.show_menu(entries, MenuTarget::Channel(facts.id), x, y);
         } else {
             let channel_id = u16::try_from(row.channel_id).unwrap_or(0);
@@ -241,11 +243,11 @@ impl AppState {
         };
         let msg_id = roster::join_id(row.msg_id_lo, row.msg_id_hi);
         // Someone else's stored message, in General or a DM (not the
-        // admin channel's lines): reportable, its author blockable.
+        // Server conversation's): reportable, its author blockable.
         let reportable = self.session.safety.on
             && !row.own
             && !row.pending
-            && self.session.chat.active_dm != Some(ADMIN_CHANNEL_KEY)
+            && self.session.chat.active_dm != Some(SERVER_CONV_KEY)
             && self
                 .author_of_message(msg_id)
                 .is_some_and(|(author, _)| Some(author) != self.session.our_user_id);
@@ -268,7 +270,15 @@ impl AppState {
             msg_id,
             body: row.body.to_string(),
         };
-        self.show_menu(menu::message_menu(&facts), target, x, y);
+        let mut entries = menu::message_menu(&facts);
+        // A recording from Server (1.5): off this user's list.
+        if self.session.chat.active_dm == Some(SERVER_CONV_KEY)
+            && kind == menu::MessageKind::File
+            && !row.deleted
+        {
+            entries.push(menu::recording_remove_entry());
+        }
+        self.show_menu(entries, target, x, y);
     }
 
     /// Open the overlay with `entries` for `target` at window
@@ -342,6 +352,8 @@ impl AppState {
                 }
             }
             (MenuTarget::Channel(id), A::ChannelEdit(_)) => self.channel_edit(id),
+            (MenuTarget::Channel(_), A::RecordingStart(id)) => self.start_recording(id),
+            (MenuTarget::Channel(_), A::RecordingStop(id)) => self.ask_stop_recording(id),
             (MenuTarget::Channel(id), A::ChannelDelete(_)) => self.channel_delete(id),
             (MenuTarget::Message { body, .. }, A::CopyText) => {
                 crate::clipboard::set_clipboard_text(&body);
@@ -363,6 +375,11 @@ impl AppState {
                 media::copy_image(self, row_id);
             }
             (MenuTarget::Message { row_id, .. }, A::SaveFile) => self.file_save(row_id),
+            (MenuTarget::Message { row_id, .. }, A::RecordingRemove) => {
+                if let Some(blob) = self.file_blob_of_row(row_id) {
+                    self.remove_recording(blob);
+                }
+            }
             (MenuTarget::Message { msg_id, body, .. }, A::ReportMessage) => {
                 self.report_message(msg_id, &body);
             }

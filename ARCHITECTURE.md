@@ -131,7 +131,8 @@ message fails there, which no round-trip test can catch.
   peers fail the TLS handshake and the client shows `OUTDATED_MESSAGE`.
 - Additive capability → a bit in `protocol::features`, offered in
   `Hello`, announced in `Welcome`, `negotiate()`d to the intersection.
-  Bits run up to `ADMIN_PAGES` (19) in 1.2.1; every appended variant
+  Bits run up to `ADMIN_PAGES` (19) in 1.2.1 and `CAMERA` (23) in 1.5
+  (`CHANNEL_CLOCK` 20, `RECORDING` 21, `LARGE_BLOBS` 22); every appended variant
   gets a new one, since a client that negotiated an older bit cannot
   decode it (PERSISTENCE-SPEC §12). The server enforces this in one
   place: `send_msg` drops a message whose `required_feature()` the
@@ -248,7 +249,11 @@ there are no watermarks.
 A viewer can watch several sharers, so outgoing groups are keyed by a
 `Track` (`u64`): the relay uses the sharer's `ClientId`, a sharer uses
 `OWN_TRACK = 0`. The track rides in the stream header and the receiver
-keeps per-track order.
+keeps per-track order. A camera (1.5) goes up on
+`CAMERA_UPLINK_TRACK = 1` and comes down on `sender | CAMERA_TRACK_BIT`
+(bit 63): peer ids never use the top bit (`fresh_peer_id` masks it), so
+a receiver tells a camera from a screen by that bit alone and keys the
+camera's stream by the same id all the way to the screen.
 
 ### Media pacing
 
@@ -435,6 +440,97 @@ members to the default, share visibility is re-derived with
 exactly-once `ScreenShareStarted/Stopped` corrections. Validation
 (`validate_channel_list`) rejects a bad list before anything changes.
 
+### Timers, recordings and cameras (1.5)
+
+- **The channel timer** (`server/clocks.rs`, bit `CHANNEL_CLOCK`): how
+  long a voice channel has had someone in it, from the first join into
+  an empty channel to the last leave; not the lobby or AFK. Kept by
+  channel *name* (what a renumbering list change keeps) and never
+  persisted. The server sends `ChannelClock { running_ms }` on each
+  edge and at connect; the client counts on from its own monotonic
+  clock, so neither side's wall clock matters, and one 1 s UI timer
+  runs only while a timer is shown.
+- **Recording** (`server/recording.rs`, `recorder/`, bit `RECORDING`,
+  permission `RECORD`, role `recorder` seeded by migration 8). The tick
+  decides: who may start (`start_refusal`: recording enabled on a
+  persistent server, the permission, being in the channel and not the
+  lobby or AFK, none running there, `recording.max_concurrent`, the
+  `total_cap_gb` storage cap, every member's client having the bit),
+  announces `RecordingStarted` to the channel's clients, refuses a join
+  by a client without the bit while it runs, and writes a
+  `recording_access` row for everyone placed in the channel while it
+  runs — so the participants survive a crash. A client sends its
+  microphone while its room records even when nobody else is in it
+  (`sync_voice_room`; otherwise it sends only with company, and a
+  recording made alone came back silent). The relay copies each
+  voice datagram it forwards in a recording channel (`tapped`, a
+  `Bytes` clone) to the `recorder` thread on a bounded queue (8,192; a
+  full queue drops and counts — voice is never delayed). That thread
+  starts with the first recording and blocks on its queues. It decodes
+  each speaker (libopus, the RED/FEC/PLC repair the client uses),
+  reorders within 400 ms, anchors each talk spurt to its arrival time,
+  corrects drift by ±60 ms, mixes with a soft limiter at −1 dBFS
+  (`recorder/mix.rs`) and writes a 16-bit WAV spool in `recordings/`
+  beside `blobs/`, patching the header as it goes
+  (`recorder/wav.rs`). At the end it hashes the file and moves it into
+  `blobs/` as an ordinary blob (`audio/wav`); the tick writes the row's
+  end (the audit has `recording.start` and `recording.stop`, and the
+  activity line goes to everyone), and sends `RecordingReady`
+  to each participant online — delivery is a pseudo-conversation,
+  "Server", in the client's DMs. A stop comes from the REC label, the
+  menu, `/record stop`, the room emptying, `recording.max_minutes`, the
+  storage cap or a failed write, the channel going, or shutdown. Shutdown parks a running
+  recording (its row is closed with the reason, the spool keeps its
+  bytes) and the next start finishes the file (`repair_recordings`).
+  Recording files hold a reference while their row exists, so the
+  general file retention never takes them; `recording.retain_days`
+  prunes the rows (0 keeps them for good). A recording's bytes are
+  served to its participants alone (`may_fetch`, also on `FetchBlob`).
+- **Streamed downloads** (`server/downloads.rs`, bit `LARGE_BLOBS`):
+  `FetchBlobFrom { blob_id, offset }` answers with `BlobPart`s of one
+  256 KiB piece at a time, read by the persistence thread
+  (`Query::BlobRange`) and sent on a paced Media stream; the next piece
+  is read once that stream is handed to QUIC, so a download of any size
+  holds one piece in memory. The client (`client/src/downloads.rs`)
+  writes each part at its offset into `downloads-partial/` (emptied at
+  launch), checks the SHA-256 on a `download-check` thread and moves the
+  file into Downloads.
+- **Cameras** (`server/cameras.rs`, bit `CAMERA`, permission `CAMERA`,
+  members and up): a second `VideoRelay` whose viewer tracks carry
+  `CAMERA_TRACK_BIT`, channel-scoped, capped by
+  `limits.max_cameras_per_channel` (12). A move or a return to the
+  lobby turns a camera off. The client watches the cameras of its
+  channel while Channel view is on screen and routes their frames to
+  the tiles. The desktops send one: `video::camera` opens the device
+  (nokhwa's Media Foundation, `AVFoundation` and V4L2 backends; YUYV,
+  NV12 and MJPEG turned into RGBA here), and the client's `camera`
+  thread — asleep until the button is pressed, then paced by the
+  device; `video::camera` picks the device's format itself from what
+  it lists (`choose_format`: a rate of 24 fps or more, the smallest
+  size at least as tall as asked, 16:9, then the cheapest pixels),
+  because nokhwa's `Closest` wants the exact size and pixel format it
+  is given; the best few are tried in turn. On macOS nokhwa 0.10's
+  listing is inverted (each pixel format lists the *others'* sizes),
+  so `mac_formats` reads every size another way and offers each as
+  YUYV, which `AVFoundation` converts to; and its `set_all` paired one
+  format of a size with another's frame rate, which throws — fixed in
+  a vendored copy (`third_party/nokhwa-bindings-macos`,
+  `BAUCORD-PATCH.md`) — encodes it on the share's encoder at the size Settings →
+  Camera asks (`Quality::CAMERA`: 1080p at ~3 Mbit/s, 720p — the
+  default — at ~1.7, 480p at ~0.85, all 30 fps; 240p only for a
+  camera with no more), never above what the device delivers. Three
+  lossy `CameraHealth` reports step it down one size, never below
+  480p (`CAMERA_FLOOR`); fifteen clean ones step it back up. The
+  frames go to the network thread for track 1. The server is told the size (`CameraStart`) once the
+  first frame is encoded; the self-view is a copy of up to 640×360 on
+  our tile, mirrored unless Settings → Camera says
+  not. That tab's preview is the same thread without the encoder; its
+  quality list is what the camera reports (`CameraControl::Probe`,
+  `Quality::camera_choices`); its picker names the camera, kept by the
+  system's name
+  (`settings.camera`). The phones' capture and
+  encoders are still to come (PRODUCTION-PLAN CAM-3).
+
 ### Profiles and blobs (`server/profiles.rs`)
 
 A profile (spec §7.1: name color, name style, avatar hash) lives on
@@ -544,7 +640,9 @@ every session with that reason and flushes pending telemetry; pumps
 the transport for up to 500 ms so the close frames leave; then calls
 `finish_shutdown()`, which has the persistence thread write what is
 queued and exit, waiting at most 6 s for it (one deadline for the
-whole wait); and exits 0. The close frames go first so that a slow
+whole wait); and exits 0. Recordings running at that moment are parked
+first and the recorder thread is given 3 s to patch their spool headers
+(the next start makes the files). The close frames go first so that a slow
 database never holds them past Docker's 10 s stop timeout (review
 P2-5). The reason string is a wire contract with the client
 (`SERVER_RESTART_REASON`).
@@ -597,6 +695,12 @@ P2-5). The reason string is a wire contract with the client
   parked **yuv-band-N** converters; in `audio`, each open device's
   worker and **sysaudio-procloop** (Windows: a share's sound, the
   system mix minus what our own process plays).
+- **camera** (`camera.rs`, 1.5) — asleep on its control channel until
+  the camera button; then opens the device (it belongs to this
+  thread), waits on each picture, encodes it and hands it to the
+  network thread on the shared bounded media channel
+  (`MediaOut::CameraFrame`, track 1). The self-view is a newest-only
+  slot the UI takes on its next pass.
 
 The loop in `run_network_loop` selects on the control channel, the
 voice encoder's packets and the inbound wake (a `ReadWaiter` thread
@@ -691,7 +795,12 @@ threads last reported through `TelemetryAudio/Sharing/Viewing`. A quiet
 interval — no share, nothing watched, under 2 kbit/s either way — is
 skipped, one a minute still going (review 2026-10, P3-40).
 Notable moments (`ShareStarted`, `SendBufferPressure`, …) go
-immediately as `TelemetryEvent`.
+immediately as `TelemetryEvent`. The camera's model and mode go as
+`CameraStarted` / `CameraStopped` (1.5), only to a server with
+`CAMERA`, which is the one that reads them. Settings → General →
+Privacy can turn all of it off (`network::set_telemetry_allowed`, a
+process-wide switch read before every sample and event, set before
+the first connection).
 
 ### Settings (`config.rs`)
 
@@ -776,8 +885,55 @@ and `handle_network_message`, which is exhaustive over
 `NetworkMessage`; the compiler will tell you where to add an arm),
 `commands`, `presence`, `session`, `menus`, `devices`,
 `conversations`, `chat`, `activity`, `profiles`, `safety`, `stats`,
-`alerts` — each a child of `app` so nothing private had to open up;
-new methods go in the child that owns the concern.
+`alerts`, `live` (channel timers, recordings, the Server conversation)
+and `views` (the places, Channel view, cameras) — each a child of
+`app` so nothing private had to open up; new methods go in the child
+that owns the concern.
+
+The main screen (1.5) is laid out from a rail down the left of the
+window at every width (`Rail`, with the admin panel and Settings at its
+foot). Its first two buttons pick the main column (`State.view-main`):
+the channel list or, in a call, Channel view — either one, the one
+showing hidden by a second press while the chat is there to take the
+room. Chat shows or hides the chat (`view-chat`); with no main column
+the chat shows. Channel view takes the room the chat leaves, beside the
+list the chat does, and the strips between drag the list's and the
+chat's widths. A window too narrow for two (`MainWindow.narrow`) shows
+one: the main column if any, else the chat, Chat swapping them
+(`last_main` remembers which to come back to). `ui.view_list` (a main
+column or none) and `ui.view_chat` are kept; joining a channel
+ourselves, or leaving the lobby, puts Channel view up (`joined_voice`),
+its back arrow swaps it for the list (`stage_back`), and the chat's
+arrow hides the chat (`chat_back`). Messages (`view-messages`) is the
+window's other mode: an inbox and the conversation picked in it, the
+whole window: each row has the person, the newest
+line and its time (the server sends those lines after its list, as
+`ConversationPreviews`, feature bit `DM_PREVIEW`; live ones replace
+them), and a search over the names hides rows rather than removing
+them, so a row's index stays its place in `dm_order`. Any DM coming on
+screen — the inbox, a menu's Message, `/dm`, a notice — takes the
+window there (`panel_follows`), and leaving it puts the server's chat
+back in the pane. A DM is drawn as bubbles, ours on the right. On a
+narrow window a conversation from the inbox slides in over the page.
+Channel view's tiles are built from the roster's
+own rows of our channel (`rebuild_stage`, with every roster rebuild; a
+speaking edge rewrites one tile), so the look, the menu and the
+speaking light are the roster's. `Logic.stage-shown` reports whether
+it can be seen, and the cameras of our channel are watched only while
+it can: their frames (stream id with `CAMERA_TRACK_BIT`) go from the
+present-prep thread to the tile instead of a viewer window. The call's
+buttons are one set (`controls.slint`) that the channel list's control
+bar, Channel view's bar (ending in Leave call) and the inbox's call
+bar are built from. **Leave call** moves us to the lobby
+(`hang_up`: a `JoinChannel` for the lobby's id), still connected and
+unseen; from the lobby the button is Disconnect. The sidebar's old
+Messages section and the "Admin logs" conversation are gone, and the
+audit lives in the admin panel's Audit tab, which takes `AuditLine`s
+live while it is open. "General" is called Chat. The windows draw
+in Inter (`crates/ui/fonts`, imported by `main.slint` and embedded by
+the build; `default-font-family` on each window), subset with
+`pyftsubset` to the scripts the app shows, unhinted, so every
+platform renders the same type.
 
 Some of that work is held to what can be seen or used. The roster model
 is rebuilt at most once per event-loop pass and only while the main
@@ -803,8 +959,9 @@ thread while any is open), `gallery-decode` (the picture viewer's full
 size), `avatar-decode` (§6), `picture-load` (a picked, pasted or
 dropped picture read, decoded and shrunk for sending, EXIF orientation
 applied and its metadata dropped), `file-read` (a file to send, P2-6),
-`save-download` and `cache-cleanup` (the old `avatars/` folder, once a
-launch). Their results come back through `slint::invoke_from_event_loop`
+`save-download`, `download-check` (a streamed download's SHA-256, 1.5)
+and `cache-cleanup` (the old `avatars/` folder and any
+`downloads-partial/` left by a quit, once a launch). Their results come back through `slint::invoke_from_event_loop`
 as pixels; the `slint::Image` is made on the UI thread.
 
 `main.rs` sets up file logging — `baucord.log` in the config folder,

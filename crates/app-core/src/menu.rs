@@ -14,6 +14,11 @@ use crate::roster::Role;
 /// What an entry says. The shell maps each to its localized string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Label {
+    /// Voice channel recording (1.5).
+    RecordingStart,
+    RecordingStop,
+    /// A recording's card in the Server conversation: off my list.
+    RecordingRemove,
     ChannelConfigOwned,
     ChannelEdit,
     ChannelDelete,
@@ -70,6 +75,11 @@ pub enum Label {
 pub enum Action {
     /// Informational or submenu header: nothing to do.
     None,
+    /// Start or stop the channel's recording (1.5).
+    RecordingStart(u16),
+    RecordingStop(u16),
+    /// Take a recording off this user's list.
+    RecordingRemove,
     ChannelEdit(u16),
     ChannelDelete(u16),
     /// The volume slider row: drawn inline, adjusted live; never a
@@ -387,6 +397,30 @@ pub fn channel_menu(session: &Session, channel: &ChannelFacts) -> Vec<Entry> {
     ]
 }
 
+/// A recording card's own entry in the Server conversation (1.5):
+/// take it off this user's list (the file stays for the others in it).
+#[must_use]
+pub fn recording_remove_entry() -> Entry {
+    Entry::new(Label::RecordingRemove, Action::RecordingRemove)
+        .danger()
+        .with_separator()
+}
+
+/// A channel row's recording entries (1.5), put ahead of the rest of
+/// its menu: start where we may and it is not recording, stop where we
+/// may and it is.
+#[must_use]
+pub fn recording_entries(channel_id: u16, can_start: bool, can_stop: bool) -> Vec<Entry> {
+    let mut out = Vec::new();
+    if can_start {
+        out.push(Entry::new(Label::RecordingStart, Action::RecordingStart(channel_id)));
+    }
+    if can_stop {
+        out.push(Entry::new(Label::RecordingStop, Action::RecordingStop(channel_id)).danger());
+    }
+    out
+}
+
 /// What kind of chat row a menu is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageKind {
@@ -522,6 +556,16 @@ mod tests {
 
     fn labels(entries: &[Entry]) -> Vec<Label> {
         entries.iter().map(|e| e.label.clone()).collect()
+    }
+
+    #[test]
+    fn recording_entries_follow_what_may_be_done() {
+        assert!(recording_entries(3, false, false).is_empty());
+        let start = recording_entries(3, true, false);
+        assert_eq!(start.len(), 1);
+        assert_eq!(start[0].action, Action::RecordingStart(3));
+        let stop = recording_entries(3, false, true);
+        assert_eq!(stop[0].action, Action::RecordingStop(3));
     }
 
     #[test]

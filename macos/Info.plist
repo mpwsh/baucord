@@ -36,6 +36,8 @@
 	<string>11.0</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>baucord uses the camera when you turn it on in a voice channel.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>© 0x0 Studios</string>
 	<key>NSLocalNetworkUsageDescription</key>

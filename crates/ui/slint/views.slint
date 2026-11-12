@@ -1,0 +1,739 @@
+// views.slint — the rail, the Messages inbox and Channel view (1.5).
+//
+// A rail down the left of the window, at every width: the channel
+// list or Channel view (our channel as a grid of tiles, in a call) as
+// the main column, Chat (the server's one text room) beside it or
+// not, or Messages (an inbox and the conversation picked in it). The
+// host keeps the state (`State.view-*`) and decides what a press does
+// (`Logic.view-picked`).
+
+import { ScrollView } from "std-widgets.slint";
+import { Icon, IconSet, IconDisplay } from "@lucide";
+import { Theme } from "theme.slint";
+import { Tr } from "tr.slint";
+import { State, Logic, StageTile } from "globals.slint";
+import { IconBtn, AvatarTile, Tip, RoleGlyph, Field } from "widgets.slint";
+import { StageControls, MicBtn, DeafenBtn, HangUpBtn, SettingsBtn, AdminBtn } from "controls.slint";
+
+/// A count on a corner, cobalt.
+component CornerCount inherits Rectangle {
+    in property <int> count;
+    in property <brush> rim: Theme.surface;
+    width: Math.max(self.height, n.preferred-width + 8px);
+    height: 16px;
+    border-radius: 8px;
+    background: Theme.accent;
+    border-width: 2px;
+    border-color: root.rim;
+    n := Text {
+        text: root.count > 99 ? "99+" : root.count;
+        color: Theme.on-accent;
+        font-size: 9px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+/// One place on the rail: an icon in a 44 px square, tinted when it is
+/// the place on screen; an unread count or a green dot (in a call
+/// elsewhere) on its corner; its name as the tip.
+component RailButton inherits Rectangle {
+    in property <Icon> icon;
+    in property <string> text;
+    in property <bool> active;
+    in property <int> badge: 0;
+    in property <bool> dot: false;
+    in property <bool> enabled: true;
+    callback clicked;
+    width: 44px;
+    height: 44px;
+    border-radius: Theme.radius-md;
+    background: root.active ? Theme.accent.with-alpha(0.25)
+        : t.has-hover && root.enabled ? Theme.hover : transparent;
+    animate background { duration: 120ms; }
+    opacity: root.enabled ? 1 : 0.4;
+    IconDisplay {
+        icon: root.icon;
+        size: 22px;
+        stroke: root.active ? Theme.accent-text
+            : t.has-hover ? Theme.text-primary : Theme.text-secondary;
+    }
+    if root.badge > 0 : CornerCount {
+        x: parent.width - self.width + 2px;
+        y: 2px;
+        count: root.badge;
+    }
+    if root.dot && root.badge == 0 : Rectangle {
+        x: parent.width - 16px;
+        y: parent.height - 16px;
+        width: 12px;
+        height: 12px;
+        border-radius: 6px;
+        background: Theme.success;
+        border-width: 2px;
+        border-color: Theme.surface;
+    }
+    t := TouchArea {
+        mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
+        clicked => {
+            Tip.hide(root.text);
+            if (root.enabled) { root.clicked(); }
+        }
+        changed has-hover => {
+            if (self.has-hover) {
+                Tip.show(root.text, root.absolute-position.x, root.absolute-position.y,
+                    root.width, root.height, true);
+            } else {
+                Tip.hide(root.text);
+            }
+        }
+    }
+}
+
+/// The rail: the channel list or Channel view (in a call) as the main
+/// column, lit while it shows; Chat, shown or hidden; Messages, the
+/// window's other mode; then the admin panel (for whoever may open it)
+/// and Settings at the foot.
+export component Rail inherits Rectangle {
+    /// What shows (main.slint works it out, the fallback included).
+    in property <bool> list-on;
+    in property <bool> stage-on;
+    in property <bool> chat-on;
+    width: 64px;
+    background: Theme.surface;
+    property <bool> in-call: State.stage-name != "";
+    VerticalLayout {
+        padding-top: 12px;
+        padding-bottom: 12px;
+        spacing: 8px;
+        alignment: start;
+        HorizontalLayout {
+            alignment: center;
+            RailButton {
+                icon: IconSet.List;
+                text: Tr.view-list;
+                active: !State.view-messages && root.list-on;
+                clicked => { Logic.view-picked(0); }
+            }
+        }
+        HorizontalLayout {
+            alignment: center;
+            RailButton {
+                icon: IconSet.LayoutGrid;
+                text: root.in-call ? Tr.view-stage : Tr.view-stage-none;
+                active: !State.view-messages && root.stage-on;
+                enabled: root.in-call;
+                // In a call while it does not show: the way back says so.
+                dot: root.in-call && (State.view-messages || !root.stage-on);
+                clicked => { Logic.view-picked(1); }
+            }
+        }
+        HorizontalLayout {
+            alignment: center;
+            RailButton {
+                icon: IconSet.Hash;
+                text: Tr.view-chat;
+                active: !State.view-messages && root.chat-on;
+                badge: !State.view-messages && root.chat-on ? 0 : State.general-unread;
+                clicked => { Logic.view-picked(2); }
+            }
+        }
+        // The rail's other mode, set apart.
+        HorizontalLayout {
+            alignment: center;
+            Rectangle {
+                width: 28px;
+                height: 1px;
+                background: Theme.bg-tertiary;
+            }
+        }
+        HorizontalLayout {
+            alignment: center;
+            RailButton {
+                icon: IconSet.MessagesSquare;
+                text: Tr.view-dms;
+                active: State.view-messages;
+                badge: State.dm-unread-total;
+                clicked => { Logic.view-picked(3); }
+            }
+        }
+    }
+    VerticalLayout {
+        padding-bottom: 12px;
+        spacing: 8px;
+        alignment: end;
+        if State.perm-panel : HorizontalLayout {
+            alignment: center;
+            AdminBtn { size: 44px; icon-size: 22px; }
+        }
+        HorizontalLayout {
+            alignment: center;
+            SettingsBtn { size: 44px; icon-size: 22px; }
+        }
+    }
+    // The edge against the page beside it.
+    Rectangle {
+        x: parent.width - 1px;
+        width: 1px;
+        background: Theme.bg-tertiary;
+    }
+}
+
+/// The REC label: a bordered chip in the danger colour. For someone
+/// who may stop the recording, it is the stop (the host asks first).
+export component RecChip inherits Rectangle {
+    in property <bool> can-stop;
+    in property <string> tip;
+    in property <int> channel-id;
+    width: rec-t.preferred-width + 10px;
+    height: 16px;
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: Theme.danger;
+    background: ta.has-hover && root.can-stop ? Theme.danger.with-alpha(0.2) : transparent;
+    rec-t := Text {
+        text: Tr.rec-label;
+        color: Theme.danger-text;
+        font-size: 10px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    // Who started it and for how long; with the power to end it, how.
+    property <string> shown-tip: root.can-stop ? root.tip + "\n" + Tr.recording-stop : root.tip;
+    ta := TouchArea {
+        mouse-cursor: root.can-stop ? MouseCursor.pointer : MouseCursor.default;
+        clicked => {
+            if (root.can-stop) {
+                Tip.hide(root.shown-tip);
+                Logic.channel-stop-recording(root.channel-id);
+            }
+        }
+        changed has-hover => {
+            if (self.has-hover && root.tip != "") {
+                Tip.show(root.shown-tip, root.absolute-position.x, root.absolute-position.y,
+                    root.width, root.height, true);
+            } else {
+                Tip.hide(root.shown-tip);
+            }
+        }
+    }
+}
+
+/// The call, from the inbox: where it is and for how long, and the
+/// controls a call cannot do without. The words go back to it.
+component CallBar inherits Rectangle {
+    property <length> btn: State.touch-host ? 44px : 36px;
+    height: self.btn + 16px;
+    border-radius: Theme.radius-md;
+    background: Theme.bg-primary;
+    HorizontalLayout {
+        padding: 8px;
+        padding-left: 12px;
+        spacing: 4px;
+        where := VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            Text {
+                text: Tr.in-a-call;
+                color: Theme.success;
+                font-size: Theme.font-sm;
+                font-weight: 600;
+                overflow: elide;
+            }
+            Text {
+                text: State.stage-timer != "" ? State.stage-name + " · " + State.stage-timer : State.stage-name;
+                color: Theme.text-muted;
+                font-size: Theme.font-sm;
+                overflow: elide;
+            }
+        }
+        MicBtn { size: root.btn; }
+        DeafenBtn { size: root.btn; }
+        HangUpBtn { size: root.btn; }
+    }
+    TouchArea {
+        x: 0;
+        width: where.width + 12px;
+        mouse-cursor: pointer;
+        clicked => { Logic.view-picked(1); }
+    }
+}
+
+/// Messages: the inbox. Each conversation with its person, the newest
+/// line and its time, and how many wait unread; a search over the
+/// names; the call's bar at the foot while in one. The conversation
+/// itself is the chat pane's (wide: beside this; narrow: sliding in).
+export component Inbox inherits Rectangle {
+    in property <bool> narrow: false;
+    background: Theme.bg-secondary;
+    property <length> pic: root.narrow ? 50px : 44px;
+    VerticalLayout {
+        padding-top: 16px;
+        padding-bottom: 8px;
+        spacing: 10px;
+        VerticalLayout {
+            padding-left: 16px;
+            padding-right: 16px;
+            spacing: 12px;
+            vertical-stretch: 0;
+            // Back to the channels and the chat, as Messages on the
+            // rail does a second time.
+            HorizontalLayout {
+                spacing: 8px;
+                IconBtn {
+                    size: 32px;
+                    icon-size: 18px;
+                    icon: IconSet.ArrowLeft;
+                    idle-color: Theme.text-primary;
+                    tooltip: Tr.inbox-back;
+                    tooltip-below: true;
+                    clicked => { Logic.view-picked(3); }
+                }
+                Text {
+                    text: Tr.view-dms;
+                    color: Theme.text-primary;
+                    font-size: root.narrow ? 20px : 18px;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                }
+            }
+            Rectangle {
+                height: State.touch-host ? 44px : 36px;
+                Field {
+                    height: parent.height;
+                    placeholder: Tr.inbox-search;
+                    text <=> State.dm-filter;
+                    edited => { Logic.dm-filter-changed(); }
+                }
+                Rectangle {
+                    x: parent.width - 30px;
+                    width: 20px;
+                    IconDisplay {
+                        icon: IconSet.Search;
+                        size: 15px;
+                        stroke: Theme.text-muted;
+                    }
+                }
+            }
+        }
+        if State.dms.length == 0 : Text {
+            x: 16px;
+            width: parent.width - 32px;
+            text: Tr.dm-list-empty;
+            color: Theme.text-muted;
+            font-size: Theme.font-sm;
+            wrap: word-wrap;
+        }
+        ScrollView {
+            vertical-stretch: 1;
+            mouse-drag-pan-enabled: State.touch-host;
+            VerticalLayout {
+                alignment: start;
+                padding-left: 8px;
+                padding-right: 8px;
+                for dm[i] in State.dms : row := Rectangle {
+                    // Hidden by the search: no height, nothing drawn.
+                    height: dm.shown ? root.pic + 20px : 0px;
+                    visible: dm.shown;
+                    border-radius: Theme.radius-md;
+                    background: dm.active ? Theme.accent.with-alpha(0.2)
+                        : dm-t.has-hover ? Theme.hover : transparent;
+                    animate background { duration: 120ms; }
+                    // The ✕ sits where the time is, under the pointer.
+                    property <bool> on-close: dm-t.has-hover && !dm.admin
+                        && dm-t.mouse-x > dm-t.width - 32px && dm-t.mouse-y < dm-t.height / 2;
+                    dm-t := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            if (row.on-close) {
+                                Logic.dm-closed(i);
+                            } else {
+                                Logic.dm-clicked(i);
+                            }
+                        }
+                    }
+                    HorizontalLayout {
+                        padding: 10px;
+                        spacing: 12px;
+                        Rectangle {
+                            width: root.pic;
+                            if !dm.admin : AvatarTile {
+                                y: (parent.height - self.height) / 2;
+                                source: dm.avatar;
+                                has-image: dm.has-avatar;
+                                initial: dm.initial;
+                                tint: dm.tile-tint;
+                                side: root.pic;
+                                corner: root.pic / 2;
+                                ring: false;
+                                ring-room: false;
+                            }
+                            // Online: a green dot on the picture.
+                            if !dm.admin && dm.online : Rectangle {
+                                x: root.pic - 13px;
+                                y: (parent.height + root.pic) / 2 - 13px;
+                                width: 14px;
+                                height: 14px;
+                                border-radius: 7px;
+                                background: Theme.success;
+                                border-width: 3px;
+                                border-color: row.background == transparent ? Theme.bg-secondary : Theme.hover;
+                            }
+                            // Server: not a person.
+                            if dm.admin : Rectangle {
+                                y: (parent.height - self.height) / 2;
+                                width: root.pic;
+                                height: root.pic;
+                                border-radius: 12px;
+                                background: Theme.border;
+                                IconDisplay {
+                                    icon: IconSet.Server;
+                                    size: 22px;
+                                    stroke: Theme.text-primary;
+                                }
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 2px;
+                            horizontal-stretch: 1;
+                            HorizontalLayout {
+                                spacing: 6px;
+                                Text {
+                                    text: dm.name;
+                                    color: Theme.text-primary;
+                                    font-size: root.narrow ? Theme.font-lg : Theme.font-md;
+                                    font-weight: dm.unread > 0 ? 700 : 600;
+                                    overflow: elide;
+                                    horizontal-stretch: 1;
+                                }
+                                if !(dm-t.has-hover && !dm.admin && !State.touch-host) : Text {
+                                    text: dm.when;
+                                    color: dm.unread > 0 ? Theme.accent-text : Theme.text-muted;
+                                    font-size: Theme.font-xs;
+                                    vertical-alignment: center;
+                                }
+                                if dm-t.has-hover && !dm.admin && !State.touch-host : Rectangle {
+                                    width: 20px;
+                                    height: 20px;
+                                    border-radius: Theme.radius-sm;
+                                    background: row.on-close ? Theme.subtle : transparent;
+                                    IconDisplay {
+                                        icon: IconSet.X;
+                                        size: 12px;
+                                        stroke: Theme.text-secondary;
+                                    }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                Text {
+                                    text: dm.preview != "" ? dm.preview : dm.status;
+                                    color: dm.unread > 0 ? Theme.text-primary : Theme.text-secondary;
+                                    font-size: root.narrow ? Theme.font-md : Theme.font-body;
+                                    overflow: elide;
+                                    horizontal-stretch: 1;
+                                }
+                                if dm.unread > 0 : Rectangle {
+                                    width: Math.max(self.height, badge.preferred-width + 10px);
+                                    height: 18px;
+                                    y: (parent.height - self.height) / 2;
+                                    border-radius: 9px;
+                                    background: Theme.accent;
+                                    badge := Text {
+                                        text: dm.unread > 99 ? "99+" : dm.unread;
+                                        color: Theme.on-accent;
+                                        font-size: Theme.font-xs;
+                                        font-weight: 700;
+                                        vertical-alignment: center;
+                                        horizontal-alignment: center;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if State.stage-name != "" : HorizontalLayout {
+            padding-left: 8px;
+            padding-right: 8px;
+            vertical-stretch: 0;
+            CallBar { }
+        }
+    }
+}
+
+/// Messages with no conversation picked (wide): what to do.
+export component InboxEmpty inherits Rectangle {
+    background: Theme.bg-primary;
+    VerticalLayout {
+        alignment: center;
+        spacing: 12px;
+        HorizontalLayout {
+            alignment: center;
+            IconDisplay {
+                icon: IconSet.MessagesSquare;
+                size: 40px;
+                stroke: Theme.text-muted;
+            }
+        }
+        Text {
+            text: Tr.dm-pick;
+            color: Theme.text-muted;
+            font-size: Theme.font-md;
+            horizontal-alignment: center;
+        }
+    }
+}
+
+/// One person in Channel view: their camera, or their picture on a
+/// tinted ground, the speaking ring, their name and marks.
+component Tile inherits Rectangle {
+    in property <StageTile> tile;
+    border-radius: Theme.radius-lg;
+    background: tile.camera ? #000000 : tile.tile-tint.darker(0.35);
+    clip: true;
+    border-width: tile.speaking ? 3px : 1px;
+    border-color: tile.speaking ? Theme.success : Theme.border;
+    animate border-color { duration: 120ms; }
+    // Our own camera arrives mirrored already (the self-view).
+    if tile.camera : Image {
+        width: parent.width;
+        height: parent.height;
+        source: tile.frame;
+        image-fit: cover;
+    }
+    // A picture: the whole of it, over a dimmed copy that fills the
+    // tile's sides (no circle in a big square).
+    if !tile.camera && tile.has-avatar : Image {
+        width: parent.width;
+        height: parent.height;
+        source: tile.avatar;
+        image-fit: cover;
+        opacity: 0.25;
+    }
+    if !tile.camera && tile.has-avatar : Image {
+        width: parent.width;
+        height: parent.height;
+        source: tile.avatar;
+        image-fit: contain;
+    }
+    if !tile.camera && !tile.has-avatar : AvatarTile {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2 - 8px;
+        side: Math.min(parent.width, parent.height) * 0.42;
+        corner: self.side / 2;
+        source: tile.avatar;
+        has-image: false;
+        initial: tile.initial;
+        tint: tile.tile-tint;
+        ring: false;
+        ring-room: false;
+    }
+    // Name and marks, bottom left: the name, the role's glyph, the
+    // level; the progress to the next level runs under them.
+    Rectangle {
+        x: 8px;
+        y: parent.height - self.height - 10px;
+        width: Math.min(parent.width - 16px, name-row.preferred-width + 12px);
+        height: 22px;
+        border-radius: 6px;
+        background: #000000A0;
+        name-row := HorizontalLayout {
+            padding-left: 6px;
+            padding-right: 6px;
+            spacing: 4px;
+            Text {
+                text: tile.name;
+                color: tile.has-name-color ? tile.name-color : #FFFFFF;
+                font-size: Theme.font-sm;
+                font-weight: 600;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            if tile.role-icon != "" : RoleGlyph {
+                name: tile.role-icon;
+                size: 13px;
+                stroke: tile.has-role-color ? tile.role-color : #FFFFFFC0;
+            }
+            if tile.role-icon == "" && (tile.role == 1 || tile.role == 3 || tile.role == 4) : Rectangle {
+                width: 13px;
+                IconDisplay {
+                    icon: tile.role == 4 ? IconSet.Shield
+                        : tile.role == 3 ? IconSet.Wrench
+                        : IconSet.CircleDashed;
+                    size: 13px;
+                    stroke: tile.role == 4 ? Theme.admin : #FFFFFFC0;
+                }
+            }
+            if tile.level-short != "" : Text {
+                text: tile.level-short;
+                color: #FFFFFFB0;
+                font-size: Theme.font-xs;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+            if tile.self-deafened || tile.self-muted : Rectangle {
+                width: 13px;
+                IconDisplay {
+                    icon: tile.self-deafened ? IconSet.HeadphoneOff : IconSet.MicOff;
+                    size: 13px;
+                    stroke: #FFFFFFC0;
+                }
+            }
+        }
+    }
+    // The progress to the next level: a thin bar along the bottom.
+    if tile.xp-pct >= 0 : Rectangle {
+        x: 0;
+        y: parent.height - 4px;
+        width: parent.width;
+        height: 4px;
+        background: #00000080;
+        Rectangle {
+            x: 0;
+            width: parent.width * Math.clamp(tile.xp-pct, 0, 100) / 100;
+            background: Theme.accent-text;
+        }
+    }
+    if tile.sharing : Rectangle {
+        x: parent.width - self.width - 8px;
+        y: 8px;
+        width: live.preferred-width + 12px;
+        height: 18px;
+        border-radius: 9px;
+        background: Theme.danger;
+        live := Text {
+            text: Tr.live;
+            color: Theme.on-accent;
+            font-size: Theme.font-xs;
+            font-weight: 700;
+        }
+    }
+    ta := TouchArea {
+        pointer-event(ev) => {
+            if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
+                Logic.tile-context(tile.index,
+                    ta.absolute-position.x + ta.mouse-x, ta.absolute-position.y + ta.mouse-y);
+            }
+        }
+        clicked => {
+            if (!tile.is-us) {
+                Logic.tile-context(tile.index,
+                    ta.absolute-position.x + ta.mouse-x, ta.absolute-position.y + ta.mouse-y);
+            }
+        }
+    }
+}
+
+/// Channel view: our channel's header — the way back to the list, its
+/// name, REC and timer — a grid of its people, 16:9 tiles sharing the
+/// stage evenly in the fewest columns that keep every tile on screen,
+/// and the call's bar under them.
+export component Stage inherits Rectangle {
+    in property <bool> narrow: false;
+    background: Theme.bg-primary;
+    property <int> n: State.stage-tiles.length;
+    property <length> gap: 10px;
+    property <length> grid-w: grid.width;
+    property <length> grid-h: grid.height;
+    pure function tile-w(c: int) -> length {
+        return (root.grid-w - (c - 1) * root.gap) / c;
+    }
+    pure function rows(c: int) -> int {
+        return Math.ceil(root.n / c);
+    }
+    pure function fits(c: int) -> bool {
+        return root.rows(c) * root.tile-w(c) * 9 / 16 + (root.rows(c) - 1) * root.gap <= root.grid-h;
+    }
+    property <int> cols: root.n <= 1 ? 1 : root.fits(1) ? 1 : root.fits(2) ? 2
+        : root.fits(3) ? 3 : root.fits(4) ? 4 : root.fits(5) ? 5 : root.narrow ? 2 : 6;
+    // The tile's width: as wide as a column allows, and no taller than
+    // the rows allow.
+    property <length> tw: Math.min(root.tile-w(root.cols),
+        ((root.grid-h - (root.rows(root.cols) - 1) * root.gap) / Math.max(1, root.rows(root.cols))) * 16 / 9);
+    property <length> th: root.tw * 9 / 16;
+    property <length> used-w: root.cols * root.tw + (root.cols - 1) * root.gap;
+    property <length> used-h: root.rows(root.cols) * root.th + (root.rows(root.cols) - 1) * root.gap;
+
+    VerticalLayout {
+        padding-top: root.narrow ? 12px : 16px;
+        padding-left: root.narrow ? 12px : 20px;
+        padding-right: root.narrow ? 12px : 20px;
+        padding-bottom: root.narrow ? 12px : 20px;
+        spacing: root.narrow ? 10px : 16px;
+        // ── Header: back, name, REC, timer ─────────────────────────
+        HorizontalLayout {
+            spacing: 10px;
+            height: root.narrow ? 44px : 36px;
+            IconBtn {
+                size: parent.height;
+                icon-size: 20px;
+                icon: IconSet.ArrowLeft;
+                idle-color: Theme.text-primary;
+                filled: true;
+                tooltip: Tr.stage-back;
+                tooltip-below: true;
+                clicked => { Logic.stage-back(); }
+            }
+            Text {
+                text: State.stage-name;
+                color: Theme.text-primary;
+                font-size: Theme.font-lg;
+                font-weight: 700;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 0;
+                max-width: self.preferred-width;
+            }
+            if State.stage-recording : Rectangle {
+                width: chip.width;
+                chip := RecChip {
+                    y: (parent.height - self.height) / 2;
+                    can-stop: State.stage-can-stop;
+                    tip: State.stage-rec-tip;
+                    channel-id: State.stage-channel;
+                }
+            }
+            Text {
+                text: State.stage-timer;
+                color: Theme.text-muted;
+                font-size: Theme.font-sm;
+                vertical-alignment: center;
+            }
+            Rectangle { horizontal-stretch: 1; }
+        }
+        grid := Rectangle {
+            vertical-stretch: 1;
+            Rectangle {
+                x: (parent.width - root.used-w) / 2;
+                y: (parent.height - root.used-h) / 2;
+                width: root.used-w;
+                height: root.used-h;
+                for t[i] in State.stage-tiles : Tile {
+                    x: Math.mod(i, root.cols) * (root.tw + root.gap);
+                    y: Math.floor(i / root.cols) * (root.th + root.gap);
+                    width: root.tw;
+                    height: root.th;
+                    tile: t;
+                }
+            }
+            if root.n <= 1 : Text {
+                x: 0;
+                y: parent.height - 28px;
+                width: parent.width;
+                text: Tr.stage-empty;
+                color: Theme.text-muted;
+                font-size: Theme.font-sm;
+                horizontal-alignment: center;
+            }
+        }
+        HorizontalLayout {
+            alignment: center;
+            StageControls { }
+        }
+    }
+}

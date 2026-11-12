@@ -733,6 +733,39 @@ pub fn save_to_downloads(name: &str, bytes: &[u8]) -> Result<crate::host::Saved,
     })
 }
 
+/// A file already on disk (a streamed download, 1.5) into Downloads:
+/// moved there on the desktop, handed to the host on a phone. The
+/// partial file is gone afterwards either way.
+///
+/// # Errors
+/// The host's or the file system's message.
+pub fn move_into_downloads(
+    name: &str,
+    from: &std::path::Path,
+) -> Result<crate::host::Saved, String> {
+    if let Some(saved) = crate::host::save_download_path(name, mime_for(name), from) {
+        std::fs::remove_file(from).ok();
+        return saved;
+    }
+    let dir = dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // A free name, claimed with an empty file the move then replaces.
+    let path = app_core::files::write_new(&dir, &app_core::files::safe_name(name), &[])
+        .map_err(|e| e.to_string())?;
+    if std::fs::rename(from, &path).is_err() {
+        // Another volume: copy, then let the partial go.
+        std::fs::copy(from, &path).map_err(|e| e.to_string())?;
+        std::fs::remove_file(from).ok();
+    }
+    mark_as_downloaded(&path);
+    Ok(crate::host::Saved {
+        shown: path.display().to_string(),
+        target: path,
+    })
+}
+
 fn write_into_downloads(name: &str, bytes: &[u8]) -> std::io::Result<std::path::PathBuf> {
     let dir = dirs::download_dir()
         .or_else(dirs::home_dir)

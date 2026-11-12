@@ -22,7 +22,7 @@ limits:
 logging:
   level: info
   stats_interval_secs: 3600
-  link_stats_interval_secs: 2
+  link_stats_interval_secs: 300
   telemetry: true
   file: ""
 identity:

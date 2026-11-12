@@ -27,6 +27,14 @@ export global Theme {
     out property <brush> hover:        #272A2F;
     out property <brush> subtle:       #303338;
     out property <brush> border:       #3A3D42;
+    // 1.5: the chat beside Channel view or the channel list, a step
+    // lighter than the ground so its edge reads; the strip at that
+    // edge and its grip; a conversation's bubbles (ours in a dark
+    // cobalt, fog on it 6.0:1; theirs the tertiary panel).
+    out property <brush> bg-panel:     #26292E;
+    out property <brush> grip:         #6B6E73;
+    out property <brush> bubble-own:   #164E7A;
+    out property <color> bubble-own-meta: #A9C9E6;
     // What a dialog dims the window with (`Modal` in widgets.slint).
     out property <brush> scrim:        #000000AA;
 
@@ -89,6 +97,8 @@ export global Theme {
     out property <length> font-sm:    Math.round(12 * scale) * 1px;
     out property <length> font-body:  Math.round(13 * scale) * 1px;
     out property <length> font-md:    Math.round(14 * scale) * 1px;
+    // What a chat message reads in (1.5: a step over the UI's body).
+    out property <length> font-message: Math.round(14 * scale) * 1px;
     out property <length> font-lg:    Math.round(16 * scale) * 1px;
     out property <length> font-title: Math.round(30 * scale) * 1px;
 }

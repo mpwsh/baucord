@@ -33,8 +33,6 @@ export global Tr {
     in property <string> lobby-banner;
     in property <string> drop-to-send;
     in property <string> lobby-mic-hint;
-    in property <string> messages-collapse;
-    in property <string> messages-expand;
     in property <string> invite-button;
     // Invite dialog
     in property <string> invite-dialog-title;
@@ -129,6 +127,7 @@ export global Tr {
     in property <string> share-screen;
     in property <string> stop-sharing;
     in property <string> disconnect;
+    in property <string> leave-call;
     in property <string> live;
 
     // Per-user popover (the menu strings live in the host: app-core's
@@ -194,11 +193,39 @@ export global Tr {
     in property <string> chat-loading;
     in property <string> banner-not-persistent;
     // Direct messages
-    in property <string> messages-header;
     in property <string> dm-general;
+    // 1.5: recording, the places, Channel view, the inbox
+    in property <string> rec-label;
+    in property <string> recording-stop;
+    in property <string> view-list;
+    in property <string> view-stage;
+    in property <string> view-stage-none;
+    in property <string> chat-hide;
+    in property <string> view-chat;
+    in property <string> view-dms;
+    in property <string> stage-back;
+    in property <string> stage-empty;
+    in property <string> inbox-search;
+    in property <string> inbox-back;
+    in property <string> in-a-call;
+    in property <string> dm-pick;
+    in property <string> tab-camera;
+    in property <string> camera-lead;
+    in property <string> camera-device;
+    in property <string> camera-none;
+    in property <string> camera-starting;
+    in property <string> camera-preview-hint;
+    in property <string> camera-preview-start;
+    in property <string> camera-preview-stop;
+    in property <string> camera-mirror;
+    in property <string> camera-mirror-hint;
+    in property <string> camera-quality;
+    in property <string> camera-quality-hint;
+    in property <string> camera-on;
+    in property <string> camera-off;
+    in property <string> dm-list-empty;
     in property <string> dm-direct-message;
     in property <string> dm-note-memory;
-    in property <string> dm-back;
     in property <string> chat-placeholder-dm;
 
     // Screen share dialog
@@ -324,6 +351,8 @@ export global Tr {
     in property <string> chat-image-size-hint;
     in property <string> privacy-header;
     in property <string> privacy-note;
+    in property <string> telemetry-send;
+    in property <string> telemetry-send-hint;
     in property <string> audio-aec;
     in property <string> audio-aec-hint;
     in property <string> aec-lowering;

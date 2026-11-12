@@ -1,6 +1,6 @@
 [package]
 name = "app-core"
-version = "0.3.4"
+version = "0.3.5"
 edition.workspace = true
 license.workspace = true
 description = "Platform-agnostic application layer for baucord — view models, chat/image/GIF pipelines, and pure app logic shared by every shell (desktop today, mobile-android / mobile-ios later)."

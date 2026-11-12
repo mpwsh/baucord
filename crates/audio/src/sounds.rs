@@ -44,6 +44,11 @@ pub enum SoundType {
     WentQuiet,
     /// We unmuted or undeafened: the same, a third higher.
     BackLive,
+    /// Our channel started recording (1.5), or we joined one that is:
+    /// one note held, then a higher one — a clear "this is on".
+    RecordingStarted,
+    /// Our channel's recording stopped: the same two, falling.
+    RecordingStopped,
 }
 
 // ── Sound bank ──────────────────────────────────────────────────────────
@@ -59,6 +64,8 @@ pub struct SoundBank {
     viewer_joined: Vec<f32>,
     went_quiet: Vec<f32>,
     back_live: Vec<f32>,
+    recording_started: Vec<f32>,
+    recording_stopped: Vec<f32>,
 }
 impl Default for SoundBank {
     fn default() -> Self {
@@ -91,6 +98,10 @@ impl SoundBank {
             // Lower going quiet, higher coming back.
             went_quiet: synth_soft_note(392.0, 0.32, 0.17),
             back_live: synth_soft_note(466.2, 0.32, 0.17),
+            // A recording: E5 twice then A5, brighter than the share's
+            // low fifth, so nobody mistakes one for the other.
+            recording_started: synth_notes(&[(659.3, 0.09), (659.3, 0.09), (880.0, 0.20)], 0.28),
+            recording_stopped: synth_notes(&[(880.0, 0.09), (659.3, 0.22)], 0.28),
         }
     }
 
@@ -107,6 +118,8 @@ impl SoundBank {
             SoundType::ViewerJoined => &self.viewer_joined,
             SoundType::WentQuiet => &self.went_quiet,
             SoundType::BackLive => &self.back_live,
+            SoundType::RecordingStarted => &self.recording_started,
+            SoundType::RecordingStopped => &self.recording_stopped,
         }
     }
 }

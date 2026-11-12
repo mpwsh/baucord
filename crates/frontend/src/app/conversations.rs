@@ -274,9 +274,9 @@ impl AppState {
                 if fetch {
                     self.load_earlier(50);
                 }
-                if let Some(msg_id) = mark
-                    && user != ADMIN_CHANNEL_KEY
-                {
+                if let Some(up_to) = mark.filter(|_| user == SERVER_CONV_KEY) {
+                    self.mark_recordings_seen(up_to);
+                } else if let Some(msg_id) = mark {
                     self.network
                         .tx
                         .send(NetworkControl::Send(ClientMessage::MarkRead {
@@ -288,6 +288,7 @@ impl AppState {
             }
         }
         self.rebuild_dms_model();
+        self.panel_follows(key);
         self.main.invoke_chat_pin_bottom();
         self.main.invoke_focus_composer();
     }
@@ -321,7 +322,7 @@ impl AppState {
     /// Remember (or forget) that a conversation was closed, so the
     /// next login's `Conversations` does not bring it back.
     pub(super) fn set_dm_hidden(&mut self, user: client::UserId, hidden: bool) {
-        if user == ADMIN_CHANNEL_KEY {
+        if user == SERVER_CONV_KEY {
             return;
         }
         let key = hex(&user);
@@ -357,6 +358,7 @@ impl AppState {
                 last_msg_id: 0,
                 // Nothing to fetch without a store.
                 fetched: false,
+                ..Default::default()
             });
         if meta.name.is_empty() {
             meta.name = name.to_string();
@@ -370,50 +372,37 @@ impl AppState {
         self.main.global::<State>().set_narrow_chat_open(true);
     }
 
-    /// The admin channel's row exists (spec §8): a conversation under
-    /// the reserved key, first in the Messages list, never fetched
-    /// from the DM store.
-    pub(super) fn ensure_admin_channel(&mut self) {
-        self.session
-            .chat
-            .dm_meta
-            .entry(ADMIN_CHANNEL_KEY)
-            .or_insert_with(|| DmMeta {
-                name: t!("admin-channel"),
-                unread: 0,
-                last_ts: 0,
-                last_msg_id: 0,
-                fetched: true,
-            });
-        if !self.session.chat.dm_order.contains(&ADMIN_CHANNEL_KEY) {
-            self.session.chat.dm_order.insert(0, ADMIN_CHANNEL_KEY);
+    /// The newest line of a DM, as the inbox shows it (1.5).
+    pub(super) fn note_dm_line(&mut self, user: client::UserId, text: &str, mine: bool) {
+        if let Some(meta) = self.session.chat.dm_meta.get_mut(&user) {
+            meta.preview = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            meta.preview_mine = mine;
         }
     }
 
-    /// The shield row: open the admin channel; the last page of the
-    /// audit becomes its history the first time.
-    pub(super) fn open_admin_channel(&mut self) {
-        self.ensure_admin_channel();
-        let empty =
-            self.with_conversation(Some(ADMIN_CHANNEL_KEY), |app| app.history.rows().is_empty());
-        self.switch_conversation(Some(ADMIN_CHANNEL_KEY));
-        if empty {
-            let lead = t!("admin-channel-lead");
-            self.with_conversation(Some(ADMIN_CHANNEL_KEY), |app| app.push_system_here(&lead));
-            self.send_admin(
-                AdminCommand::AuditLog {
-                    before: None,
-                    limit: 50,
-                },
-                PendingAdmin::Channel,
-            );
+    /// The server's newest lines, after its list (`ConversationPreviews`).
+    pub(super) fn take_dm_previews(&mut self, previews: Vec<client::protocol::DmPreview>) {
+        for p in previews {
+            if let Some(meta) = self.session.chat.dm_meta.get_mut(&p.user_id) {
+                meta.preview = app_core::emoji::for_display(&p.text);
+                meta.preview_mine = p.mine;
+            }
         }
+        self.rebuild_dms_model();
     }
 
-    /// The Messages section's rows: newest conversation first, with
-    /// unread counts, online rings and the partner's look.
+    /// The Messages inbox's rows: newest conversation first, with the
+    /// newest line, its time, unread counts, presence and the partner's
+    /// look. `State.dm-filter` hides the rows whose name does not match
+    /// (hidden, not removed: a row's index is its place in `dm_order`).
     pub(super) fn rebuild_dms_model(&mut self) {
         let mut total = 0;
+        let filter = self
+            .main
+            .global::<State>()
+            .get_dm_filter()
+            .trim()
+            .to_lowercase();
         let rows: Vec<DmRow> = self
             .session
             .chat
@@ -426,16 +415,41 @@ impl AppState {
                 let name = client
                     .and_then(|c| self.session.users.get(&c))
                     .map_or(meta.name.clone(), |u| u.username.clone());
+                let preview = if meta.preview.is_empty() {
+                    String::new()
+                } else if meta.preview_mine {
+                    t!("dm-preview-you", "text" => meta.preview.as_str())
+                } else {
+                    meta.preview.clone()
+                };
+                // Where they are: in a room, connected, or neither.
+                let status = match client.and_then(|c| self.session.users.get(&c)) {
+                    _ if *user == SERVER_CONV_KEY => String::new(),
+                    Some(u) if Some(self.channel_name(u.channel_id)) != self.lobby_name => {
+                        let channel = self.channel_name(u.channel_id);
+                        t!("dm-status-in", "channel" => channel.as_str())
+                    }
+                    Some(_) => t!("dm-status-online"),
+                    None => String::new(),
+                };
                 let mut row = DmRow {
                     name: name.as_str().into(),
                     unread: i32::try_from(meta.unread).unwrap_or(i32::MAX),
                     active: self.session.chat.active_dm == Some(*user),
                     online: client.is_some(),
+                    preview: preview.into(),
+                    when: if meta.last_ts == 0 {
+                        "".into()
+                    } else {
+                        inbox_when(meta.last_ts).into()
+                    },
+                    status: status.into(),
+                    shown: filter.is_empty() || name.to_lowercase().contains(&filter),
                     avatar: slint::Image::default(),
                     has_avatar: false,
                     initial: app_core::roster::initial_of(&name).into(),
                     tile_tint: ui::convert::tint(&name),
-                    admin: *user == ADMIN_CHANNEL_KEY,
+                    admin: *user == SERVER_CONV_KEY,
                 };
                 // Online: their session's look; offline: what the server
                 // said of them with the list (`Authors`).
@@ -505,6 +519,7 @@ impl AppState {
                 // Never opened: with a store the page will bring this one
                 // too, so it is not pushed twice.
                 fetched: false,
+                ..Default::default()
             });
         meta.name = username.to_string();
         meta.last_ts = ts;
@@ -557,6 +572,11 @@ impl AppState {
             Incoming::Text(text) => app_core::emoji::for_display(text),
             Incoming::File(file) => t!("notif-dm-file", "name" => file.name.as_str()),
         };
+        let line = match &body {
+            Incoming::Text(_) => text.clone(),
+            Incoming::File(file) => file.name.clone(),
+        };
+        self.note_dm_line(from, &line, false);
         self.alert_direct_message(from, username, &text);
         self.rebuild_dms_model();
     }
@@ -565,9 +585,9 @@ impl AppState {
     /// under a placeholder id; `MessageAck` confirms it, `MessageFailed`
     /// removes it.
     pub(super) fn send_dm(&mut self, to: client::UserId, text: String) {
-        if to == ADMIN_CHANNEL_KEY {
-            // Commands only here; they are handled before this point.
-            let hint = t!("admin-channel-commands-only");
+        if to == SERVER_CONV_KEY {
+            // Nobody reads replies here.
+            let hint = t!("server-conv-read-only");
             self.with_conversation(Some(to), |app| app.push_system_here(&hint));
             return;
         }
@@ -594,6 +614,7 @@ impl AppState {
         if let Some(m) = self.session.chat.dm_meta.get_mut(&to) {
             m.last_ts = now;
         }
+        self.note_dm_line(to, &body, true);
         self.session.chat.dm_order.retain(|u| *u != to);
         self.session.chat.dm_order.insert(0, to);
         self.rebuild_dms_model();

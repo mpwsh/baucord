@@ -104,6 +104,7 @@ impl AppState {
             "leave" => self.handle_disconnect(),
             "quit" | "exit" if super::HOST_CAN_QUIT => self.leave_app(super::Leaving::Quit),
             "quit" | "exit" => self.push_command_output(&t!("quit-ios")),
+            "record" => self.handle_record_command(args),
             "users" => self.send_admin(AdminCommand::ListUsers, PendingAdmin::Show),
             "restrictions" | "bans" => {
                 self.send_admin(AdminCommand::ListRestrictions, PendingAdmin::Show);
@@ -304,6 +305,9 @@ impl AppState {
         }
         if has(p::MANAGE_CHANNELS) {
             out.push("/move <user> <channel>");
+        }
+        if has(p::RECORD) {
+            out.push("/record [stop]");
         }
         if has(p::MUTE) || has(p::RESTRICT) {
             out.push("/mute [voice|text] <user> [30m] [reason]");
@@ -744,13 +748,6 @@ impl AppState {
                     crate::adminui::take_error(self, &why);
                     return;
                 }
-                if matches!(then, PendingAdmin::Channel) {
-                    let line = t!("chat-admin-refused", "why" => why.as_str());
-                    self.with_conversation(Some(ADMIN_CHANNEL_KEY), |app| {
-                        app.push_system_here(&line);
-                    });
-                    return;
-                }
                 self.push_command_output(&t!("chat-admin-refused", "why" => why.as_str()));
                 return;
             }
@@ -762,18 +759,6 @@ impl AppState {
             }
             PendingAdmin::AuditMore => {
                 crate::adminui::take_outcome(self, -1, outcome);
-                return;
-            }
-            PendingAdmin::Channel => {
-                if let client::AdminOutcome::Audit(entries) = outcome {
-                    // Newest first on the wire; oldest first in a chat.
-                    for e in entries.iter().rev() {
-                        let line = audit_line_text(e);
-                        self.with_conversation(Some(ADMIN_CHANNEL_KEY), |app| {
-                            app.push_system_here(&line);
-                        });
-                    }
-                }
                 return;
             }
             PendingAdmin::Show | PendingAdmin::Telemetry(_) => {}

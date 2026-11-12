@@ -1,6 +1,6 @@
 [package]
 name = "audio"
-version = "0.8.1"
+version = "0.8.2"
 edition.workspace = true
 license.workspace = true
 description = "audio components for baucord"
@@ -16,6 +16,10 @@ workspace = true
 # otherwise.
 cpal = "0.18.2"
 dasp_sample = "0.11"
+
+# The RED bundle format (`protocol::red`), shared with the server's
+# recorder. Pure Rust, no I/O.
+protocol = { path = "../protocol" }
 
 # Wav reading
 hound = "3.5"

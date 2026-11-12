@@ -12,7 +12,7 @@ site (`web/licenses.html`). `scripts/licenses.py` writes both:
   (libjpeg-turbo, libpng, zlib, Wuffs, FreeType, ICU data), FFmpeg and
   x264 in the desktop builds (with the GPL texts), the NVIDIA and AMD
   encoder headers in FFmpeg's Windows build, libopus, the Lucide icons,
-  and Slint's royalty-free license (its crates carry no license file);
+  the Inter typeface (`crates/ui/fonts`), and Slint's royalty-free license (its crates carry no license file);
 - the website's own: Alpine.js (`web/js/alpine.min.js`), on the site's
   page only, since the apps do not contain it.
 

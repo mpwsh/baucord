@@ -21,6 +21,10 @@ the server: slash commands with ephemeral replies (`COMMANDS`, the
 review document's bot section, steps 1–2) and the `bot` role. Until
 then a bot reacts to chat lines (`!play …`) and is an ordinary member.
 
+For people who will not open the repository, the same ground is
+covered on the website: [baucord.com/bots.html](https://baucord.com/bots.html)
+(`web/bots.html`; keep the two in step).
+
 ## 1. Running it
 
 ```
@@ -34,7 +38,7 @@ baucord-gateway --server play.example.com:51000 --name MusicBot \
 | `--name` (`BAUCORD_BOT_NAME`) | The bot's name on the server. |
 | `--key` (`BAUCORD_KEY`, default `bot.key`) | The bot's identity key, made on the first run. **Whoever has this file is the bot.** Keep it like the server's `identity.key`; never commit it. |
 | `--invite` (`BAUCORD_INVITE`) | An invite code (`server invite create`, or `/invite` in the app). Needed on the first run only: it links the key, and from then on the key alone logs in. A used code is forgotten by the gateway, so leaving the flag in a service file is harmless. |
-| `--pin` (`BAUCORD_PIN`) | The server's identity, `SHA256:…` (the server prints it at start; Settings → Servers shows it). Without one the first connection's identity is trusted and written to `<key>.pin` next to the key, and every later run insists on it — the app's trust-on-first-use. |
+| `--pin` (`BAUCORD_PIN`) | The server's identity, `SHA256:…` (the server prints it at start; Settings → Servers shows it). Without one the first connection's identity is trusted and written to a `.pin` file beside the key (`musicbot.key` → `musicbot.pin`), and every later run insists on it — the app's trust-on-first-use. |
 | `--listen` (`BAUCORD_GATEWAY_LISTEN`, default `127.0.0.1:8765`) | Where bots connect. |
 | `--token` (`BAUCORD_GATEWAY_TOKEN`) | A secret the bot must present: `Authorization: Bearer …` or `?token=…`. Required when `--listen` is not the loopback — anyone who reaches the socket *is* the bot. |
 | `--voice-kbps` (`BAUCORD_VOICE_KBPS`, default 64) | Opus bitrate for what the bot plays, 16–128. |
@@ -125,6 +129,9 @@ thing is the same.
 | `RESTRICTED` / `RESTRICTION_LIFTED` | `kind`, `until`, `reason` / `kind` | A mute or a text restriction on the bot. |
 | `ROLES` | `roles: [{id, name, rank, permissions, builtin}]` | The server's role table. |
 | `MOVED_IDLE` | `after_min` | The server moved the bot to the AFK channel. |
+| `CHANNEL_CLOCK` | `channel_id`, `running_ms` (`null` when empty) | A channel's timer started or stopped (1.5); a bot counts on from `running_ms`. |
+| `RECORDING_START` / `RECORDING_STOP` | `channel_id`, `rec_id`, `elapsed_ms`, `by` / `channel_id`, `rec_id`, `duration_ms`, `reason`, `by` | A channel started or stopped recording (1.5). A bot in it is recorded too. |
+| `RECORDING_READY` | `rec_id`, `channel`, `started_at`, `duration_ms`, `file_name`, `size`, `blob_id` | A recording the bot was in is ready, from Server. |
 
 ### 2.3 Actions: `action`
 
@@ -205,7 +212,9 @@ is playing (the bot answers with the place in the line); `!skip`;
 with symphonia (mp3, aac/m4a, flac, ogg/vorbis, wav) and resamples to
 48 kHz mono with rubato, the crates the audio engine already uses; a
 URL is fetched as it plays, so an internet radio stream plays until
-`!stop`. It says little in chat on purpose: the server's chat limit
+`!stop`. A link to a YouTube, Spotify, SoundCloud or Bandcamp *page*
+is refused with a line saying so: those are pages about a track, and
+`music_bot.py`'s job. It says little in chat on purpose: the server's chat limit
 (5 lines in 5 s) applies to a bot, and a chatty one loses the lines
 that matter.
 

@@ -65,11 +65,18 @@ pub const ADMIN_CHANNEL: u64 = 1 << 22;
 /// Nothing implies it, `RESTRICT` included; DMs stay undeletable for
 /// everyone.
 pub const DELETE_MESSAGES: u64 = 1 << 23;
+/// Start and stop voice channel recordings (1.5). Admins hold it, and
+/// the `recorder` role grants it on top of anyone's other roles.
+pub const RECORD: u64 = 1 << 24;
+/// Turn one's camera on in a voice channel (1.5). A `share`
+/// restriction takes it away too.
+pub const CAMERA: u64 = 1 << 25;
 
 /// What a guest may do.
 pub const GUEST_PERMISSIONS: u64 = JOIN_CHANNELS | SPEAK | TEXT_GENERAL;
 /// What a member may do.
-pub const MEMBER_PERMISSIONS: u64 = GUEST_PERMISSIONS | DM | SHARE | UPLOAD | CREATE_INVITES;
+pub const MEMBER_PERMISSIONS: u64 =
+    GUEST_PERMISSIONS | DM | SHARE | UPLOAD | CREATE_INVITES | CAMERA;
 /// What an organizer may do: a member who can make channels.
 pub const ORGANIZER_PERMISSIONS: u64 = MEMBER_PERMISSIONS | CREATE_CHANNELS | MANAGE_OWN_CHANNELS;
 /// What an admin may do: everything.
@@ -81,6 +88,7 @@ pub const ADMIN_PERMISSIONS: u64 = ORGANIZER_PERMISSIONS
     | MUTE
     | RESTRICT
     | DELETE_MESSAGES
+    | RECORD
     | MANAGE_ROLES
     | MANAGE_USERS
     | MANAGE_INVITES
@@ -104,6 +112,9 @@ pub const ROLE_MEMBER: RoleId = 2;
 pub const ROLE_ORGANIZER: RoleId = 3;
 /// The built-in `admin` role's id.
 pub const ROLE_ADMIN: RoleId = 4;
+/// The name of the role migration 8 seeds with [`RECORD`] alone (1.5).
+/// A custom role: admins may rename, restyle or delete it.
+pub const RECORDER_ROLE_NAME: &str = "recorder";
 
 /// Where guests stand for `min_role` gates: the floor.
 pub const RANK_GUEST: Rank = 0;
@@ -166,7 +177,7 @@ pub const fn has(permissions: u64, bit: u64) -> bool {
 /// Every permission with the name the CLI and the panel use for it,
 /// in bit order. [`ADMIN`] is listed so it can be *printed*; a custom
 /// role can never hold it ([`CUSTOM_ROLE_PERMISSIONS`]).
-pub const PERMISSION_NAMES: [(&str, u64); 24] = [
+pub const PERMISSION_NAMES: [(&str, u64); 26] = [
     ("join", JOIN_CHANNELS),
     ("speak", SPEAK),
     ("text", TEXT_GENERAL),
@@ -183,6 +194,8 @@ pub const PERMISSION_NAMES: [(&str, u64); 24] = [
     ("mute", MUTE),
     ("restrict", RESTRICT),
     ("delete-messages", DELETE_MESSAGES),
+    ("record", RECORD),
+    ("camera", CAMERA),
     ("manage-roles", MANAGE_ROLES),
     ("manage-users", MANAGE_USERS),
     ("manage-invites", MANAGE_INVITES),
@@ -294,6 +307,8 @@ mod tests {
             GOLD_NAME,
             PANEL,
             ADMIN_CHANNEL,
+            RECORD,
+            CAMERA,
         ];
         for (i, a) in all.iter().enumerate() {
             assert_eq!(a.count_ones(), 1);

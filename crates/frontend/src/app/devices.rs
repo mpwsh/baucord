@@ -265,8 +265,18 @@ impl AppState {
     /// voice engine — every Close used to reopen the microphone and the
     /// output, a gap in the call — and the connect view keeps a verdict
     /// it shows (review 2026-10, P2-2).
+    /// Settings → General → Privacy's switch, to the network thread.
+    pub(crate) fn apply_telemetry_pref(&mut self) {
+        client::network::set_telemetry_allowed(self.settings.privacy.send_telemetry);
+        log::info!(
+            "telemetry to servers: {}",
+            if self.settings.privacy.send_telemetry { "on" } else { "off" }
+        );
+    }
+
     pub(crate) fn apply_settings_live(&mut self, before: &client::config::Settings) {
         self.apply_text_scale();
+        self.apply_telemetry_pref();
         self.push_ui_prefs();
         self.apply_push_to_talk();
         let (now, was) = (&self.settings.audio, &before.audio);
@@ -323,12 +333,12 @@ impl AppState {
     }
 
     /// What Rust words itself, outside `Tr`, in the new language: the
-    /// admin channel's name, the roster (its headers and fallbacks) and
+    /// Server conversation's name, the roster (its headers and fallbacks) and
     /// the tray's menu. They stayed in the old one until something else
     /// redrew them (review 2026-10, P3-1).
     pub(crate) fn relabel_for_language(&mut self) {
-        if let Some(meta) = self.session.chat.dm_meta.get_mut(&ADMIN_CHANNEL_KEY) {
-            meta.name = t!("admin-channel");
+        if let Some(meta) = self.session.chat.dm_meta.get_mut(&SERVER_CONV_KEY) {
+            meta.name = t!("server-conv");
         }
         self.rebuild_dms_model();
         self.update_user_list();

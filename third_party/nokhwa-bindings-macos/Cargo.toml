@@ -1,0 +1,59 @@
+# nokhwa-bindings-macos 0.2.4 from crates.io, vendored with one fix for
+# baucord in `AVCaptureDevice::set_all` (see BAUCORD-PATCH.md). The
+# workspace root's `[patch.crates-io]` points here; `[workspace]
+# exclude` keeps it out of the workspace (no fmt, no clippy). The
+# manifest is the registry's normalized one otherwise.
+
+[package]
+edition = "2021"
+name = "nokhwa-bindings-macos"
+version = "0.2.4"
+authors = ["l1npengtul"]
+build = "build.rs"
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "The AVFoundation bindings crate for `nokhwa`"
+readme = "README.md"
+keywords = [
+    "avfoundation",
+    "macos",
+    "capture",
+    "webcam",
+]
+license = "Apache-2.0"
+repository = "https://github.com/l1npengtul/nokhwa"
+
+[lib]
+name = "nokhwa_bindings_macos"
+path = "src/lib.rs"
+
+[dependencies.nokhwa-core]
+version = "0.1"
+
+[target.'cfg(any(target_os="macos",target_os="ios"))'.dependencies.block]
+version = "0.1"
+
+[target.'cfg(any(target_os="macos",target_os="ios"))'.dependencies.cocoa-foundation]
+version = "0.2"
+
+[target.'cfg(any(target_os="macos",target_os="ios"))'.dependencies.core-foundation]
+version = "0.10"
+
+[target.'cfg(any(target_os="macos",target_os="ios"))'.dependencies.core-media-sys]
+version = "0.1"
+
+[target.'cfg(any(target_os="macos",target_os="ios"))'.dependencies.core-video-sys]
+version = "0.1"
+
+[target.'cfg(any(target_os="macos",target_os="ios"))'.dependencies.flume]
+version = "0.11"
+
+[target.'cfg(any(target_os="macos",target_os="ios"))'.dependencies.objc]
+version = "0.2"
+features = ["exception"]
+
+[target.'cfg(any(target_os="macos",target_os="ios"))'.dependencies.once_cell]
+version = "1"

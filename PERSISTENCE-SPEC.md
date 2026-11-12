@@ -99,7 +99,7 @@ review P1-22). With the server's socket wait capped at 1 s (review
 P1-2), a change reaches live sessions within about 3 s.
 Migrations are forward-only, recorded in `schema_version`; a downgrade
 refuses to start rather than guess. Since migration 7 (columns dropped,
-§2) going back to an older server means restoring a backup taken before
+§2) — and migration 8, recordings, 1.5 — going back to an older server means restoring a backup taken before
 the upgrade.
 
 ### 1.1 Persistence on and off
@@ -118,7 +118,8 @@ the upgrade.
 | profiles (color, style, avatar)    | ✔ client-held, sent on connect, broadcast          | ✔ also stored on the user row         |
 | telemetry queries, audit, purge                      | –                                | ✔                                     |
 | progress (xp / level)              | ✔ for the session                                  | ✔ kept                                |
-| admin panel / admin channel        | ✔ over the in-memory policy                        | ✔                                     |
+| admin panel                        | ✔ over the in-memory policy                        | ✔                                     |
+| voice recording (1.5)              | – refused (`Unavailable`)                          | ✔ files kept, delivered by Server     |
 
 Persistence-off is the LAN/dev/"just tonight" server: everything in
 this document works for the session, and a restart forgets roles,
@@ -208,8 +209,15 @@ startup). The schema is at version 7: migration 7 (`0007_drop_unused`,
 is the `profile` restriction), `user_keys.label`, `channels.is_afk`
 and `channels.position`, `blobs.declared_mime` (the sniffed type is
 the one served), and the whole telemetry sample and event kept as
-blobs beside the columns the reports read. A server older than
-schema 7 refuses the database; going back means restoring a backup.
+blobs beside the columns the reports read. Migration 8
+(`0008_recordings`, 1.5) adds `recordings` (one row a recording: the
+channel's name, start, duration, who started and stopped it, why it
+ended, its size and blob) and `recording_access (rec_id, user_id,
+seen)` — one row per person recorded, written as they are placed in
+the channel, so a crash loses no participant — and seeds the
+`recorder` role (`record`, rank 5, icon `mic`). The schema is at
+version 8; a server older than that refuses the database; going back
+means restoring a backup.
 
 ### 2.1 Ids and keys
 
@@ -494,7 +502,8 @@ usable:
   value, set at creation, else the server default) is moved there by
   the server with an ordinary `UserMovedChannel` and told why. Voice
   in the AFK channel is not relayed to anyone, which is the point.
-  Idle is measured on the server from events it already has; no
+  Someone subscribed to a screen share is never idle, however quiet
+  (1.5). Idle is measured on the server from events it already has; no
   client change is needed for the first version (a keyboard/mouse
   idle signal from the desktop can refine it later).
 - Topic/description: later.
@@ -534,7 +543,14 @@ ServerMessage::Direct { from: UserId, msg: ChatMessage }
 ServerMessage::MessageAck { client_ref, msg_id } | MessageFailed { client_ref, reason }
 ServerMessage::History { conv: ConvRef, messages: Vec<ChatMessage>, more: bool }
 ServerMessage::Conversations { dms: Vec<{ user_id, name, unread, last_ts }> }
+ServerMessage::ConversationPreviews { previews: Vec<{ user_id, mine, text }> } // 1.5, DM_PREVIEW
 ```
+
+- **The inbox's lines (1.5).** Right after `Conversations`, a client
+  with `DM_PREVIEW` gets the newest line of each listed DM: its text on
+  one line, cut to 100 characters (a file's name for a file), and
+  whether it wrote it. One query, the newest undeleted message per
+  conversation; nothing new is stored.
 
 - **General does not wait for the disk.** The server assigns `msg_id`
   from an in-memory counter (persisted watermark, rebased at startup),
@@ -703,13 +719,12 @@ the persistence thread does the writes; the tick does the permission
 check and the in-memory state change (a ban takes effect before the row
 lands — the row is the record, not the gate).
 
-**The admin channel** is a text conversation visible only to users with
-`ADMIN`: the audit log is streamed into it as system messages ("mpw
-muted oveeer for 30 min: spam"), and admins can also type commands
-there (`/mute @oveeer 30m spam`) which the client turns into the same
-`AdminCommand` messages — one authorization path, two front ends. The
-panel (a tab: users, roles, restrictions, channels, files) is the
-full-featured one; the channel is the fast one during a session.
+**The admin channel** (1.1.4–1.4) was a text conversation visible only
+to users with `ADMIN`, the audit streamed into it as system lines.
+Since 1.5 the audit lives in the panel's Audit tab alone, which takes
+the `AuditLine` feed live while it is open; commands are typed in any
+conversation (`/mute @oveeer 30m spam`) and become the same
+`AdminCommand` messages — one authorization path, two front ends.
 
 **Bootstrap** is the only step that needs host access by design: the
 one-shot admin code in the startup log, or `server user grant <name>
@@ -1119,6 +1134,29 @@ The first draft's decisions, in short (the entries above refine them):
   gets back in), ban also blocks the device and address. None of them
   auto-reconnects; all keep the user row.
 
+- **Recordings are the server's, delivered by Server (1.5, in use).**
+  Native, not a bot: the relay copies the voice it already forwards in
+  a recording channel to a recorder thread, which mixes one WAV. Who
+  counts as recorded: anyone in the channel at any moment while it
+  runs. Each gets an access row and the file arrives as
+  `RecordingReady` in a "Server" conversation in their DMs (the
+  client's own, never in General); the bytes are served to those
+  people alone, on `FetchBlob` and `FetchBlobFrom`. Removing it from
+  one's list deletes only that person's access. A recording holds a
+  file reference while its row exists, so the general file retention
+  never takes it and no message's deletion touches it;
+  `recording.retain_days` (default 30) prunes the rows and with them
+  the files, and **0 keeps them forever**. A start is refused while
+  anyone in the channel runs a client without `RECORDING`, and such a
+  client cannot join a channel while it records — nobody is recorded
+  without the REC label in front of them. The label reads "REC" in
+  every language; "Recording" is translated. Start and stop are
+  audit lines (`recording.start`, `recording.stop`, `recording.fail`)
+  and activity lines for everyone. Bits `CHANNEL_CLOCK` 20,
+  `RECORDING` 21, `LARGE_BLOBS` 22, `CAMERA` 23; permissions `RECORD`
+  1<<24 (admins, the `recorder` role) and `CAMERA` 1<<25 (members).
+- **The channel timer is not persisted (1.5).** A restart drops every
+  session, so every room empties and every timer would restart anyway.
 - Wire changes are new variants only (postcard is positional); 1.0
   clients are refused with "update baucord"; a legacy `authentication:`
   section is warned about and ignored.

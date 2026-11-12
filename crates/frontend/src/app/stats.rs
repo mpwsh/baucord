@@ -525,6 +525,10 @@ impl AppState {
         self.voice.tx.send(VoiceControl::Shutdown).ok();
         self.network.tx.send(NetworkControl::Shutdown).ok();
         self.screen.tx.send(ScreenControl::Shutdown).ok();
+        self.camera
+            .tx
+            .send(client::camera::CameraControl::Shutdown)
+            .ok();
 
         let voice_handle = self.voice.join_handle.take();
         let network_handle = self.network.join_handle.take();

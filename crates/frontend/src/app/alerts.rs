@@ -84,7 +84,10 @@ impl AppState {
             .dm_sounded
             .get(&from)
             .is_some_and(|at| at.elapsed() < Duration::from_secs(10));
-        let sound = self.settings.sounds.direct_message_on() && !recent;
+        // The conversation (or the Messages list) on screen in a focused
+        // window: it is being read, nothing to call attention to.
+        let watching = window_focused() && self.main_on_screen() && self.messages_on_screen(from);
+        let sound = self.settings.sounds.direct_message_on() && !recent && !watching;
         if sound {
             self.session.dm_sounded.insert(from, Instant::now());
         }

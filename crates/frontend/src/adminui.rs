@@ -906,9 +906,41 @@ pub(crate) fn audit_action_text(action: &str) -> String {
         "report.user" => "admin-act-report-user",
         "report.resolve" => "admin-act-report-resolve",
         "user.delete" => "admin-act-user-delete",
+        "recording.start" => "admin-act-recording-start",
+        "recording.stop" => "admin-act-recording-stop",
+        "recording.fail" => "admin-act-recording-fail",
         _ => return action.to_string(),
     };
     t!(key)
+}
+
+/// One audit line as it happens (`AuditLine`, 1.5): at the top of the
+/// Audit tab when it is open. The "Admin logs" conversation it went
+/// to is gone; the tab is the one place for the log.
+pub(crate) fn audit_line(app: &AppState, entry: &client::protocol::AuditEntry) {
+    let s = app.main.global::<State>();
+    if !s.get_admin_open() {
+        return;
+    }
+    let a = app.main.global::<AdminState>();
+    if s.get_admin_tab() != TAB_AUDIT {
+        return;
+    }
+    let row = AdminAuditRow {
+        when: app::format_wall_stamp(entry.ts).into(),
+        actor: entry
+            .actor
+            .clone()
+            .unwrap_or_else(|| t!("admin-actor-server"))
+            .into(),
+        action: audit_action_text(&entry.action).into(),
+        target: entry.target.clone().unwrap_or_default().into(),
+        detail: entry.detail.clone().unwrap_or_default().into(),
+    };
+    let shown = a.get_audit();
+    if let Some(model) = shown.as_any().downcast_ref::<VecModel<AdminAuditRow>>() {
+        model.insert(0, row);
+    }
 }
 
 /// The index, in the rank-ordered table, of the highest role a user

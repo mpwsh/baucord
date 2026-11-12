@@ -1267,6 +1267,123 @@ What was not run: a Windows or macOS build, and a real listener's ears.
 
 ---
 
+## 5a. Recordings, the channel timer and the view bar **[1.5]**
+
+Written in the sandbox: the server's side is covered end to end on the
+simulated network (a timer from first join to last leave; a recording
+reaching the people in it and nobody else; the REC label before
+anyone is recorded; a camera seen by its channel on a track of its
+own), the mixer and the WAV writer unit-tested, the `.slint` rendered
+at 390×844 and 1000×640; the Rust type-checked and linted on Linux.
+Nothing run on a device or against a real server.
+
+- [ ] **new** Join an empty channel: its row shows `00:00:00` counting
+  up beside the member count, on every client; the last one out
+  clears it everywhere. A client that joins late shows the same time,
+  not zero [CLK-1].
+- [ ] **new** With the `recorder` role (or admin), right-click a
+  channel you are in → Start recording (or type `/record`). Everyone in
+  the channel hears the start chime and sees the bordered **REC**
+  label — "REC" in all three languages — and the activity says who
+  started it. Hovering the channel shows no button. Without the role
+  the menu has no entry and `/record` is refused [REC-1].
+- [ ] **new** Alone in a channel, start a recording, talk for half a
+  minute, stop it: the file has your voice. `log:` (server) `recording
+  <id>: N packets mixed`, N about 25 a second of talk.
+- [ ] **new** Talk for a minute, two people at once for part of it,
+  one leaving and another joining midway; stop it from the REC label
+  (it asks first). Each of the four gets a "Server" conversation at
+  the top of DMs with a card `<channel>_<date>_<time>Z_<duration>.wav`;
+  someone who never joined gets nothing. Save it: it lands in
+  Downloads and plays back with every voice, in step, without clicks
+  at the joins. `log:` the server's `recording #… is ready … sent to
+  4 people`.
+- [ ] **new** Record an hour (or set `recording.max_minutes: 2` and let
+  it end itself): the save of a large file shows its progress and the
+  app's memory does not grow by the file's size.
+- [ ] **new** Stop the server mid-recording and start it again: the
+  people recorded find the file in Server after they reconnect, up to
+  the moment of the stop. `log:` the server's `recording #… is ready`.
+- [ ] **new** `recording.retain_days: 0`: a recording is still there
+  after the general file retention would have taken a picture.
+- [ ] **new** The admin panel's Audit tab shows `recording.start` and
+  `recording.stop` live while open; there is no "Admin logs" in DMs.
+- [ ] **new** The rail, on a desktop and a phone alike: the list and
+  Channel view buttons swap the main column (Channel view greyed
+  outside a call, a green dot when you are in one and it is hidden);
+  pressing the one showing hides it while the chat is there. Chat shows
+  and hides the chat. Make the window narrow (or use a phone): one
+  column at a time, Chat swapping with the list or Channel view and
+  back. Restart: the layout comes back as left. "General" reads "Chat"
+  everywhere [NAV-1].
+- [ ] **new** Join a voice channel: Channel view comes up at once. Its
+  back arrow swaps it for the channel list; the chat's back arrow
+  hides the chat; Messages' back arrow (and Messages pressed again)
+  returns to the channels. The chat is a lighter grey beside another
+  column; the strips between columns have a grip, dragging shows a blue
+  line and the width lands on release.
+- [ ] **new** Messages: the window shows only the inbox and a
+  conversation — no channel list, Channel view or Chat. Each row shows
+  the person, the newest line ("You: …" for ours) and its time,
+  straight after connecting too; the search hides the rows that do not
+  match. A DM shows as bubbles, ours on the right, and its header says
+  where the person is ("In General"). In a call, the inbox's foot has
+  the call (mute, deafen, leave), and the rail's Channel button a
+  green dot. Message someone from their menu: Messages opens on them.
+- [ ] **new** Leave call (Channel view's red button, the list's red
+  button): back to the lobby, still connected, chat and messages
+  there, the leave chime plays. In the lobby the button is a blue
+  Disconnect that goes to the connect page. Connecting is silent; the
+  join chime plays on picking a channel.
+- [ ] **new** A DM while the window is on Messages (or a phone on that
+  conversation or the inbox) does not chime; on another place, or the
+  window in the background, it does.
+- [ ] **new** Watch a screen share and say nothing past the channel's
+  AFK time: you are not moved to AFK. Stop watching: you are, after
+  the time.
+- [ ] **new** Settings → Camera (under Audio): the picker lists the
+  computer's cameras; Preview shows the chosen one; picking another
+  switches the preview; the Quality list shows 1080p / 720p (default)
+  / 480p as far as the camera goes (a 240p camera: 240p alone), and
+  picking one while the camera is on changes what the others get;
+  Mirror flips your own tile (not what others see). Leaving
+  the tab or closing Settings turns the preview's camera off (unless
+  it is on in a call).
+- [ ] **new** Channel view: a tile per person in our channel, ours
+  last, a picture shown whole (not a circle), role icon and level by
+  the name and an XP bar along the bottom, the speaking ring follows
+  the voice, a right click (a long
+  press on the phones) opens the person's menu; in the lobby it says
+  to join a channel.
+- [ ] **builds** Windows and macOS compile with the camera backends
+  (`video/src/camera.rs` through nokhwa; never compiled for either).
+- [ ] **new** On each desktop, press the camera button (beside the
+  screen-share button): macOS asks for access the first time; your tile shows you,
+  mirrored, within a second, and the others in the channel see you
+  (not mirrored) on your tile, on desktops and phones. `log:` `camera:
+  <name> opened at 1280x720 30 fps, Mjpeg` (or the camera's nearest),
+  `camera: sending at most 720p` and `camera: encoding with <encoder>
+  at 720p`. At 1080p, the CPU on the sender stays reasonable (the
+  MJPEG decode is ~10 ms a frame). Press again: off for everyone.
+- [ ] **new** macOS (C920 or the built-in camera): 720p and 1080p
+  open — `log:` `camera: … opened at 1280x720 30 fps Nv12` (or Yuyv),
+  no "Cannot fulfill request".
+- [ ] **new** Settings → General → Privacy: turn *Send telemetry to
+  servers* off; `log:` `telemetry to servers: off`; the server logs no
+  more `telemetry:` lines for this user, and an admin's roster tooltip
+  keeps its last line. On, with the camera on: the server logs
+  `telemetry event: … camera started: <model>, …`.
+- [ ] **new** With the camera on, move to another channel: it turns
+  off. Unplug the camera while on: a "stopped working" notice, the
+  button off. With access denied in the system's privacy settings: a
+  notice saying so [CAM-1].
+- [ ] **new** Throttle one viewer's link (or watch from a phone on a
+  weak network): after a few seconds `camera: viewers' loss …, now
+  480p` (from 720p; from 1080p it passes 720p first), never lower, and
+  back up some fifteen seconds after it clears.
+
+---
+
 ## 6. When a line fails
 
 Send back: the platform and its version (Windows build number,

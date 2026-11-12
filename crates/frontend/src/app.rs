@@ -53,6 +53,8 @@ use crate::media::{self, GifPlayer};
 use crate::viewers::Viewer;
 
 mod activity;
+mod live;
+mod views;
 mod alerts;
 mod chat;
 mod commands;
@@ -289,6 +291,10 @@ pub(crate) struct Session {
     /// The conversations and what is being written in them
     /// ([`ChatFlow`]); also started afresh when a session opens.
     pub(crate) chat: ChatFlow,
+    /// Channel timers, recordings and the Server conversation (1.5).
+    pub(crate) live: live::Live,
+    /// Channel view: the cameras in our channel (1.5).
+    pub(crate) stage: views::Stage,
 }
 
 impl Default for Session {
@@ -326,6 +332,8 @@ impl Default for Session {
             safety: Safety::default(),
             transfers: Transfers::default(),
             chat: ChatFlow::default(),
+            live: live::Live::default(),
+            stage: views::Stage::default(),
         }
     }
 }
@@ -425,6 +433,8 @@ pub(crate) struct ChatFlow {
     history_more: bool,
     /// General messages that arrived while a DM was open.
     general_unread: u32,
+    /// The DM last open in Messages: it opens again there (1.5).
+    last_dm: Option<client::UserId>,
 }
 
 // struct_excessive_bools: connected and is_testing_mic here, is_muted
@@ -437,6 +447,8 @@ pub struct AppState {
     pub(crate) network: NetworkThreadHandle,
     voice: VoiceThreadHandle,
     screen: ScreenThreadHandle,
+    /// Our camera's thread (1.5).
+    camera: client::camera::CameraThreadHandle,
     /// Prepared frames + the forward channel from the present-prep
     /// thread (see present.rs), which owns `screen.event_rx` now.
     present: Arc<crate::present::PresentShared>,
@@ -459,7 +471,7 @@ pub struct AppState {
     menu_actions: Vec<menu::Action>,
     /// The conversation a slash command was typed in: its output
     /// (and the answer to the admin command it sent) lands there —
-    /// the admin channel, a DM, or General.
+    /// the Server conversation, a DM, or General.
     command_conv: Option<client::UserId>,
     /// The slash command being run, as typed, until it asks the server
     /// something (`send_admin` takes it) or ends.
@@ -520,6 +532,8 @@ pub struct AppState {
 
     // Roster
     users_model: Rc<VecModel<UserRow>>,
+    /// Channel view's tiles (1.5).
+    stage_model: Rc<VecModel<ui::StageTile>>,
     /// When `users_model` is rebuilt (review P1-9).
     roster_sync: profiles::RosterSync,
 
@@ -537,6 +551,9 @@ pub struct AppState {
     lobby: bool,
     /// The lobby's name (ids renumber on a hot reload; names hold).
     pub(crate) lobby_name: Option<String>,
+    /// The main column a narrow window's Chat replaced (1.5), to come
+    /// back to: `State.view-main`'s list or Channel view.
+    last_main: i32,
     /// When a phone last said someone started a call (`alerts`): once
     /// per ten minutes at most.
     last_join_notice: Option<Instant>,
@@ -635,6 +652,8 @@ pub struct AppState {
     /// The single animation ticker driving every playing GIF (chat
     /// rows + the viewer overlay). Runs only while something plays.
     gif_ticker: slint::Timer,
+    /// The channel timers' second (1.5, `app::live`).
+    clock_timer: slint::Timer,
     /// When the animation ticker last ran: its next step is the time
     /// since (`gif_tick`).
     gif_last_tick: Option<Instant>,
@@ -647,15 +666,17 @@ pub struct AppState {
 /// callback is how workers nudge the Slint loop — the only reference
 /// to the wake mechanism they ever get.
 #[allow(clippy::type_complexity)] // one-shot startup plumbing
-fn spawn_workers(
-    is_testing_mic_shared: &Arc<AtomicBool>,
-) -> (
-    VoiceThreadHandle,
-    ScreenThreadHandle,
-    NetworkThreadHandle,
-    Arc<crate::present::PresentShared>,
-    crossbeam_channel::Receiver<ScreenEvent>,
-) {
+/// The worker threads, as `spawn_workers` starts them.
+struct Workers {
+    voice: VoiceThreadHandle,
+    screen: ScreenThreadHandle,
+    network: NetworkThreadHandle,
+    present: Arc<crate::present::PresentShared>,
+    screen_fwd_rx: crossbeam_channel::Receiver<ScreenEvent>,
+    camera: client::camera::CameraThreadHandle,
+}
+
+fn spawn_workers(is_testing_mic_shared: &Arc<AtomicBool>) -> Workers {
     let wake_fn: client::WakeFn = Arc::new(wake);
     // Both state channels are unbounded: neither the network thread nor
     // the UI may ever wait for the other (review P1-16). With both
@@ -680,6 +701,9 @@ fn spawn_workers(
     );
     // No wake for the screen thread: the present thread below reads its
     // events and wakes the UI (review P1-8).
+    // Our camera (1.5): asleep until it is turned on; its frames go out
+    // on the same bounded media channel as the share's.
+    let camera = client::camera::CameraThreadHandle::spawn(media_tx.clone(), wake_fn.clone());
     let screen = ScreenThreadHandle::spawn(network_tx.clone(), media_tx);
     crate::present::attach_screen(screen.tx.clone());
     // Present-prep thread: takes over screen.event_rx (the UI drain
@@ -707,7 +731,14 @@ fn spawn_workers(
         screen.tx.clone(),
         wake_fn,
     );
-    (voice, screen, network, present_shared, screen_fwd_rx)
+    Workers {
+        voice,
+        screen,
+        network,
+        present: present_shared,
+        screen_fwd_rx,
+        camera,
+    }
 }
 
 /// Prefer the Skia renderer when compiled in: femtovg (the default)
@@ -758,16 +789,28 @@ pub fn run() {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     select_renderer();
     let is_testing_mic_shared = Arc::new(AtomicBool::new(false));
-    let (voice, screen, network, present_shared, screen_fwd_rx) =
-        spawn_workers(&is_testing_mic_shared);
+    let Workers {
+        voice,
+        screen,
+        network,
+        present: present_shared,
+        screen_fwd_rx,
+        camera,
+    } = spawn_workers(&is_testing_mic_shared);
 
     let settings = Settings::load();
     apply_log_level(&settings);
+    // Before any connection: no telemetry leaves when it is off.
+    client::network::set_telemetry_allowed(settings.privacy.send_telemetry);
     // Once per launch, and a no-op after the first: a folder of chat
     // pictures can take a while to delete.
     let _ = std::thread::Builder::new()
         .name("cache-cleanup".into())
-        .spawn(client::config::remove_old_avatar_cache);
+        .spawn(|| {
+            client::config::remove_old_avatar_cache();
+            // Saves a quit cut short: nothing resumes them.
+            let _ = std::fs::remove_dir_all(client::config::partial_downloads_dir());
+        });
 
     // Localize before any UI is built. None = follow the OS locale.
     let locale = i18n::init(settings.language.as_deref());
@@ -797,6 +840,9 @@ pub fn run() {
         .set_chat(ModelRc::from(chat_model.clone()));
     main.global::<State>()
         .set_users(ModelRc::from(users_model.clone()));
+    let stage_model = Rc::new(VecModel::<ui::StageTile>::default());
+    main.global::<State>()
+        .set_stage_tiles(ModelRc::from(stage_model.clone()));
 
     // The emoji palette — straight from the shared catalog.
     let emoji_rows: Vec<ui::EmojiRow> = app_core::emoji::palette()
@@ -813,6 +859,7 @@ pub fn run() {
         network,
         voice,
         screen,
+        camera,
         server_name: String::new(),
         connected: false,
         client_key: client::config::load_client_key(),
@@ -844,12 +891,14 @@ pub fn run() {
         gifs: HashMap::new(),
         pending_preview: None,
         users_model,
+        stage_model,
         roster_sync: profiles::RosterSync::default(),
         main,
         main_repaint_arm: Rc::new(Cell::new(false)),
         main_placed: Cell::new(false),
         lobby: false,
         lobby_name: None,
+        last_main: 1,
         last_join_notice: None,
         voice_in_room: true,
         voice_transmit: true,
@@ -891,6 +940,7 @@ pub fn run() {
         reconnect_attempts: 0,
         meter_timer: slint::Timer::default(),
         gif_ticker: slint::Timer::default(),
+        clock_timer: slint::Timer::default(),
         gif_last_tick: None,
         session: Session::default(),
     }));
@@ -1186,6 +1236,8 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
     logic.on_toggle_share(move || with_app(&w, AppState::handle_toggle_screenshare));
     let w = Rc::downgrade(state);
     logic.on_disconnect(move || with_app(&w, AppState::handle_disconnect));
+    let w = Rc::downgrade(state);
+    logic.on_hang_up(move || with_app(&w, AppState::hang_up));
 
     // ── Roster hover (the profile card) ──────────────────────────
     let w = Rc::downgrade(state);
@@ -1283,24 +1335,37 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
                 .ok()
                 .and_then(|i| app.session.chat.dm_order.get(i).copied())
             {
-                if user == ADMIN_CHANNEL_KEY {
-                    app.open_admin_channel();
-                } else {
-                    app.switch_conversation(Some(user));
-                }
+                app.dm_opened(user);
             }
         });
     });
     let w = Rc::downgrade(state);
-    logic.on_general_clicked(move || {
-        with_app(&w, |app| app.switch_conversation(None));
+    logic.on_sidebar_resized(move |width| with_app(&w, |app| app.sidebar_resized(width)));
+    // ── 1.5: the view bar, Channel view, recordings ─────────────
+    let w = Rc::downgrade(state);
+    logic.on_view_picked(move |view| with_app(&w, |app| app.view_picked(view)));
+    let w = Rc::downgrade(state);
+    logic.on_stage_back(move || with_app(&w, AppState::stage_back));
+    let w = Rc::downgrade(state);
+    logic.on_chat_back(move || with_app(&w, AppState::chat_back));
+    let w = Rc::downgrade(state);
+    logic.on_panel_resized(move |width| with_app(&w, |app| app.panel_resized(width)));
+    let w = Rc::downgrade(state);
+    logic.on_dm_filter_changed(move || with_app(&w, AppState::rebuild_dms_model));
+    let w = Rc::downgrade(state);
+    logic.on_stage_shown(move |shown| with_app(&w, |app| app.stage_shown(shown)));
+    let w = Rc::downgrade(state);
+    logic.on_tile_context(move |index, x, y| with_app(&w, |app| app.open_user_menu(index, x, y)));
+    let w = Rc::downgrade(state);
+    logic.on_channel_stop_recording(move |channel| {
+        with_app(&w, |app| {
+            if let Ok(channel) = u16::try_from(channel) {
+                app.ask_stop_recording(channel);
+            }
+        });
     });
     let w = Rc::downgrade(state);
-    logic.on_messages_toggle(move || with_app(&w, AppState::toggle_messages));
-    let w = Rc::downgrade(state);
-    logic.on_sidebar_resized(move |width| with_app(&w, |app| app.sidebar_resized(width)));
-    let w = Rc::downgrade(state);
-    logic.on_messages_resized(move |h| with_app(&w, |app| app.messages_resized(h)));
+    logic.on_toggle_camera(move || with_app(&w, AppState::toggle_camera));
     let w = Rc::downgrade(state);
     logic.on_file_open(move |row_id| with_app(&w, |app| app.file_open(row_id)));
     let w = Rc::downgrade(state);
@@ -1737,6 +1802,9 @@ pub fn repaint_on_reveal(
             WindowEvent::HoveredFile(_) => set_drop_hover(true),
             WindowEvent::HoveredFileCancelled => set_drop_hover(false),
             WindowEvent::Occluded(hidden) => occluded(*hidden),
+            WindowEvent::Focused(focused) => {
+                WINDOW_FOCUSED.store(*focused, Ordering::Relaxed);
+            }
             WindowEvent::DroppedFile(path) => {
                 let path = path.clone();
                 let _ = slint::invoke_from_event_loop(move || {
@@ -1761,6 +1829,15 @@ pub fn repaint_on_reveal(
         }
         slint::winit_030::EventResult::Propagate
     });
+}
+
+/// The main window has the keyboard focus (desktop; the phones' app is
+/// focused whenever it is on screen). What the person is looking at
+/// does not chime (`alert_direct_message`).
+static WINDOW_FOCUSED: AtomicBool = AtomicBool::new(true);
+
+pub(crate) fn window_focused() -> bool {
+    WINDOW_FOCUSED.load(Ordering::Relaxed)
 }
 
 /// The "drop to send" overlay, from the winit hook (deferred). Only
@@ -1836,8 +1913,6 @@ pub(crate) enum PendingAdmin {
     Panel(i32),
     /// The panel's Audit tab asked for an older page: append.
     AuditMore,
-    /// The admin channel opened: the last page becomes its history.
-    Channel,
 }
 
 /// The composer is rewriting message `msg_id`; the draft it replaced
@@ -1859,6 +1934,10 @@ enum Confirm {
     /// Clear chat, asked first on a touch host: one stray tap beside
     /// the composer wiped the scrollback (review 2026-10, P3-18).
     ClearChat,
+    /// Stop a channel's recording (1.5): its file goes to everyone in it.
+    StopRecording {
+        channel_id: u16,
+    },
 }
 
 /// The channel dialog's subject (spec §5).
@@ -1896,6 +1975,7 @@ struct Conversation {
 }
 
 /// What the Messages section knows about a DM partner.
+#[derive(Default)]
 struct DmMeta {
     name: String,
     unread: u32,
@@ -1904,6 +1984,11 @@ struct DmMeta {
     /// Its history page has been fetched (or there is no store to
     /// fetch from); until then live messages wait for the page.
     fetched: bool,
+    /// The newest line, for the inbox (1.5): from the server's
+    /// `ConversationPreviews`, then from what comes and goes live.
+    preview: String,
+    /// We wrote that line.
+    preview_mine: bool,
 }
 
 /// The last telemetry line for a session, formatted for the tooltip.
@@ -2048,6 +2133,47 @@ pub(crate) fn format_wall_stamp(ms: u64) -> String {
         local.format("%H:%M").to_string()
     } else {
         local.format("%b %-d %H:%M").to_string()
+    }
+}
+
+/// When a conversation last moved, as the inbox says it (1.5): `HH:MM`
+/// today, "Yesterday", the weekday within the week, a short date
+/// before that (with the year when it is not this one).
+pub(crate) fn inbox_when(ms: u64) -> String {
+    use chrono::Datelike;
+    let day = local_day(ms);
+    let today = local_day(u64::try_from(chrono::Local::now().timestamp_millis()).unwrap_or(0));
+    if day == today {
+        return format_wall_time(ms);
+    }
+    if day == today - 1 {
+        return t!("chat-day-yesterday");
+    }
+    let Some(date) = i32::try_from(day)
+        .ok()
+        .and_then(chrono::NaiveDate::from_num_days_from_ce_opt)
+    else {
+        return String::new();
+    };
+    if today - day < 7 {
+        return t!(match date.weekday() {
+            chrono::Weekday::Mon => "weekday-mon",
+            chrono::Weekday::Tue => "weekday-tue",
+            chrono::Weekday::Wed => "weekday-wed",
+            chrono::Weekday::Thu => "weekday-thu",
+            chrono::Weekday::Fri => "weekday-fri",
+            chrono::Weekday::Sat => "weekday-sat",
+            chrono::Weekday::Sun => "weekday-sun",
+        });
+    }
+    let month: String = t!(format!("month-{}", date.month()).as_str())
+        .chars()
+        .take(3)
+        .collect();
+    if date.year() == chrono::Local::now().year() {
+        t!("inbox-date", "month" => month.as_str(), "day" => date.day())
+    } else {
+        t!("inbox-date-year", "month" => month.as_str(), "day" => date.day(), "year" => date.year())
     }
 }
 
@@ -2212,10 +2338,10 @@ const AVATAR_UPLOAD_ID: u32 = 1;
 /// File uploads take ids from here up (spec §7); the avatar keeps 1.
 const FILE_UPLOAD_BASE: u32 = 1_000;
 
-/// The admin channel (spec §8) lives in the Messages section as a
-/// conversation under a reserved key: no user has this id, so it parks
-/// and swaps like a DM while the composer only takes commands there.
-pub(crate) const ADMIN_CHANNEL_KEY: client::UserId = [0xFF; 32];
+/// The Server conversation (1.5): recordings reach the people in them
+/// there. A reserved key no account has, so it parks and swaps like a
+/// DM while nothing can be sent to it.
+pub(crate) use live::SERVER_CONV_KEY;
 
 /// A file on its way to the server (spec §7); the card already
 /// carries its type and size.
@@ -2322,25 +2448,6 @@ fn xp_progress(level: u16, xp: Option<u64>) -> Option<(i32, String)> {
     Some((pct, line))
 }
 
-/// One audit entry as a chat line: "14:06 · mpw kicked bob: spam".
-fn audit_line_text(e: &client::protocol::AuditEntry) -> String {
-    let actor = e.actor.clone().unwrap_or_else(|| t!("admin-actor-server"));
-    let mut line = format!(
-        "{} · {actor} {}",
-        format_wall_time(e.ts),
-        crate::adminui::audit_action_text(&e.action)
-    );
-    if let Some(t) = e.target.as_deref().filter(|t| !t.is_empty()) {
-        line.push(' ');
-        line.push_str(t);
-    }
-    if let Some(d) = e.detail.as_deref().filter(|d| !d.is_empty()) {
-        line.push_str(": ");
-        line.push_str(d);
-    }
-    line
-}
-
 /// Where a rank stands, in words (the panel's Roles tab).
 pub(crate) fn describe_standing(rank: u16) -> String {
     use client::permissions as p;
@@ -2379,6 +2486,9 @@ fn menu_label(label: &menu::Label) -> slint::SharedString {
     let key = match label {
         L::Text(text) => return text.as_str().into(),
         L::RoleName(role) => return role_name(*role).into(),
+        L::RecordingStart => "recording-start",
+        L::RecordingStop => "recording-stop",
+        L::RecordingRemove => "recording-remove",
         L::ChannelConfigOwned => "menu-channel-config-owned",
         L::ChannelEdit => "menu-channel-edit",
         L::ChannelDelete => "menu-channel-delete",

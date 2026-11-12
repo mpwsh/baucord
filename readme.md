@@ -230,7 +230,23 @@ channels:
   - name: Gaming
     password: "hunter2"                 # optional
     user_limit: 8                       # optional
+recording:                              # voice channel recording (1.5)
+  enabled: true                         # needs persistence on
+  sample_rate_hz: 48000                 # 48000, 24000 or 16000 (mono WAV)
+  max_minutes: 240                      # a recording ends itself here (≤ 720)
+  max_concurrent: 2                     # recordings at once on the server
+  total_cap_gb: 10                      # a start is refused at this much on disk
+  retain_days: 30                       # 0 = keep recordings forever
 ```
+
+A recording is started by someone with the `record` permission (the
+built-in `recorder` role has it, as admins do) from the channel's
+right-click menu or `/record`, and is one WAV of everyone's voice. It is
+delivered to the people who were in the channel while it ran, by
+"Server" in their DMs, and to nobody else. Its start and stop show in
+the activity and the audit log. The files live with the other files
+in `blobs/`, the running ones in `recordings/` beside it, both in
+`server backup`.
 
 Omit the `channels` key entirely for a single open `General`. The lobby
 is not a channel in this list: the server adds it itself, everyone

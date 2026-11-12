@@ -381,7 +381,20 @@ fn open(source: &Source) -> Result<(MediaSourceStream<'static>, Hint), String> {
                 .get("content-type")
                 .and_then(|v| v.to_str().ok())
             {
-                hint.mime_type(mime.split(';').next().unwrap_or(mime).trim());
+                let mime = mime.split(';').next().unwrap_or(mime).trim();
+                // A YouTube, Spotify, SoundCloud or Bandcamp link is the
+                // page about the track, not the track: say so, instead of
+                // symphonia's "no suitable format reader" after a megabyte
+                // of HTML.
+                if mime.eq_ignore_ascii_case("text/html") {
+                    return Err(
+                        "that is a web page, not an audio file — I play direct links \
+                         to mp3/ogg/flac/m4a/wav files and radio streams (YouTube and \
+                         the like need music_bot.py, which uses yt-dlp)"
+                            .to_string(),
+                    );
+                }
+                hint.mime_type(mime);
             }
             if let Some(ext) = url
                 .rsplit('/')

@@ -12,7 +12,9 @@
 
 use std::sync::Arc;
 
+pub mod camera;
 pub mod config;
+mod downloads;
 mod inbound_wake;
 pub mod network;
 pub mod screen;

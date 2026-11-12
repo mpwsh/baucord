@@ -202,7 +202,7 @@ impl AppState {
             .dm_order
             .iter()
             .position(|u| {
-                *u != ADMIN_CHANNEL_KEY
+                *u != SERVER_CONV_KEY
                     && self
                         .session
                         .chat
@@ -219,7 +219,7 @@ impl AppState {
     pub(super) fn set_blocked(&mut self, user: client::UserId, block: bool) {
         if !self.session.safety.on
             || Some(user) == self.session.our_user_id
-            || user == ADMIN_CHANNEL_KEY
+            || user == SERVER_CONV_KEY
         {
             return;
         }

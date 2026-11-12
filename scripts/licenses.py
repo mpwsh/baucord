@@ -11,8 +11,8 @@ Two sources, merged into one list:
 - the native code cargo cannot see, listed in COMPONENTS below with its
   license file under licenses/native/ (fetched from each project's own
   repository): Skia and what it bundles, FFmpeg and x264 in the desktop
-  builds, libopus, the GPU encoders' headers, the Lucide icons — and
-  Slint, whose crates carry no license file; and, on the site's page
+  builds, libopus, the GPU encoders' headers, the Lucide icons, the Inter
+  typeface — and Slint, whose crates carry no license file; and, on the site's page
   only, the website's own Alpine.js.
 
 CI runs it before every build (.github/workflows/licenses.yml), so the
@@ -181,6 +181,13 @@ COMPONENTS = [
         "license": "ISC License (and MIT for the icons derived from Feather)",
         "note": "https://lucide.dev",
         "texts": ["lucide.txt"],
+    },
+    {
+        "name": "Inter (the app's typeface)",
+        "license": "SIL Open Font License 1.1",
+        "note": "Copyright (c) 2016 The Inter Project Authors — https://github.com/rsms/inter, "
+        "version 4.1, cut to the scripts the app shows (crates/ui/fonts).",
+        "texts": ["inter-OFL.txt"],
     },
     # `site`: on the website's page only — the apps do not contain it.
     {

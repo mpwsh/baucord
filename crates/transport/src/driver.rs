@@ -1530,14 +1530,13 @@ impl Driver {
 
     /// Video: send one chunk on the track's current group. Dropped
     /// silently when the group was reset (the next keyframe reopens).
-    /// The relay sends with [`Self::send_video_shared`] and a sharer
-    /// with [`Self::send`] on [`Lane::Video`]; this per-track form is
-    /// what the simulator's tests drive.
+    /// The relay sends with [`Self::send_video_shared`] and a sharer's
+    /// screen with [`Self::send`] on [`Lane::Video`]; a camera (1.5)
+    /// rides its own uplink track through this.
     ///
     /// # Errors
     /// Unknown or unconnected peer.
-    #[cfg(test)]
-    pub(crate) fn send_video(
+    pub fn send_video(
         &mut self,
         now: Instant,
         peer: PeerId,
@@ -1924,7 +1923,9 @@ impl Driver {
 
 fn fresh_peer_id(ids: &HashMap<PeerId, ConnectionHandle>) -> PeerId {
     loop {
-        let id: u64 = rand::random();
+        // The top bit is left clear: a downlink video track with it set
+        // is a camera (`protocol::recording::CAMERA_TRACK_BIT`, 1.5).
+        let id: u64 = rand::random::<u64>() & !(1 << 63);
         if id != 0 && !ids.contains_key(&id) {
             return id;
         }

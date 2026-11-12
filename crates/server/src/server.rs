@@ -37,12 +37,16 @@ use transport::{
 };
 
 mod admin;
+mod cameras;
 mod channels;
+mod clocks;
+mod downloads;
 mod dms;
 mod files;
 mod history;
 mod moderation;
 mod profiles;
+mod recording;
 mod safety;
 
 use crate::clock::{Clock, WallMs};
@@ -191,6 +195,13 @@ enum Waiting {
         blob_id: protocol::BlobId,
         refs_then: u32,
     },
+    /// A page of someone's recordings (1.5).
+    Recordings(ClientId),
+    /// A piece of a streamed download (1.5).
+    BlobRange {
+        client: ClientId,
+        blob_id: protocol::BlobId,
+    },
 }
 
 pub struct ChatServer {
@@ -272,6 +283,9 @@ pub struct ChatServer {
     /// whenever `channel_of` changes (a join, a move, a leave, a new
     /// channel list) — events, not packets.
     room_members: HashMap<u16, Vec<ClientId>>,
+    /// When each occupied channel's timer started (1.5), by channel
+    /// name: `clocks.rs`.
+    occupied_since: HashMap<String, Instant>,
     /// The channel list announced to clients, built once from config.
     channel_infos: Vec<ChannelInfo>,
     /// Where new clients land (config `default: true`).
@@ -348,6 +362,25 @@ pub struct ChatServer {
     stats: ServerStats,
     voice: VoiceRelay,
     video: VideoRelay,
+    /// Cameras (1.5): the same relay, on camera tracks.
+    cameras: VideoRelay,
+    // ── Recording (1.5): `recording.rs` ──────────────────────────────
+    recorder: crate::recorder::Recorder,
+    /// Recordings running, by id.
+    recordings: HashMap<u64, recording::ActiveRecording>,
+    /// Recordings that ended and wait for their file.
+    finishing: HashMap<u64, recording::FinishingRecording>,
+    /// Who may fetch each recording's file.
+    recording_access: HashMap<protocol::BlobId, HashSet<UserId>>,
+    /// Each finished recording's file.
+    recording_blob_of: HashMap<u64, protocol::BlobId>,
+    next_rec_id: u64,
+    /// The channels being recorded, by wire id: the voice relay's tap.
+    tapped: HashSet<u16>,
+    blobs_dir: Option<PathBuf>,
+    spool_dir: Option<PathBuf>,
+    /// Streamed downloads in progress (1.5): `downloads.rs`.
+    downloads: HashMap<(ClientId, protocol::BlobId), downloads::Download>,
 }
 
 impl DriverHost for ChatServer {
@@ -387,6 +420,7 @@ impl ChatServer {
         // ── Persistence and policy ──────────────────────────────────
         // Opened (and migrated) here, before the socket binds: a broken
         // database fails startup, never a running server.
+        config.persistence.recording_retain_days = config.recording.retain_days;
         let (persist, startup) = Persist::spawn(&config.persistence)?;
         let mut policy = startup.policy;
         let now = Instant::now();
@@ -470,6 +504,7 @@ impl ChatServer {
             channel_list: config_channels_for_list,
             channel_of: HashMap::new(),
             room_members: HashMap::new(),
+            occupied_since: HashMap::new(),
             channel_infos,
             default_channel,
             config_path: None,
@@ -505,6 +540,17 @@ impl ChatServer {
             stats: ServerStats::default(),
             voice: VoiceRelay::new(),
             video: VideoRelay::new(),
+            cameras: VideoRelay::cameras(),
+            recorder: crate::recorder::Recorder::new(),
+            recordings: HashMap::new(),
+            finishing: HashMap::new(),
+            recording_access: startup.recordings.access,
+            recording_blob_of: startup.recordings.blob_of,
+            next_rec_id: startup.recordings.next_rec_id,
+            tapped: HashSet::new(),
+            blobs_dir: startup.blobs_dir,
+            spool_dir: startup.spool_dir,
+            downloads: HashMap::new(),
         };
         if let Some(code) = server.bootstrap_invite.clone()
             && let Some(invite) = server.policy.invites.get(&code).cloned()
@@ -865,6 +911,7 @@ impl ChatServer {
             }
             self.sweep_restrictions();
             self.prune_admission_failures();
+            self.sweep_recordings();
         }
         if now.duration_since(self.last_progress_minute) >= PROGRESS_INTERVAL {
             self.last_progress_minute = now;
@@ -893,14 +940,29 @@ impl ChatServer {
                 afk_channel: afk,
                 lobby: self.default_channel,
                 channel_of: &self.channel_of,
+                recording: &self.tapped,
             },
         );
-        self.video.process(&mut self.driver, now, &senders);
+        self.pump_recordings();
+        // A sender's screen and camera ride different uplink tracks.
+        for sender in &senders {
+            while let Some((track, item)) = self.driver.recv_video(*sender) {
+                if track == protocol::recording::CAMERA_UPLINK_TRACK {
+                    self.cameras
+                        .relay_video_item(&mut self.driver, now, *sender, item);
+                } else {
+                    self.video
+                        .relay_video_item(&mut self.driver, now, *sender, item);
+                }
+            }
+        }
+        self.pump_downloads();
         self.video
             .process_system_audio(&mut self.driver, now, &senders);
 
         if now.duration_since(self.last_health) >= STREAM_HEALTH_INTERVAL {
             self.send_stream_health();
+            self.send_camera_health();
             self.last_health = now;
         }
 
@@ -987,6 +1049,14 @@ impl ChatServer {
         if let Some(deadline) = self.driver.next_deadline() {
             due = due.min(deadline);
         }
+        // A recording's file comes from the recorder thread, without a
+        // datagram to wake for (1.5): looked for while one is being
+        // finished, never otherwise. (A download's next piece needs no
+        // wake of its own: its stream is paced by the transport, whose
+        // deadlines wake the tick, and the read is a database read.)
+        if !self.finishing.is_empty() {
+            due = due.min(self.now + Duration::from_millis(100));
+        }
         due
     }
 
@@ -1004,6 +1074,9 @@ impl ChatServer {
             "Shutting down: closing {} connections ({reason})",
             self.driver.peer_count()
         );
+        self.now = now;
+        // Recordings are parked: the next start finishes their files.
+        self.park_recordings();
         for peer in self.driver.peers() {
             self.driver.close(now, peer, reason);
         }
@@ -1013,6 +1086,9 @@ impl ChatServer {
     /// Have the persistence thread write what is queued and stop
     /// (bounded). The last step of a shutdown.
     pub fn finish_shutdown(&mut self) {
+        // The spools' headers first: they are what the next start
+        // finishes recordings from.
+        self.recorder.shutdown(Duration::from_secs(3));
         self.persist.shutdown();
     }
 
@@ -1682,6 +1758,18 @@ impl ChatServer {
                 Waiting::BlobRecount { blob_id, refs_then } => {
                     self.resolve_blob_recount(blob_id, refs_then, &outcome);
                 }
+                Waiting::Recordings(client) => match outcome {
+                    crate::persistence::Outcome::Answered(crate::persistence::Answer::Recordings(
+                        items,
+                        more,
+                    )) => {
+                        self.resolve_recordings(client, items, more);
+                    }
+                    _ => debug!("a recordings list for {client:#x} did not come"),
+                },
+                Waiting::BlobRange { client, blob_id } => {
+                    self.resolve_blob_range(client, blob_id, outcome);
+                }
             }
         }
     }
@@ -2076,6 +2164,9 @@ impl ChatServer {
 
         self.last_activity.insert(client_id, self.now);
         self.send_channel_details(client_id);
+        self.send_channel_clocks(client_id);
+        self.send_recordings_running(client_id);
+        self.handle_fetch_recordings(client_id, None);
         self.replay_history(client_id);
         self.send_conversations(client_id);
 
@@ -2262,6 +2353,14 @@ impl ChatServer {
         }
         self.audio_states.remove(&client_id);
         self.deafened.remove(&client_id);
+        self.forget_downloads(client_id);
+        let room: Vec<ClientId> = self
+            .channel_of
+            .get(&client_id)
+            .and_then(|ch| self.room_members.get(ch))
+            .cloned()
+            .unwrap_or_default();
+        self.cameras_after_disconnect(client_id, &room);
         let was_visible = self
             .channel_of
             .remove(&client_id)
@@ -2723,6 +2822,41 @@ impl ChatServer {
                 note,
             } => self.handle_report(client_id, target, reason, &note),
             ClientMessage::DeleteAccount => self.handle_delete_account(client_id),
+
+            // ── Recording (1.5) ─────────────────────────────────────
+            ClientMessage::StartRecording { channel_id } => {
+                self.handle_start_recording(client_id, channel_id);
+            }
+            ClientMessage::StopRecording { channel_id } => {
+                self.handle_stop_recording(client_id, channel_id);
+            }
+            ClientMessage::FetchRecordings { before } => {
+                self.handle_fetch_recordings(client_id, before);
+            }
+            ClientMessage::RemoveRecording { rec_id } => {
+                self.handle_remove_recording(client_id, rec_id);
+            }
+            ClientMessage::MarkRecordingsSeen { up_to } => {
+                self.handle_recordings_seen(client_id, up_to);
+            }
+            ClientMessage::FetchBlobFrom { blob_id, offset } => {
+                self.handle_fetch_blob_from(client_id, blob_id, offset);
+            }
+
+            // ── Cameras (1.5) ───────────────────────────────────────
+            ClientMessage::CameraStart { width, height } => {
+                self.handle_camera_start(client_id, width, height);
+            }
+            ClientMessage::CameraStop => self.handle_camera_stop(client_id),
+            ClientMessage::SubscribeCamera { target_id } => {
+                self.handle_subscribe_camera(client_id, target_id);
+            }
+            ClientMessage::UnsubscribeCamera { target_id } => {
+                self.handle_unsubscribe_camera(client_id, target_id);
+            }
+            ClientMessage::RequestCameraKeyframe { target_id } => {
+                self.handle_camera_keyframe(client_id, target_id);
+            }
         }
     }
 
@@ -3024,6 +3158,10 @@ impl ChatServer {
         for client in demoted {
             self.withdraw(client);
         }
+        // The list renumbered: every running timer again, by its new id.
+        for client in self.clients() {
+            self.send_channel_clocks(client);
+        }
 
         // ── Re-derive channel-scoped share visibility ───────────────
         // For each channel-scoped stream, compare each client's view
@@ -3110,6 +3248,11 @@ impl ChatServer {
             self.deny_join(client_id, channel_id, ChannelDenyReason::WrongPassword);
             return;
         }
+        // A recording channel takes only clients that show its label.
+        if !self.may_join_recording(client_id, channel_id) {
+            self.deny_join(client_id, channel_id, ChannelDenyReason::NotPermitted);
+            return;
+        }
         if let Some(limit) = target.user_limit
             && self.members_in(channel_id) >= usize::from(limit)
         {
@@ -3147,6 +3290,8 @@ impl ChatServer {
             }),
         }
         self.revalidate_shares_after_move(client_id, old_channel, channel_id);
+        self.note_recording_participant(client_id, channel_id);
+        self.cameras_after_move(client_id, old_channel, channel_id);
     }
 
     fn deny_join(&mut self, client_id: ClientId, channel_id: u16, reason: ChannelDenyReason) {
@@ -3167,6 +3312,8 @@ impl ChatServer {
             }
         }
         self.room_members.retain(|_, members| !members.is_empty());
+        self.update_channel_clocks();
+        self.check_recordings();
     }
 
     /// Members currently in `channel_id`.
@@ -3676,6 +3823,8 @@ fn event_kind(e: &TelemetryEvent) -> &'static str {
         TelemetryEvent::ShareStarted { .. } => "share_started",
         TelemetryEvent::ShareStopped => "share_stopped",
         TelemetryEvent::Disconnected { .. } => "disconnected",
+        TelemetryEvent::CameraStarted { .. } => "camera_started",
+        TelemetryEvent::CameraStopped => "camera_stopped",
     }
 }
 
@@ -3701,6 +3850,12 @@ fn describe_event(e: &TelemetryEvent) -> String {
         }
         TelemetryEvent::ShareStopped => "share stopped".to_string(),
         TelemetryEvent::Disconnected { reason } => format!("disconnected: {reason}"),
+        TelemetryEvent::CameraStarted {
+            camera,
+            mode,
+            encoder,
+        } => format!("camera started: {camera}, {mode}, {encoder}"),
+        TelemetryEvent::CameraStopped => "camera stopped".to_string(),
     }
 }
 
