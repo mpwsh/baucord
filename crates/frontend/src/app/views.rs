@@ -128,11 +128,10 @@ impl AppState {
             }
         };
         match view {
-            VIEW_LIST | VIEW_STAGE if pick(main) => {
-                // The one showing: hidden, if the chat takes the room.
-                if !narrow && s.get_view_chat() {
-                    s.set_view_main(MAIN_NONE);
-                }
+            // The one showing: hidden, if the chat takes the room (else
+            // the arms below set it again, which changes nothing).
+            VIEW_LIST | VIEW_STAGE if pick(main) && !narrow && s.get_view_chat() => {
+                s.set_view_main(MAIN_NONE);
             }
             VIEW_LIST => s.set_view_main(MAIN_LIST),
             VIEW_STAGE => s.set_view_main(MAIN_STAGE),
