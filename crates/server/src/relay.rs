@@ -510,9 +510,10 @@ impl VideoRelay {
             let mut worst_rtt_ms = 0f32;
             let mut viewers = 0u16;
             for viewer in subs {
-                let (Some(link), Some(track)) =
-                    (driver.stats(*viewer), driver.track_stats(*viewer, *sharer | self.track_bit))
-                else {
+                let (Some(link), Some(track)) = (
+                    driver.stats(*viewer),
+                    driver.track_stats(*viewer, *sharer | self.track_bit),
+                ) else {
                     continue;
                 };
                 let window = self.health_window.entry((*viewer, *sharer)).or_default();

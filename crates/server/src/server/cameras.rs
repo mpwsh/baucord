@@ -10,7 +10,9 @@
 //! lobby turns it off.
 
 use log::info;
-use protocol::{features, permissions, ClientId, DenyReason, RestrictionKind, ServerMessage, ShareScope};
+use protocol::{
+    features, permissions, ClientId, DenyReason, RestrictionKind, ServerMessage, ShareScope,
+};
 
 use super::ChatServer;
 use crate::relay::ShareInfo;
@@ -60,10 +62,9 @@ impl ChatServer {
             self.deny_camera(client, None, DenyReason::InvalidDimensions);
             return;
         }
-        let on_here = self
-            .room_members
-            .get(&ch)
-            .map_or(0, |m| m.iter().filter(|p| self.cameras.is_sharing(**p)).count());
+        let on_here = self.room_members.get(&ch).map_or(0, |m| {
+            m.iter().filter(|p| self.cameras.is_sharing(**p)).count()
+        });
         if !self.cameras.is_sharing(client)
             && on_here >= self.config.limits.max_cameras_per_channel
             && !self.has_permission(client, permissions::BYPASS_LIMITS)
@@ -80,7 +81,10 @@ impl ChatServer {
                 scope: ShareScope::Channel,
             },
         );
-        info!("{} ({client:#x}) turned their camera on ({width}x{height})", self.username_of(client));
+        info!(
+            "{} ({client:#x}) turned their camera on ({width}x{height})",
+            self.username_of(client)
+        );
         let audience = self.camera_audience(client);
         self.send_to(
             &audience,
@@ -98,7 +102,8 @@ impl ChatServer {
         if !self.cameras.is_sharing(client) {
             return;
         }
-        self.cameras.stop_sharing(&mut self.driver, self.now, client);
+        self.cameras
+            .stop_sharing(&mut self.driver, self.now, client);
         info!("{} ({client:#x}) camera off", self.username_of(client));
         let msg = ServerMessage::CameraStopped { client_id: client };
         self.send_to(audience, &msg);
@@ -130,7 +135,10 @@ impl ChatServer {
         }
         self.cameras.subscribe(client, target);
         if self.cameras.allow_keyframe_request(self.now, target) {
-            self.send_msg(target, &ServerMessage::CameraKeyframeRequested { viewer_id: client });
+            self.send_msg(
+                target,
+                &ServerMessage::CameraKeyframeRequested { viewer_id: client },
+            );
         }
     }
 
@@ -146,7 +154,10 @@ impl ChatServer {
         if self.cameras.is_subscribed(client, target)
             && self.cameras.allow_keyframe_request(self.now, target)
         {
-            self.send_msg(target, &ServerMessage::CameraKeyframeRequested { viewer_id: client });
+            self.send_msg(
+                target,
+                &ServerMessage::CameraKeyframeRequested { viewer_id: client },
+            );
         }
     }
 
@@ -221,7 +232,10 @@ impl ChatServer {
                 .copied()
                 .filter(|p| *p != client && self.has_feature(*p, features::CAMERA))
                 .collect();
-            self.send_to(&audience, &ServerMessage::CameraStopped { client_id: client });
+            self.send_to(
+                &audience,
+                &ServerMessage::CameraStopped { client_id: client },
+            );
         }
     }
 

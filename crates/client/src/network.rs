@@ -2467,11 +2467,10 @@ impl NetworkClient {
                 viewers,
                 ..
             } => {
-                self.message_queue
-                    .push(NetworkMessage::CameraHealth {
-                        worst_loss,
-                        viewers,
-                    });
+                self.message_queue.push(NetworkMessage::CameraHealth {
+                    worst_loss,
+                    viewers,
+                });
             } // No catch-all: the match is exhaustive on purpose, so a
               // new ServerMessage variant is a compile error here (a
               // reminder to handle it) instead of a silent log line.
@@ -2752,7 +2751,13 @@ impl NetworkClient {
     }
 
     /// Start a streamed download (1.5).
-    fn begin_download(&mut self, now: Instant, blob_id: [u8; 32], size: u64, path: &std::path::Path) {
+    fn begin_download(
+        &mut self,
+        now: Instant,
+        blob_id: [u8; 32],
+        size: u64,
+        path: &std::path::Path,
+    ) {
         match crate::downloads::Download::create(path, size) {
             Ok(d) => {
                 self.downloads.running.insert(blob_id, d);
@@ -2811,7 +2816,8 @@ impl NetworkClient {
             .name("download-check".into())
             .spawn(move || {
                 let ok = crate::downloads::check(&path, &blob_id);
-                tx.send(NetworkControl::DownloadChecked { blob_id, path, ok }).ok();
+                tx.send(NetworkControl::DownloadChecked { blob_id, path, ok })
+                    .ok();
             });
         if spawned.is_err() {
             self.message_queue
@@ -3226,7 +3232,10 @@ impl NetworkClient {
                     let _ = self.driver.send_video(now, self.server, track, &chunk);
                 }
             }
-            None => warn!("Camera frame seq={seq} not packable ({} bytes), dropping", data.len()),
+            None => warn!(
+                "Camera frame seq={seq} not packable ({} bytes), dropping",
+                data.len()
+            ),
         }
     }
 

@@ -18,10 +18,11 @@
 //! A child of `app`: everything private to `AppState` is in reach
 //! through `super::*`, so these are the same methods, only filed.
 
-#[allow(clippy::wildcard_imports)]
-use super::*;
 use client::protocol::recording::CAMERA_TRACK_BIT;
 use ui::StageTile;
+
+#[allow(clippy::wildcard_imports)]
+use super::*;
 
 /// The rail's buttons, as `Logic.view-picked` numbers them.
 const VIEW_LIST: i32 = 0;
@@ -119,7 +120,13 @@ impl AppState {
         let (main, chat) = self.columns();
         let narrow = self.narrow();
         let s = self.main.global::<State>();
-        let pick = |m: i32| if view == VIEW_LIST { m == MAIN_LIST } else { m == MAIN_STAGE };
+        let pick = |m: i32| {
+            if view == VIEW_LIST {
+                m == MAIN_LIST
+            } else {
+                m == MAIN_STAGE
+            }
+        };
         match view {
             VIEW_LIST | VIEW_STAGE if pick(main) => {
                 // The one showing: hidden, if the chat takes the room.
@@ -417,7 +424,10 @@ impl AppState {
         if Some(client_id) == self.session.our_client_id {
             return;
         }
-        info!("{} turned their camera on ({width}x{height})", self.username_of(client_id));
+        info!(
+            "{} turned their camera on ({width}x{height})",
+            self.username_of(client_id)
+        );
         self.session
             .stage
             .cameras
@@ -590,7 +600,10 @@ impl AppState {
     /// goes, as viewers do.
     pub(super) fn forget_cameras(&mut self) {
         if self.session.stage.sending {
-            self.camera.tx.send(client::camera::CameraControl::Stop).ok();
+            self.camera
+                .tx
+                .send(client::camera::CameraControl::Stop)
+                .ok();
             self.main.global::<State>().set_camera_on(false);
         }
         let ids: Vec<u64> = self.session.stage.cameras.keys().copied().collect();
@@ -700,7 +713,10 @@ impl AppState {
 
     /// Settings → Camera's preview off, with no call sending.
     pub(crate) fn stop_camera_preview_thread(&self) {
-        self.camera.tx.send(client::camera::CameraControl::Stop).ok();
+        self.camera
+            .tx
+            .send(client::camera::CameraControl::Stop)
+            .ok();
     }
 
     /// Settings → Camera's mirror or data saver changed: the open
@@ -718,7 +734,10 @@ impl AppState {
     /// Our camera off: the thread, the room (if it was told), the tile.
     pub(super) fn stop_own_camera(&mut self, tell_server: bool) {
         if self.session.stage.sending {
-            self.camera.tx.send(client::camera::CameraControl::Stop).ok();
+            self.camera
+                .tx
+                .send(client::camera::CameraControl::Stop)
+                .ok();
             crate::settingsui::camera_preview_ended(self);
         }
         if self.session.stage.announced {
@@ -778,7 +797,8 @@ impl AppState {
                 crate::settingsui::camera_heights(self, &heights);
             }
             CameraEvent::Error(failure) => {
-                let was_on = self.session.stage.sending || crate::settingsui::camera_previewing(self);
+                let was_on =
+                    self.session.stage.sending || crate::settingsui::camera_previewing(self);
                 self.stop_own_camera(true);
                 crate::settingsui::camera_preview_ended(self);
                 if was_on {

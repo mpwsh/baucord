@@ -265,9 +265,8 @@ impl Mixer {
                 if let Some(block) = block {
                     let out = &mut self.scratch;
                     if let Ok(n) = sp.decoder.decode(block.data, out, false) {
-                        let block_pos = pos.saturating_sub(
-                            u64::from(block.ts_offset) * u64::from(rate) / 48_000,
-                        );
+                        let block_pos = pos
+                            .saturating_sub(u64::from(block.ts_offset) * u64::from(rate) / 48_000);
                         repaired.push((block_pos, out[..n].to_vec()));
                         sp.frame = n.max(1);
                         self.stats.repaired_red += 1;
@@ -397,8 +396,9 @@ fn limit(v: i32) -> i16 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use protocol::pack_voice_with_flags;
+
+    use super::*;
 
     const RATE: u32 = 48_000;
     const FRAME: usize = 960;
@@ -511,7 +511,14 @@ mod tests {
                 continue; // lost
             }
             // 11 arrives before 9.
-            let arrival = if i == 9 { 12 } else if i == 11 { 9 } else { i } as u64 * 960;
+            let arrival = if i == 9 {
+                12
+            } else if i == 11 {
+                9
+            } else {
+                i
+            } as u64
+                * 960;
             mix.push(1, arrival, p);
         }
         let mut out = Vec::new();
@@ -567,7 +574,10 @@ mod tests {
             mix.drain_ready(&mut out);
             written += out.len();
             out.clear();
-            assert!(mix.buf.len() < 16_000 * 2, "the timeline holds about a second");
+            assert!(
+                mix.buf.len() < 16_000 * 2,
+                "the timeline holds about a second"
+            );
         }
         mix.finish(30_000 * 320, &mut out);
         written += out.len();

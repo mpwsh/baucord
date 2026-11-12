@@ -39,7 +39,12 @@ pub(super) struct Download {
 
 impl ChatServer {
     /// `FetchBlobFrom`.
-    pub(super) fn handle_fetch_blob_from(&mut self, client: ClientId, blob_id: BlobId, offset: u64) {
+    pub(super) fn handle_fetch_blob_from(
+        &mut self,
+        client: ClientId,
+        blob_id: BlobId,
+        offset: u64,
+    ) {
         if !self.may_fetch(client, &blob_id) {
             self.send_msg(client, &ServerMessage::BlobMissing { blob_id });
             return;
@@ -47,7 +52,9 @@ impl ChatServer {
         // A blob held in memory (an avatar, or anything on a server
         // without persistence) goes in one piece.
         if let Some(bytes) = self.blob_bytes.get(&blob_id).cloned() {
-            let from = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
+            let from = usize::try_from(offset)
+                .unwrap_or(usize::MAX)
+                .min(bytes.len());
             self.send_parts(client, blob_id, offset, &bytes[from..], bytes.len() as u64);
             return;
         }
@@ -102,7 +109,8 @@ impl ChatServer {
                 },
                 self.now + PIECE_DEADLINE,
             );
-            self.waiting.insert(ask, Waiting::BlobRange { client, blob_id });
+            self.waiting
+                .insert(ask, Waiting::BlobRange { client, blob_id });
             if let Some(d) = self.downloads.get_mut(&key) {
                 d.reading = true;
             }
@@ -110,7 +118,12 @@ impl ChatServer {
     }
 
     /// A piece was read (or not).
-    pub(super) fn resolve_blob_range(&mut self, client: ClientId, blob_id: BlobId, outcome: Outcome) {
+    pub(super) fn resolve_blob_range(
+        &mut self,
+        client: ClientId,
+        blob_id: BlobId,
+        outcome: Outcome,
+    ) {
         let key = (client, blob_id);
         let Some(d) = self.downloads.get(&key).copied() else {
             return;
@@ -178,7 +191,9 @@ impl ChatServer {
                 total,
                 data: Vec::new(),
             };
-            frames.push(protocol::Bytes::from(protocol::encode_server_message(&msg)?));
+            frames.push(protocol::Bytes::from(protocol::encode_server_message(
+                &msg,
+            )?));
         }
         self.stats.bytes_sent += body.len() as u64;
         match self.driver.send_media(self.now, client, frames) {

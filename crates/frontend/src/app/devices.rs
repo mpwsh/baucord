@@ -270,7 +270,11 @@ impl AppState {
         client::network::set_telemetry_allowed(self.settings.privacy.send_telemetry);
         log::info!(
             "telemetry to servers: {}",
-            if self.settings.privacy.send_telemetry { "on" } else { "off" }
+            if self.settings.privacy.send_telemetry {
+                "on"
+            } else {
+                "off"
+            }
         );
     }
 

@@ -59,7 +59,8 @@ impl Download {
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.write_all(&data[..take])?;
         self.note(offset, end);
-        let pct = u8::try_from(self.received().saturating_mul(100) / self.total.max(1)).unwrap_or(100);
+        let pct =
+            u8::try_from(self.received().saturating_mul(100) / self.total.max(1)).unwrap_or(100);
         if pct != self.last_pct {
             self.last_pct = pct;
             return Ok(Some(pct));

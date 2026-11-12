@@ -40,8 +40,8 @@ mod admin;
 mod cameras;
 mod channels;
 mod clocks;
-mod downloads;
 mod dms;
+mod downloads;
 mod files;
 mod history;
 mod moderation;
@@ -1759,10 +1759,9 @@ impl ChatServer {
                     self.resolve_blob_recount(blob_id, refs_then, &outcome);
                 }
                 Waiting::Recordings(client) => match outcome {
-                    crate::persistence::Outcome::Answered(crate::persistence::Answer::Recordings(
-                        items,
-                        more,
-                    )) => {
+                    crate::persistence::Outcome::Answered(
+                        crate::persistence::Answer::Recordings(items, more),
+                    ) => {
                         self.resolve_recordings(client, items, more);
                     }
                     _ => debug!("a recordings list for {client:#x} did not come"),

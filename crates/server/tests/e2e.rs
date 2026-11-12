@@ -3192,7 +3192,12 @@ fn a_member_watching_a_screen_share_is_not_moved_to_afk() {
         matches!(m, ServerMessage::ScreenShareStarted { client_id, .. } if *client_id == alice_id)
             .then_some(())
     });
-    bob.send(&mut w, &ClientMessage::SubscribeScreen { target_id: alice_id });
+    bob.send(
+        &mut w,
+        &ClientMessage::SubscribeScreen {
+            target_id: alice_id,
+        },
+    );
     // Bob says nothing for 93 s, the share on his screen the whole time;
     // the same idle stretch moves a member who is not watching.
     for _ in 0..3 {
@@ -6917,7 +6922,10 @@ fn a_channel_timer_runs_from_the_first_join_to_the_last_leave() {
     old.features = features::CLIENT_1_1 & !features::CHANNEL_CLOCK;
     let code = w.guest_code.clone();
     old.hello(&mut w, "old", Auth::Invite { code });
-    w.settle(&mut [&mut old, &mut alice, &mut bob], Duration::from_secs(1));
+    w.settle(
+        &mut [&mut old, &mut alice, &mut bob],
+        Duration::from_secs(1),
+    );
     assert!(!old
         .inbox
         .iter()
@@ -6944,7 +6952,10 @@ fn a_recording_reaches_the_people_in_it_and_nobody_else() {
     assert_eq!(why, protocol::recording::RecordingDenyReason::NoPermission);
     // The guest steps out before it starts.
     guest.join(&mut w, 1, None);
-    w.settle(&mut [&mut guest, &mut admin, &mut alice], Duration::from_millis(500));
+    w.settle(
+        &mut [&mut guest, &mut admin, &mut alice],
+        Duration::from_millis(500),
+    );
 
     admin.send(&mut w, &ClientMessage::StartRecording { channel_id: 0 });
     let rec_id = alice.wait_for(&mut w, &mut [&mut admin, &mut guest], |m| match m {
@@ -6972,8 +6983,8 @@ fn a_recording_reaches_the_people_in_it_and_nobody_else() {
     // Real speech-like sound: a 440 Hz tone, encoded as the client
     // encodes, so the file can be checked for it (a silent frame let a
     // silent recording pass).
-    let mut enc = opus::Encoder::new(48_000, opus::Channels::Mono, opus::Application::Voip)
-        .expect("encoder");
+    let mut enc =
+        opus::Encoder::new(48_000, opus::Channels::Mono, opus::Application::Voip).expect("encoder");
     let mut opus_buf = vec![0u8; 512];
     for seq in 0..50u32 {
         let pcm: Vec<f32> = (0..960)
@@ -6996,23 +7007,29 @@ fn a_recording_reaches_the_people_in_it_and_nobody_else() {
         );
     }
     admin.send(&mut w, &ClientMessage::StopRecording { channel_id: 0 });
-    let (duration_ms, reason) = alice.wait_for(&mut w, &mut [&mut admin, &mut guest], |m| match m {
-        ServerMessage::RecordingStopped {
-            rec_id: id,
-            duration_ms,
-            reason,
-            ..
-        } if *id == rec_id => Some((*duration_ms, *reason)),
-        _ => None,
-    });
+    let (duration_ms, reason) =
+        alice.wait_for(&mut w, &mut [&mut admin, &mut guest], |m| match m {
+            ServerMessage::RecordingStopped {
+                rec_id: id,
+                duration_ms,
+                reason,
+                ..
+            } if *id == rec_id => Some((*duration_ms, *reason)),
+            _ => None,
+        });
     assert_eq!(reason, protocol::recording::RecordingStopReason::Stopped);
     assert!(duration_ms >= 1_000, "{duration_ms}");
 
     // The file comes from Server to the two who were in it.
-    let item = wait_real(&mut w, &mut alice, &mut [&mut admin, &mut guest], |m| match m {
-        ServerMessage::RecordingReady { item } => Some(item.clone()),
-        _ => None,
-    });
+    let item = wait_real(
+        &mut w,
+        &mut alice,
+        &mut [&mut admin, &mut guest],
+        |m| match m {
+            ServerMessage::RecordingReady { item } => Some(item.clone()),
+            _ => None,
+        },
+    );
     assert_eq!(item.rec_id, rec_id);
     assert_eq!(item.channel, "General");
     assert!(std::path::Path::new(&item.file_name)
@@ -7021,11 +7038,18 @@ fn a_recording_reaches_the_people_in_it_and_nobody_else() {
     assert!(!item.seen);
     // 48 kHz mono 16-bit: 96 bytes a millisecond, plus the header.
     let expected = 44 + duration_ms * 96;
-    assert!(item.size.abs_diff(expected) <= 96 * 30, "{} vs {expected}", item.size);
+    assert!(
+        item.size.abs_diff(expected) <= 96 * 30,
+        "{} vs {expected}",
+        item.size
+    );
     wait_real(&mut w, &mut admin, &mut [&mut alice, &mut guest], |m| {
         matches!(m, ServerMessage::RecordingReady { .. }).then_some(())
     });
-    w.settle(&mut [&mut alice, &mut admin, &mut guest], Duration::from_secs(1));
+    w.settle(
+        &mut [&mut alice, &mut admin, &mut guest],
+        Duration::from_secs(1),
+    );
     assert!(!guest
         .inbox
         .iter()
@@ -7055,8 +7079,14 @@ fn a_recording_reaches_the_people_in_it_and_nobody_else() {
     let mut filled = 0usize;
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     while filled < got.len() {
-        assert!(std::time::Instant::now() < deadline, "download stalled at {filled}");
-        w.settle(&mut [&mut alice, &mut admin, &mut guest], Duration::from_millis(50));
+        assert!(
+            std::time::Instant::now() < deadline,
+            "download stalled at {filled}"
+        );
+        w.settle(
+            &mut [&mut alice, &mut admin, &mut guest],
+            Duration::from_millis(50),
+        );
         std::thread::sleep(Duration::from_millis(2));
         for m in alice.inbox.drain(..) {
             if let ServerMessage::BlobPart {
@@ -7093,19 +7123,32 @@ fn a_recording_reaches_the_people_in_it_and_nobody_else() {
     let key = alice.key.clone();
     alice.leave(&mut w);
     let mut alice = w.connect_with_key("alice", Auth::Key, key.clone());
-    let items = wait_real(&mut w, &mut alice, &mut [&mut admin, &mut guest], |m| match m {
-        ServerMessage::Recordings { items, .. } => Some(items.clone()),
-        _ => None,
-    });
+    let items = wait_real(
+        &mut w,
+        &mut alice,
+        &mut [&mut admin, &mut guest],
+        |m| match m {
+            ServerMessage::Recordings { items, .. } => Some(items.clone()),
+            _ => None,
+        },
+    );
     assert_eq!(items.len(), 1);
     alice.send(&mut w, &ClientMessage::RemoveRecording { rec_id });
-    w.settle(&mut [&mut alice, &mut admin, &mut guest], Duration::from_secs(1));
+    w.settle(
+        &mut [&mut alice, &mut admin, &mut guest],
+        Duration::from_secs(1),
+    );
     alice.leave(&mut w);
     let mut alice = w.connect_with_key("alice", Auth::Key, key);
-    let items = wait_real(&mut w, &mut alice, &mut [&mut admin, &mut guest], |m| match m {
-        ServerMessage::Recordings { items, .. } => Some(items.clone()),
-        _ => None,
-    });
+    let items = wait_real(
+        &mut w,
+        &mut alice,
+        &mut [&mut admin, &mut guest],
+        |m| match m {
+            ServerMessage::Recordings { items, .. } => Some(items.clone()),
+            _ => None,
+        },
+    );
     assert!(items.is_empty());
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -7173,7 +7216,10 @@ fn a_camera_is_seen_by_its_channel_on_a_track_of_its_own() {
     let mut carol = w.connect_member("carol");
     let alice_id = alice.id;
     carol.join(&mut w, 1, None);
-    w.settle(&mut [&mut alice, &mut bob, &mut carol], Duration::from_millis(500));
+    w.settle(
+        &mut [&mut alice, &mut bob, &mut carol],
+        Duration::from_millis(500),
+    );
     alice.send(
         &mut w,
         &ClientMessage::CameraStart {
@@ -7185,21 +7231,31 @@ fn a_camera_is_seen_by_its_channel_on_a_track_of_its_own() {
         ServerMessage::CameraStarted { client_id, .. } if *client_id == alice_id => Some(()),
         _ => None,
     });
-    w.settle(&mut [&mut alice, &mut bob, &mut carol], Duration::from_millis(300));
+    w.settle(
+        &mut [&mut alice, &mut bob, &mut carol],
+        Duration::from_millis(300),
+    );
     assert!(!carol
         .inbox
         .iter()
         .any(|m| matches!(m, ServerMessage::CameraStarted { .. })));
-    bob.send(&mut w, &ClientMessage::SubscribeCamera { target_id: alice.id });
+    bob.send(
+        &mut w,
+        &ClientMessage::SubscribeCamera {
+            target_id: alice.id,
+        },
+    );
     alice.wait_for(&mut w, &mut [&mut bob, &mut carol], |m| {
         matches!(m, ServerMessage::CameraKeyframeRequested { .. }).then_some(())
     });
     // A keyframe on the camera track reaches bob on alice's camera
     // track, not her screen's.
     let now = w.net.now();
-    w.net
-        .driver(alice.node)
-        .video_new_group(now, alice.peer, protocol::recording::CAMERA_UPLINK_TRACK);
+    w.net.driver(alice.node).video_new_group(
+        now,
+        alice.peer,
+        protocol::recording::CAMERA_UPLINK_TRACK,
+    );
     let chunks = protocol::pack_video_frame(0, true, 640, 360, 0, &[7u8; 2000]).unwrap();
     for c in &chunks {
         let now = w.net.now();
@@ -7211,7 +7267,10 @@ fn a_camera_is_seen_by_its_channel_on_a_track_of_its_own() {
     let mut tracks = Vec::new();
     let deadline = w.net.now() + Duration::from_secs(2);
     while w.net.now() < deadline && tracks.len() < chunks.len() {
-        w.settle(&mut [&mut alice, &mut bob, &mut carol], Duration::from_millis(20));
+        w.settle(
+            &mut [&mut alice, &mut bob, &mut carol],
+            Duration::from_millis(20),
+        );
         while let Some((track, item)) = w.net.driver(bob.node).recv_video(bob.peer) {
             if matches!(item, VideoItem::Chunk(_)) {
                 tracks.push(track);

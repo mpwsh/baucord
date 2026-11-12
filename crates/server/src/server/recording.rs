@@ -130,10 +130,10 @@ impl ChatServer {
         if self.recording_bytes() >= u64::from(cfg.total_cap_gb) << 30 {
             return Some(RecordingDenyReason::StorageFull);
         }
-        let everyone_sees_the_label = self.room_members.get(&channel_id).is_none_or(|m| {
-            m.iter()
-                .all(|c| self.has_feature(*c, features::RECORDING))
-        });
+        let everyone_sees_the_label = self
+            .room_members
+            .get(&channel_id)
+            .is_none_or(|m| m.iter().all(|c| self.has_feature(*c, features::RECORDING)));
         (!everyone_sees_the_label).then_some(RecordingDenyReason::OldClients)
     }
 
@@ -253,14 +253,22 @@ impl ChatServer {
         let duration_ms =
             u64::try_from(self.now.duration_since(rec.started).as_millis()).unwrap_or(u64::MAX);
         let parking = reason == RecordingStopReason::ServerRestart;
-        self.recorder
-            .close(rec_id, self.now, if parking { None } else { self.blobs_dir.clone() });
+        self.recorder.close(
+            rec_id,
+            self.now,
+            if parking {
+                None
+            } else {
+                self.blobs_dir.clone()
+            },
+        );
         info!(
             "recording #{rec_id} of '{}' ended after {} ({}{})",
             rec.channel,
             protocol::recording::clock_label(duration_ms),
             reason.describe(),
-            by.as_ref().map_or(String::new(), |(_, n)| format!(", by {n}"))
+            by.as_ref()
+                .map_or(String::new(), |(_, n)| format!(", by {n}"))
         );
         self.audit(
             by.as_ref().map(|(u, _)| *u),
@@ -404,7 +412,12 @@ impl ChatServer {
             }
             RecEvent::Failed { rec_id, error } => {
                 warn!("recording #{rec_id} failed: {error}");
-                self.audit(None, "recording.fail", None, Some(format!("#{rec_id}: {error}")));
+                self.audit(
+                    None,
+                    "recording.fail",
+                    None,
+                    Some(format!("#{rec_id}: {error}")),
+                );
                 if self.recordings.contains_key(&rec_id) {
                     self.end_recording(rec_id, RecordingStopReason::StorageFull, None);
                 }

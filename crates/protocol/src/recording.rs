@@ -154,7 +154,13 @@ pub struct RecordingItem {
 pub fn file_name(channel: &str, started_at_ms: u64, duration_ms: u64) -> String {
     let safe: String = channel
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .take(48)
         .collect();
     let safe = if safe.trim_matches('_').is_empty() {
@@ -176,7 +182,12 @@ pub fn file_name(channel: &str, started_at_ms: u64, duration_ms: u64) -> String 
 #[must_use]
 pub fn clock_label(ms: u64) -> String {
     let secs = ms / 1000;
-    format!("{:02}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60)
+    format!(
+        "{:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs / 60) % 60,
+        secs % 60
+    )
 }
 
 /// UTC calendar fields of a Unix time (Howard Hinnant's algorithm), so

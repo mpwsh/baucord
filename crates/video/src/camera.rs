@@ -236,7 +236,13 @@ pub fn rank_formats(offers: &[Offer], height: u32, fps: u32) -> Vec<usize> {
         };
         // How far from 16:9, in thousandths.
         let aspect = (i64::from(o.width) * 9_000 / i64::from(o.height.max(1)) - 16_000).abs();
-        (!smooth(o), size, aspect, o.fps.abs_diff(fps), cost(o.format))
+        (
+            !smooth(o),
+            size,
+            aspect,
+            o.fps.abs_diff(fps),
+            cost(o.format),
+        )
     });
     order
 }
@@ -404,9 +410,11 @@ mod desktop {
         // lists nothing opens at whatever it starts with.
         let mut camera = None;
         let mut last_error = None;
-        for i in super::rank_formats(&offers, height, WANTED_FPS).into_iter().take(6) {
-            let request =
-                RequestedFormat::new::<RgbAFormat>(RequestedFormatType::Exact(listed[i]));
+        for i in super::rank_formats(&offers, height, WANTED_FPS)
+            .into_iter()
+            .take(6)
+        {
+            let request = RequestedFormat::new::<RgbAFormat>(RequestedFormatType::Exact(listed[i]));
             match nokhwa::Camera::new(CameraIndex::Index(index), request) {
                 Ok(c) => {
                     camera = Some(c);
@@ -643,7 +651,10 @@ mod tests {
             offer(640, 360, 30, RawFormat::Yuyv),
         ];
         assert_eq!(choose_format(&offers, 720, 30), Some(1));
-        let small = [offer(320, 240, 30, RawFormat::Yuyv), offer(160, 120, 30, RawFormat::Yuyv)];
+        let small = [
+            offer(320, 240, 30, RawFormat::Yuyv),
+            offer(160, 120, 30, RawFormat::Yuyv),
+        ];
         assert_eq!(choose_format(&small, 720, 30), Some(0));
         // Only slow offers: still one.
         let slow = [offer(1280, 720, 10, RawFormat::Yuyv)];

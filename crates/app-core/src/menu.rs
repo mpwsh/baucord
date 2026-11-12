@@ -413,7 +413,10 @@ pub fn recording_remove_entry() -> Entry {
 pub fn recording_entries(channel_id: u16, can_start: bool, can_stop: bool) -> Vec<Entry> {
     let mut out = Vec::new();
     if can_start {
-        out.push(Entry::new(Label::RecordingStart, Action::RecordingStart(channel_id)));
+        out.push(Entry::new(
+            Label::RecordingStart,
+            Action::RecordingStart(channel_id),
+        ));
     }
     if can_stop {
         out.push(Entry::new(Label::RecordingStop, Action::RecordingStop(channel_id)).danger());

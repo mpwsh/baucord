@@ -50,14 +50,22 @@ pub enum CameraControl {
     /// Close it.
     Stop,
     /// Settings → Camera changed what the open camera does.
-    Options { mirror: bool, quality: Quality },
+    Options {
+        mirror: bool,
+        quality: Quality,
+    },
     /// The sizes a camera can deliver (Settings → Camera's list):
     /// answered with [`CameraEvent::Heights`].
-    Probe { device: Option<String> },
+    Probe {
+        device: Option<String>,
+    },
     /// A viewer asked for a keyframe (`CameraKeyframeRequested`).
     ForceKeyframe,
     /// The relay's account of our camera's viewers (`CameraHealth`).
-    Health { worst_loss: f32, viewers: u16 },
+    Health {
+        worst_loss: f32,
+        viewers: u16,
+    },
     Shutdown,
 }
 
@@ -319,7 +327,12 @@ fn stop(running: Option<Running>, event_tx: &Sender<CameraEvent>) {
 
 /// The camera closes for good after a failure: the thread stops and
 /// the UI is told why.
-fn fail(running: &mut Option<Running>, event_tx: &Sender<CameraEvent>, wake: &WakeFn, f: CameraFailure) {
+fn fail(
+    running: &mut Option<Running>,
+    event_tx: &Sender<CameraEvent>,
+    wake: &WakeFn,
+    f: CameraFailure,
+) {
     stop(running.take(), event_tx);
     let _ = event_tx.send(CameraEvent::Error(f));
     wake();

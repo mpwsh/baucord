@@ -15,11 +15,12 @@
 //! A child of `app`: everything private to `AppState` is in reach
 //! through `super::*`, so these are the same methods, only filed.
 
-#[allow(clippy::wildcard_imports)]
-use super::*;
 use client::protocol::recording::{
     clock_label, RecordingDenyReason, RecordingItem, RecordingStopReason,
 };
+
+#[allow(clippy::wildcard_imports)]
+use super::*;
 
 /// The "Server" conversation's key: no account has it.
 pub(crate) const SERVER_CONV_KEY: client::UserId = [0xFE; 32];
@@ -122,11 +123,10 @@ impl AppState {
             return;
         }
         if wanted {
-            self.clock_timer.start(
-                slint::TimerMode::Repeated,
-                Duration::from_secs(1),
-                || with_current(AppState::tick_clocks),
-            );
+            self.clock_timer
+                .start(slint::TimerMode::Repeated, Duration::from_secs(1), || {
+                    with_current(AppState::tick_clocks)
+                });
         } else {
             self.clock_timer.stop();
         }
@@ -324,10 +324,7 @@ impl AppState {
             mime: "audio/wav".to_string(),
             size: u32::try_from(item.size).unwrap_or(u32::MAX),
         };
-        self.session
-            .live
-            .items
-            .insert(item.blob_id, item.clone());
+        self.session.live.items.insert(item.blob_id, item.clone());
         if let Some(conv) = self.session.chat.dm_meta.get_mut(&SERVER_CONV_KEY)
             && item.started_at >= conv.last_ts
         {
@@ -434,7 +431,12 @@ impl AppState {
 
     /// A recording card's Save: written to a partial file as it comes,
     /// then moved into Downloads.
-    pub(super) fn save_recording(&mut self, blob: [u8; 32], conv: Option<client::UserId>, msg_id: u64) {
+    pub(super) fn save_recording(
+        &mut self,
+        blob: [u8; 32],
+        conv: Option<client::UserId>,
+        msg_id: u64,
+    ) {
         let Some((name, size)) = self
             .session
             .live
@@ -452,14 +454,10 @@ impl AppState {
             .live
             .downloads
             .insert(blob, (name.clone(), msg_id));
-        self.session.transfers.pending_downloads.insert(
-            blob,
-            PendingDownload {
-                name,
-                conv,
-                msg_id,
-            },
-        );
+        self.session
+            .transfers
+            .pending_downloads
+            .insert(blob, PendingDownload { name, conv, msg_id });
         self.set_transfer(conv, msg_id, Some((2, 0)));
         self.network
             .tx

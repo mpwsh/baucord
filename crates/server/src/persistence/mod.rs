@@ -47,8 +47,8 @@ pub use self::store::{
     backup_to_tar, blobs_dir, check, cli_create_invite, cli_find_user, cli_kick,
     cli_lift_restriction, cli_list_invites, cli_load_policy, cli_prune, cli_purge, cli_restrict,
     cli_revoke_invite, cli_role_create, cli_role_delete, cli_role_edit, cli_set_key, cli_set_roles,
-    cli_telemetry, hex, parse_hex_id, restore_from_tar, BackupReport, CheckReport, RestoreReport,
-    RecordingEnd, RecordingFile, RecordingRow, RecordingState, Retention, RoleEdit, TelemetryLine,
+    cli_telemetry, hex, parse_hex_id, restore_from_tar, BackupReport, CheckReport, RecordingEnd,
+    RecordingFile, RecordingRow, RecordingState, RestoreReport, Retention, RoleEdit, TelemetryLine,
     GENERAL_CONV, SCHEMA_VERSION,
 };
 use crate::clock::WallMs;

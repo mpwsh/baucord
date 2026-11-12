@@ -53,13 +53,13 @@ use crate::media::{self, GifPlayer};
 use crate::viewers::Viewer;
 
 mod activity;
-mod live;
-mod views;
 mod alerts;
 mod chat;
 mod commands;
 mod conversations;
 mod devices;
+mod live;
+mod views;
 // `AppState`'s methods, by concern; each file is a child module so
 // nothing here had to become `pub` for them.
 mod events;

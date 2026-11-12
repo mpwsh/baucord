@@ -330,15 +330,16 @@ impl AppState {
             // (an admin's move, a kick) there is no room to ding
             // into: the banner says where we are.
             let asked = self.session.pending_channel_join.take() == Some(channel_id);
-            let from_lobby = our_channel_before
-                .is_none_or(|c| Some(self.channel_name(c)) == self.lobby_name);
+            let from_lobby =
+                our_channel_before.is_none_or(|c| Some(self.channel_name(c)) == self.lobby_name);
             let state = self.main.global::<State>();
             state.set_channel_prompt_open(false);
             state.set_channel_password("".into());
             if self.in_lobby() {
                 // Out of a voice room (Leave call, an admin's move): the
                 // leave chime, as hanging up sounds.
-                if our_channel_before.is_some_and(|c| Some(self.channel_name(c)) != self.lobby_name) {
+                if our_channel_before.is_some_and(|c| Some(self.channel_name(c)) != self.lobby_name)
+                {
                     self.play_chime(SoundType::UserLeft);
                 }
                 self.update_user_list();

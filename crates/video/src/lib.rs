@@ -17,8 +17,8 @@
 //! as 1152×720, not a stretched 1280×720.
 
 pub mod buffer;
-pub mod capture;
 pub mod camera;
+pub mod capture;
 #[cfg(target_os = "windows")]
 pub mod dxgi;
 
@@ -239,7 +239,8 @@ impl Quality {
     }
 
     /// The camera sizes, largest first.
-    pub const CAMERA: &'static [Quality] = &[Self::Cam1080, Self::Cam720, Self::Cam480, Self::Cam240];
+    pub const CAMERA: &'static [Quality] =
+        &[Self::Cam1080, Self::Cam720, Self::Cam480, Self::Cam240];
 
     /// The default camera size.
     pub const CAMERA_DEFAULT: Quality = Self::Cam720;

@@ -816,9 +816,11 @@ impl Sqlite {
         for blob in blobs {
             let refs: Option<i64> = self
                 .conn
-                .query_row("SELECT refs FROM blobs WHERE blob_id = ?1", params![blob], |r| {
-                    r.get(0)
-                })
+                .query_row(
+                    "SELECT refs FROM blobs WHERE blob_id = ?1",
+                    params![blob],
+                    |r| r.get(0),
+                )
                 .optional()?;
             if refs == Some(0) {
                 self.delete_blob(&blob)?;
@@ -2933,7 +2935,10 @@ fn spool_dir(blobs: &Path) -> PathBuf {
         let n: u64 = rand::random();
         blobs.with_file_name(format!(
             "{}-recordings-{n:x}",
-            blobs.file_name().and_then(|f| f.to_str()).unwrap_or("baucord")
+            blobs
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("baucord")
         ))
     }
 }
@@ -3096,11 +3101,11 @@ impl Sqlite {
     /// # Errors
     /// `SQLite` failure.
     pub fn recording_state(&self) -> Result<RecordingState, rusqlite::Error> {
-        let max: i64 = self.conn.query_row(
-            "SELECT COALESCE(MAX(rec_id), 0) FROM recordings",
-            [],
-            |r| r.get(0),
-        )?;
+        let max: i64 =
+            self.conn
+                .query_row("SELECT COALESCE(MAX(rec_id), 0) FROM recordings", [], |r| {
+                    r.get(0)
+                })?;
         let mut state = RecordingState {
             next_rec_id: unordered(max).saturating_add(1),
             ..RecordingState::default()
@@ -3109,7 +3114,9 @@ impl Sqlite {
             let mut stmt = self
                 .conn
                 .prepare("SELECT rec_id, blob_id FROM recordings WHERE blob_id IS NOT NULL")?;
-            for row in stmt.query_map([], |r| Ok((unordered(r.get(0)?), r.get::<_, [u8; 32]>(1)?)))? {
+            for row in
+                stmt.query_map([], |r| Ok((unordered(r.get(0)?), r.get::<_, [u8; 32]>(1)?)))?
+            {
                 let (rec, blob) = row?;
                 state.blob_of.insert(rec, blob);
                 state.access.entry(blob).or_default();
@@ -3120,7 +3127,9 @@ impl Sqlite {
              JOIN recordings r ON r.rec_id = a.rec_id
              WHERE r.blob_id IS NOT NULL",
         )?;
-        for row in stmt.query_map([], |r| Ok((r.get::<_, [u8; 32]>(0)?, r.get::<_, UserId>(1)?)))? {
+        for row in stmt.query_map([], |r| {
+            Ok((r.get::<_, [u8; 32]>(0)?, r.get::<_, UserId>(1)?))
+        })? {
             let (blob, user) = row?;
             state.access.entry(blob).or_default().insert(user);
         }
@@ -3192,8 +3201,9 @@ impl Sqlite {
             let duration_ms = if *said_ms > 0 {
                 *said_ms
             } else {
-                file.as_ref()
-                    .map_or(0, |f| (f.size.saturating_sub(44)) / 2 * 1000 / u64::from((*rate).max(1)))
+                file.as_ref().map_or(0, |f| {
+                    (f.size.saturating_sub(44)) / 2 * 1000 / u64::from((*rate).max(1))
+                })
             };
             self.finish_recording(&RecordingEnd {
                 rec_id: *rec_id,
@@ -3203,7 +3213,10 @@ impl Sqlite {
                 file,
             })?;
             repaired += 1;
-            info!("recording {rec_id} of '{channel}' finished at startup ({})", reason.describe());
+            info!(
+                "recording {rec_id} of '{channel}' finished at startup ({})",
+                reason.describe()
+            );
         }
         Ok(repaired)
     }
@@ -3212,7 +3225,12 @@ impl Sqlite {
     /// when the file is missing. Not verified against the hash — the
     /// receiver checks the whole file at the end.
     #[must_use]
-    pub fn read_blob_range(&self, blob_id: &[u8; 32], offset: u64, len: usize) -> Option<(Vec<u8>, u64)> {
+    pub fn read_blob_range(
+        &self,
+        blob_id: &[u8; 32],
+        offset: u64,
+        len: usize,
+    ) -> Option<(Vec<u8>, u64)> {
         use std::io::{Read, Seek, SeekFrom};
         let mut file = File::open(self.blobs.join(hex(blob_id))).ok()?;
         let total = file.metadata().ok()?.len();
@@ -3247,7 +3265,10 @@ mod tests {
 
     #[test]
     fn a_preview_is_one_line_cut_short() {
-        assert_eq!(super::preview_line("hello\n  there\tyou"), "hello there you");
+        assert_eq!(
+            super::preview_line("hello\n  there\tyou"),
+            "hello there you"
+        );
         let long = "x".repeat(protocol::DM_PREVIEW_CHARS + 20);
         let cut = super::preview_line(&long);
         assert_eq!(cut.chars().count(), protocol::DM_PREVIEW_CHARS);
@@ -3960,4 +3981,3 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 }
-

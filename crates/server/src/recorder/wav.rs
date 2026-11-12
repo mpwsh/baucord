@@ -110,7 +110,10 @@ impl WavWriter {
     /// I/O.
     pub fn finish(mut self) -> io::Result<u64> {
         self.file.flush()?;
-        let mut file = self.file.into_inner().map_err(io::IntoInnerError::into_error)?;
+        let mut file = self
+            .file
+            .into_inner()
+            .map_err(io::IntoInnerError::into_error)?;
         file.seek(SeekFrom::Start(0))?;
         file.write_all(&header(self.rate, self.data_bytes))?;
         file.sync_all()?;
@@ -200,7 +203,10 @@ mod tests {
         let bytes = fs::read(&path).unwrap();
         assert_eq!(&bytes[0..4], b"RIFF");
         assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 16);
-        assert_eq!(u32::from_le_bytes(bytes[24..28].try_into().unwrap()), 16_000);
+        assert_eq!(
+            u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+            16_000
+        );
         assert_eq!(i16::from_le_bytes([bytes[46], bytes[47]]), -1);
         fs::remove_dir_all(&dir).ok();
     }
