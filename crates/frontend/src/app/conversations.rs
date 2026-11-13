@@ -246,8 +246,12 @@ impl AppState {
             None => {
                 s.set_active_dm(-1);
                 s.set_conv_name("".into());
-                self.session.chat.general_unread = 0;
-                s.set_general_unread(0);
+                // Read only if it shows: the pane may hold the chat
+                // with the chat hidden (1.5).
+                if self.general_on_screen() {
+                    self.session.chat.general_unread = 0;
+                    s.set_general_unread(0);
+                }
             }
             Some(user) => {
                 Self::clear_dm_notice(&user);

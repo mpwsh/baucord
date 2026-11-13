@@ -27,12 +27,22 @@ impl AppState {
     /// open: a DM being read must not swallow the room's traffic.
     pub fn push_chat_message(&mut self, meta: &Meta, body: &str, edited: bool) {
         self.with_conversation(None, |app| app.push_message_here(meta, body, edited));
-        if self.session.chat.active_dm.is_some() && !meta.own && !meta.pending {
-            self.session.chat.general_unread += 1;
-            self.main.global::<State>().set_general_unread(
-                i32::try_from(self.session.chat.general_unread).unwrap_or(i32::MAX),
-            );
+        if !meta.own && !meta.pending {
+            self.count_general_unread();
         }
+    }
+
+    /// One more line in the server's chat from someone else: unread
+    /// unless the chat is on screen — not while a DM holds the pane,
+    /// nor while the chat is hidden (1.5: the rail's Chat, Messages).
+    fn count_general_unread(&mut self) {
+        if self.general_on_screen() {
+            return;
+        }
+        self.session.chat.general_unread += 1;
+        self.main.global::<State>().set_general_unread(
+            i32::try_from(self.session.chat.general_unread).unwrap_or(i32::MAX),
+        );
     }
 
     /// Into whatever conversation the active fields hold right now —
@@ -64,11 +74,8 @@ impl AppState {
     /// A file card into General, whichever conversation is shown.
     pub(super) fn push_chat_file(&mut self, meta: &Meta, file: app_core::chat::FileMeta) {
         self.with_conversation(None, |app| app.push_file_here(meta, file));
-        if self.session.chat.active_dm.is_some() && !meta.own {
-            self.session.chat.general_unread += 1;
-            self.main.global::<State>().set_general_unread(
-                i32::try_from(self.session.chat.general_unread).unwrap_or(i32::MAX),
-            );
+        if !meta.own {
+            self.count_general_unread();
         }
     }
 

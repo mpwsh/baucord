@@ -18,11 +18,10 @@
 //! A child of `app`: everything private to `AppState` is in reach
 //! through `super::*`, so these are the same methods, only filed.
 
-use client::protocol::recording::CAMERA_TRACK_BIT;
-use ui::StageTile;
-
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use client::protocol::recording::CAMERA_TRACK_BIT;
+use ui::StageTile;
 
 /// The rail's buttons, as `Logic.view-picked` numbers them.
 const VIEW_LIST: i32 = 0;
@@ -89,6 +88,22 @@ impl AppState {
         (main, chat)
     }
 
+    /// The server's chat is in the pane and the pane on screen (the
+    /// window aside, as for any chat): its lines are read as they come.
+    pub(super) fn general_on_screen(&self) -> bool {
+        let s = self.main.global::<State>();
+        self.session.chat.active_dm.is_none() && !s.get_view_messages() && self.columns().1
+    }
+
+    /// After the columns change: the chat coming on screen has been
+    /// read (its count goes, as opening it from a DM does).
+    fn chat_seen(&mut self) {
+        if self.general_on_screen() && self.session.chat.general_unread > 0 {
+            self.session.chat.general_unread = 0;
+            self.main.global::<State>().set_general_unread(0);
+        }
+    }
+
     /// A press on the rail. The channel list and Channel view (in a
     /// call) are one main column, either one: pressing the other swaps
     /// it, pressing the one showing hides it while the chat is there to
@@ -115,6 +130,7 @@ impl AppState {
                 _ => {}
             }
             self.save_view_prefs();
+            self.chat_seen();
             return;
         }
         let (main, chat) = self.columns();
@@ -149,6 +165,7 @@ impl AppState {
             _ => {}
         }
         self.save_view_prefs();
+        self.chat_seen();
     }
 
     /// Channel view's back arrow: the channel list instead of it.
@@ -169,6 +186,7 @@ impl AppState {
             s.set_view_main(self.last_main.max(MAIN_LIST));
         }
         self.save_view_prefs();
+        self.chat_seen();
     }
 
     /// Into Messages, with the conversation last open there (wide; a

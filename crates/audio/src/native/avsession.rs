@@ -15,7 +15,6 @@
 //!   already reopens on. cpal's own streams handle these themselves.
 
 use std::ptr::NonNull;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use block2::RcBlock;

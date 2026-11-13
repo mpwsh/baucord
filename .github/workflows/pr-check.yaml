@@ -9,8 +9,10 @@ name: PR check
 # in by hand (PRODUCTION-PLAN §8). It is a check, not a release build:
 # release.yml's ubuntu:22.04 container, static FFmpeg and glibc floor
 # are not reproduced here. Windows-only code is type-checked by a cross
-# check from Linux (`windows`); macOS-, Android- and iOS-only code is
-# not compiled by this workflow.
+# check from Linux (`windows`); the phones' apps by `android` and
+# `ios`, for their own targets, with the release builds' toolchains but
+# nothing linked or packaged; macOS-only desktop code is not compiled
+# by this workflow.
 #
 # The release workflows call it (`workflow_call`) and publish nothing
 # until it passed: a tag is never checked by the push and pull-request
@@ -165,6 +167,107 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run the checks
         run: cargo run --locked --manifest-path tools/chat-scroll-sim/Cargo.toml
+
+  # ── The Android app, type-checked for Android ──────────────────────
+  # The release build's NDK, SDK platform and cargo-ndk, and its exact
+  # environment (android/app/build.gradle.kts, `cargoNdkEnvironment`),
+  # running clippy instead of the build: every crate the app links is
+  # compiled for aarch64-linux-android, build scripts included (libopus
+  # through cmake, Slint's Java helper), and nothing is linked or
+  # packaged. 1.5.0's release was the first to find a desktop-only
+  # dependency used on the phones; this finds the next one on the pull
+  # request that adds it.
+  android:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Set up Java 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+      - name: Install SDK packages
+        # The release's: NDK 29, the newest cmake (it brings ninja), and
+        # the platform Slint's build script compiles against.
+        run: |
+          set -eux
+          yes | sdkmanager --licenses >/dev/null || true
+          LIST=$(sdkmanager --list 2>/dev/null)
+          NDK=$(echo "$LIST" | grep -oE 'ndk;29\.[0-9.]+' | sort -V | tail -1)
+          BT=$(echo "$LIST"  | grep -oE 'build-tools;36\.[0-9.]+' | sort -V | tail -1)
+          CM=$(echo "$LIST"  | grep -oE 'cmake;[0-9.]+' | sort -V | tail -1)
+          sdkmanager "platforms;android-36" "$BT" "$NDK" "$CM"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK#ndk;}" >> "$GITHUB_ENV"
+          echo "ANDROID_JAR=$ANDROID_HOME/platforms/android-36/android.jar" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/${CM/;//}/bin" >> "$GITHUB_PATH"
+      - name: Read the pinned Rust toolchain
+        id: toolchain
+        run: |
+          echo "channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: aarch64-linux-android
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-check
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk@4.1.2
+      - name: Type-check and lint for Android
+        # `-p android`, as the release builds it: the workspace would
+        # unify the desktop's features into frontend.
+        env:
+          CMAKE_GENERATOR: Ninja
+        run: cargo ndk --target arm64-v8a --platform 29 clippy --locked -p android
+
+  # ── The iPhone app, type-checked for iOS ───────────────────────────
+  # The release's runner and Xcode (ios-release.yml) and its cargo
+  # command (ios/scripts/build_with_cargo.sh), as clippy: every crate
+  # the app links compiled for aarch64-apple-ios against the iOS SDK,
+  # with nothing linked, signed or archived.
+  ios:
+    runs-on: macos-26
+    env:
+      XCODE_APP: /Applications/Xcode_26.6.app
+      # What the Xcode build hands cargo (ios/project.yml).
+      IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Select Xcode
+        run: |
+          set -eux
+          sudo xcode-select -s "$XCODE_APP"
+          xcodebuild -version
+          cmake --version
+      - name: Read the pinned Rust toolchain
+        id: toolchain
+        run: |
+          echo "channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: aarch64-apple-ios
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ios-check
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Type-check and lint for iOS
+        run: cargo clippy --locked --target aarch64-apple-ios -p ios
 
   # ── Windows-only code, type-checked from Linux ─────────────────────
   # MinGW's headers stand in for the Windows SDK and Debian's FFmpeg

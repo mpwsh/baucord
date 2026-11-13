@@ -4,7 +4,7 @@ What changed from one release to the next, for the people who run a
 baucord server and the people who use the apps. Releases before this
 file are summed up in SESSION-GUIDE.md §3 ("Shipped").
 
-## 1.5.0 (unreleased)
+## 1.5.0 (2026-11-12)
 
 Recording a voice channel, the channel timer, and a new way around the
 app: Channel, Chat and Messages. Built on 1.4.0; the two can ship
@@ -74,6 +74,10 @@ together.
   bottom — mic, headphones, screen, camera and **Leave call**. Its back
   arrow swaps it for the channel list; the chat's arrow hides the chat,
   and Messages has one back to the channels.
+- **Chat counts what you missed while hidden.** With the chat hidden
+  beside the list or Channel view, or while you are in Messages, new
+  lines in it add to the count on the rail's Chat button; showing the
+  chat clears it.
 - **The chat is a step lighter** beside another column, so its edge
   reads, and the strips between columns carry a grip to drag them.
 - **Messages is an inbox** ("Mensajes" in Spanish): each conversation
@@ -126,7 +130,7 @@ together.
 - **Watching a stream is not idle.** Auto-AFK leaves alone anyone
   subscribed to a screen share, however quiet they are.
 
-## 1.4.0 (unreleased)
+## 1.4.0 (not released on its own: shipped in 1.5.0)
 
 Numbered for the bot and plugin framework planned on it (the spec is
 in the 2026-10-27 review document), on top of the 2026-10 review fixed

@@ -508,6 +508,11 @@ persistence:
   history:   { retain_days: 90 }       # chat and direct messages
   files:     { retain_days: 30 }       # files nothing uses any more
   telemetry: { retain_days: 30 }       # clients' 10-second samples
+recording:                             # voice channel recording (1.5)
+  enabled: true                        # needs persistence
+  max_minutes: 240                     # a recording ends itself here
+  total_cap_gb: 10                     # a start is refused past this on disk
+  retain_days: 30                      # 0 = keep recordings forever
 channels:
   - name: General
   - name: Gaming
@@ -522,6 +527,16 @@ channels:
           lobby everyone arrives in is added by the server and is not in
           this list. A channel is known by its name: renaming one moves
           the people in it to the lobby.
+        </li>
+        <li>
+          <strong>Recording</strong>: someone with the
+          <code>record</code> permission (admins, and the built-in
+          <code>recorder</code> role) starts it from a channel's menu or
+          with <code>/record</code>. It is one WAV of everyone's voice,
+          delivered by "Server" to the people who were in the channel,
+          and to nobody else. Running recordings are written to
+          <code>recordings/</code> beside the files; the server image
+          builds libopus to decode the voice.
         </li>
         <li>
           A missing file is written with the defaults; a file that does
@@ -775,7 +790,8 @@ tail -f /var/log/baucord-net.log</code></pre>
       <p>
         Whoever runs a server holds what people send through it, and
         answers for it. The server stores accounts, roles, chat and direct
-        messages, shared files and the apps' call-quality samples in
+        messages, shared files, channel recordings and the apps'
+        call-quality samples in
         <code>data/baucord/</code>, for as long as the
         <code>persistence</code> settings say; logs people send from
         their app land in <code>data/baucord/logs/</code>. Its own log
