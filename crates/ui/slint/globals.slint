@@ -111,6 +111,9 @@ export struct StageTile {
     self-muted: bool,
     self-deafened: bool,
     sharing: bool,
+    // We watch their stream (1.5.2): the tile shows their picture and
+    // "Watching", their camera is in the stream's window.
+    watching: bool,
     is-us: bool,
     camera: bool,        // a camera is on and its picture is here
     frame: image,
@@ -343,6 +346,9 @@ export global State {
     /// The stream page turned a quarter for a phone whose rotation is
     /// locked (viewer.slint), kept for the session across streams.
     in-out property <bool> watch-rotated: false;
+    /// The sharer's camera, a box over the stream (1.5.2).
+    in property <image> watch-camera-frame;
+    in property <bool> watch-camera-on: false;
 
     // ── Invite dialog (spec §3.1) ───────────────────────────────────
     // Options are indices into the lists the host fills; the created

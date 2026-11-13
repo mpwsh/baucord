@@ -7,7 +7,7 @@ import { IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
 import { Tr } from "tr.slint";
 import { State, Logic } from "globals.slint";
-import { IconBtn } from "widgets.slint";
+import { IconBtn, Tip } from "widgets.slint";
 
 export component MicBtn inherits IconBtn {
     icon: State.muted ? IconSet.MicOff : IconSet.Mic;
@@ -78,14 +78,16 @@ export component HangUpBtn inherits IconBtn {
 /// Leave call, with its words: the end of Channel view's bar.
 export component LeaveCallBtn inherits Rectangle {
     in property <length> size: 44px;
+    /// The glyph alone, its words as a tip: a bar too narrow for them.
+    in property <bool> compact: false;
     height: root.size;
-    width: row.preferred-width;
+    width: root.compact ? root.size : row.preferred-width;
     border-radius: Theme.radius-md;
     background: t.has-hover ? Theme.danger.darker(15%) : Theme.danger;
     animate background { duration: 120ms; }
     row := HorizontalLayout {
-        padding-left: 14px;
-        padding-right: 16px;
+        padding-left: root.compact ? 0px : 14px;
+        padding-right: root.compact ? 0px : 16px;
         spacing: Theme.gap-sm;
         alignment: center;
         Rectangle {
@@ -96,7 +98,7 @@ export component LeaveCallBtn inherits Rectangle {
                 stroke: Theme.on-accent;
             }
         }
-        Text {
+        if !root.compact : Text {
             text: Tr.leave-call;
             color: Theme.on-accent;
             font-size: Theme.font-md;
@@ -106,7 +108,18 @@ export component LeaveCallBtn inherits Rectangle {
     }
     t := TouchArea {
         mouse-cursor: pointer;
-        clicked => { Logic.hang-up(); }
+        clicked => {
+            Tip.hide(Tr.leave-call);
+            Logic.hang-up();
+        }
+        changed has-hover => {
+            if (self.has-hover && root.compact) {
+                Tip.show(Tr.leave-call, root.absolute-position.x, root.absolute-position.y,
+                    root.width, root.height, false);
+            } else {
+                Tip.hide(Tr.leave-call);
+            }
+        }
     }
 }
 
@@ -114,6 +127,8 @@ export component LeaveCallBtn inherits Rectangle {
 /// Leave call. Settings and the admin panel are on the rail (a phone:
 /// on the channel list).
 export component StageControls inherits Rectangle {
+    /// Leave call as its glyph alone (a narrow window, 1.5.2).
+    in property <bool> compact: false;
     property <length> btn: State.touch-host ? 48px : 44px;
     height: self.btn + 12px;
     width: row.preferred-width;
@@ -126,6 +141,9 @@ export component StageControls inherits Rectangle {
         DeafenBtn { size: root.btn; }
         if !State.touch-host : ShareBtn { size: root.btn; }
         if State.camera-available : CameraBtn { size: root.btn; }
-        LeaveCallBtn { size: root.btn; }
+        LeaveCallBtn {
+            size: root.btn;
+            compact: root.compact;
+        }
     }
 }

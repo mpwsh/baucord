@@ -501,7 +501,8 @@ exactly-once `ScreenShareStarted/Stopped` corrections. Validation
   `limits.max_cameras_per_channel` (12). A move or a return to the
   lobby turns a camera off. The client watches the cameras of its
   channel while Channel view is on screen and routes their frames to
-  the tiles. The desktops send one: `video::camera` opens the device
+  the tiles, and the camera of anyone whose stream it watches into that
+  stream's viewer, as a box over the picture (1.5.2). The desktops send one: `video::camera` opens the device
   (nokhwa's Media Foundation, `AVFoundation` and V4L2 backends; YUYV,
   NV12 and MJPEG turned into RGBA here), and the client's `camera`
   thread — asleep until the button is pressed, then paced by the
@@ -515,7 +516,18 @@ exactly-once `ScreenShareStarted/Stopped` corrections. Validation
   YUYV, which `AVFoundation` converts to; and its `set_all` paired one
   format of a size with another's frame rate, which throws — fixed in
   a vendored copy (`third_party/nokhwa-bindings-macos`,
-  `BAUCORD-PATCH.md`) — encodes it on the share's encoder at the size Settings →
+  `BAUCORD-PATCH.md`). On Windows the Media Foundation bindings
+  dropped every frame rate stated as a fraction (30000/1001), so such
+  a camera listed nothing; the vendored copy
+  (`third_party/nokhwa-bindings-windows`, 1.5.2) rounds them and logs
+  each format it skips. On Linux the V4L2 bindings had the same
+  fraction bug, read ranges of sizes and rates (virtual cameras,
+  v4l2loopback) wrongly, and could not read the YU12/YV12 such devices
+  offer; the vendored copy (`third_party/nokhwa-bindings-linux`, 1.5.2)
+  rounds rates, offers the common sizes and rates inside a range, and
+  hands YU12/YV12 on as NV12, interleaving the chroma planes. Every request takes all the pixel formats
+  `to_rgba` reads (`READABLE`), not nokhwa's RGBA decoder's list
+  — encodes it on the share's encoder at the size Settings →
   Camera asks (`Quality::CAMERA`: 1080p at ~3 Mbit/s, 720p — the
   default — at ~1.7, 480p at ~0.85, all 30 fps; 240p only for a
   camera with no more), never above what the device delivers. Three
@@ -915,13 +927,25 @@ screen — the inbox, a menu's Message, `/dm`, a notice — takes the
 window there (`panel_follows`), and leaving it puts the server's chat
 back in the pane. A DM is drawn as bubbles, ours on the right. On a
 narrow window a conversation from the inbox slides in over the page.
-Channel view's tiles are built from the roster's
+Channel view's tiles (5:4, square on an upright phone, in the column
+count that makes them biggest) are built from the roster's
 own rows of our channel (`rebuild_stage`, with every roster rebuild; a
 speaking edge rewrites one tile), so the look, the menu and the
-speaking light are the roster's. `Logic.stage-shown` reports whether
+speaking light are the roster's; a tile with a picture takes the
+picture's main color for its ground (`app_core::roster::picture_tint`,
+sampled from the decoded avatar's pixels in `tile_of`). `Logic.stage-shown` reports whether
 it can be seen, and the cameras of our channel are watched only while
 it can: their frames (stream id with `CAMERA_TRACK_BIT`) go from the
-present-prep thread to the tile instead of a viewer window. The call's
+present-prep thread to the tile instead of a viewer window. A tile's
+Live badge opens that person's stream (`Logic.watch-user`); while a
+viewer of theirs is open (1.5.2) their camera is watched whether or
+not Channel view is seen, its frames go to the viewer
+(`Viewer::set_camera`, drawn by `StreamViewerPanel` as a box the viewer
+moves, resizes and hides) and the tile shows their picture and
+"Watching" (`StageTile.watching`). Opening or closing a viewer runs
+`viewers_changed` (the camera watch, then the tiles); every close goes
+through `close_viewer`. A minimized viewer stops decoding the camera
+with the stream. The call's
 buttons are one set (`controls.slint`) that the channel list's control
 bar, Channel view's bar (ending in Leave call) and the inbox's call
 bar are built from. **Leave call** moves us to the lobby

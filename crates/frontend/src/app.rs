@@ -1583,7 +1583,11 @@ fn wire_logic(state: &Rc<RefCell<AppState>>) {
                         .transfers
                         .pending_picture_uploads
                         .insert(app.next_file_upload_id, png.clone());
-                    app.begin_file_upload("picture.png".into(), "image/png".into(), png);
+                    // Named and typed for what it is: a GIF went as
+                    // `picture.png`, and was refused as the wrong type.
+                    let name = format!("picture.{}", app_core::images::extension_for(&png));
+                    let mime = app_core::images::mime_for(&png).to_string();
+                    app.begin_file_upload(name, mime, png);
                 } else {
                     app.send_image_with_card(png);
                 }

@@ -253,13 +253,29 @@ pub fn rank_formats(offers: &[Offer], height: u32, fps: u32) -> Vec<usize> {
 mod desktop {
     use std::time::Instant;
 
-    use nokhwa::pixel_format::RgbAFormat;
     use nokhwa::utils::{
         ApiBackend, CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType,
     };
 
     use super::{to_rgba, CameraError, CameraInfo, RawFormat, WANTED_FPS};
     use crate::{Frame, PixelFormat};
+
+    /// Every pixel format `to_rgba` reads. nokhwa's own lists leave
+    /// one out or another (its RGBA decoder's has no GRAY), and a
+    /// request only takes formats in its list: a camera whose formats
+    /// all fell outside it would not open even to be listed.
+    const READABLE: &[FrameFormat] = &[
+        FrameFormat::MJPEG,
+        FrameFormat::YUYV,
+        FrameFormat::NV12,
+        FrameFormat::GRAY,
+        FrameFormat::RAWRGB,
+        FrameFormat::RAWBGR,
+    ];
+
+    fn request(kind: RequestedFormatType) -> RequestedFormat<'static> {
+        RequestedFormat::with_formats(kind, READABLE)
+    }
 
     fn backend_error(e: &nokhwa::NokhwaError) -> CameraError {
         let text = e.to_string();
@@ -269,6 +285,19 @@ mod desktop {
         } else {
             CameraError::Backend(text)
         }
+    }
+
+    /// The camera would not open even to list its formats: none of
+    /// them is one `to_rgba` reads (the backend logged what it skipped
+    /// just before), or the device is busy or gone. Its name goes in
+    /// the log, so a user's log says which camera it was.
+    fn unusable(index: u32, e: &nokhwa::NokhwaError) -> CameraError {
+        let name = list()
+            .ok()
+            .and_then(|all| all.into_iter().find(|c| c.index == index))
+            .map_or_else(|| format!("camera {index}"), |c| c.name);
+        log::warn!("camera: {name} has no format baucord can open: {e}");
+        backend_error(e)
     }
 
     pub fn list() -> Result<Vec<CameraInfo>, CameraError> {
@@ -322,9 +351,11 @@ mod desktop {
     /// stream (Settings → Camera's sizes).
     pub fn heights_of(index: u32) -> Result<Vec<u32>, CameraError> {
         ask_access()?;
-        let request = RequestedFormat::new::<RgbAFormat>(RequestedFormatType::None);
-        let mut camera = nokhwa::Camera::new(CameraIndex::Index(index), request)
-            .map_err(|e| backend_error(&e))?;
+        let mut camera = nokhwa::Camera::new(
+            CameraIndex::Index(index),
+            request(RequestedFormatType::None),
+        )
+        .map_err(|e| backend_error(&e))?;
         Ok(heights(&mut camera))
     }
 
@@ -391,9 +422,11 @@ mod desktop {
         // it was given, which a Mac camera's list (NV12/YUYV, no MJPEG)
         // never has: 1.5's first 720p build could not open one.
         let listed = {
-            let probe = RequestedFormat::new::<RgbAFormat>(RequestedFormatType::None);
-            let mut camera = nokhwa::Camera::new(CameraIndex::Index(index), probe)
-                .map_err(|e| backend_error(&e))?;
+            let mut camera = nokhwa::Camera::new(
+                CameraIndex::Index(index),
+                request(RequestedFormatType::None),
+            )
+            .map_err(|e| unusable(index, &e))?;
             listed(&mut camera)
         };
         let offers: Vec<super::Offer> = listed
@@ -414,8 +447,10 @@ mod desktop {
             .into_iter()
             .take(6)
         {
-            let request = RequestedFormat::new::<RgbAFormat>(RequestedFormatType::Exact(listed[i]));
-            match nokhwa::Camera::new(CameraIndex::Index(index), request) {
+            match nokhwa::Camera::new(
+                CameraIndex::Index(index),
+                request(RequestedFormatType::Exact(listed[i])),
+            ) {
                 Ok(c) => {
                     camera = Some(c);
                     break;
@@ -429,11 +464,11 @@ mod desktop {
         let mut camera = match (camera, last_error) {
             (Some(c), _) => c,
             (None, Some(e)) => return Err(backend_error(&e)),
-            (None, None) => {
-                let request = RequestedFormat::new::<RgbAFormat>(RequestedFormatType::None);
-                nokhwa::Camera::new(CameraIndex::Index(index), request)
-                    .map_err(|e| backend_error(&e))?
-            }
+            (None, None) => nokhwa::Camera::new(
+                CameraIndex::Index(index),
+                request(RequestedFormatType::None),
+            )
+            .map_err(|e| backend_error(&e))?,
         };
         camera.open_stream().map_err(|e| backend_error(&e))?;
         let format = camera.camera_format();

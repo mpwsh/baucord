@@ -129,6 +129,10 @@ export global Tr {
     in property <string> disconnect;
     in property <string> leave-call;
     in property <string> live;
+    // A sharer's tile while we watch their stream, and the badges' tips.
+    in property <string> tile-watching;
+    in property <string> tile-watch-tip;
+    in property <string> tile-watching-tip;
 
     // Per-user popover (the menu strings live in the host: app-core's
     // `menu` names them, `menu_label` localizes)
@@ -239,6 +243,8 @@ export global Tr {
     in property <string> viewer-exit-fullscreen;
     in property <string> viewer-fill;
     in property <string> viewer-fit;
+    in property <string> viewer-camera-hide;
+    in property <string> viewer-camera-show;
     in property <string> viewer-rotate;
     in property <string> viewer-unrotate;
     in property <string> viewer-mic-mute;

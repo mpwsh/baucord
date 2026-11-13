@@ -1341,6 +1341,44 @@ Nothing run on a device or against a real server.
 - [ ] **new** Watch a screen share and say nothing past the channel's
   AFK time: you are not moved to AFK. Stop watching: you are, after
   the time.
+- [ ] **new** Windows, a camera that states fractional frame rates
+  (OBS Virtual Camera set to 29.97 fps, a capture card, a phone-as-
+  webcam app): it is listed with its sizes and turns on. A camera with
+  no format baucord reads fails with a toast, and the log names the
+  camera and each format it skipped [CAM-1, 1.5.2].
+- [ ] **new** Linux, a USB webcam: Settings → Camera lists it once
+  (not twice, for its metadata node), and it turns on, also after a
+  restart with it picked [CAM-1, 1.5.2].
+- [ ] **new** Linux, a virtual camera (v4l2loopback: OBS Virtual
+  Camera, a phone-as-webcam app) and a plain USB camera: each is
+  listed with its sizes (`v4l2-ctl --list-formats-ext -d /dev/videoN`
+  shows what it offers) and turns on; a YU12 one shows correct colours,
+  not green or pink [CAM-1, 1.5.2].
+- [ ] **new** Channel view, someone sharing with their camera on: their
+  tile shows the camera and **Live**. Click Live: their stream opens
+  with their camera in a box at the top right; their tile turns to
+  their picture and **Watching**. Drag the box, resize it from the
+  inner corner (it keeps the camera's shape, the far corner stays),
+  hide it (✕, the bar's camera button, C) and bring it back;
+  double-click puts it back. Resize the window: the box keeps its
+  corner and never covers the control bar. Close the stream: the
+  camera is back on the tile. Clicking Watching brings the window
+  forward. Minimize the stream's window: neither the stream nor the
+  camera decodes (the log's summary lines stop); restore: both come
+  back. Someone sharing without a camera: Live opens the stream, no
+  box, Watching on the tile. Your own tile's Live is not clickable
+  [1.5.2].
+- [ ] **new** The same with Channel view hidden (the channel list
+  showing) or the main window on another screen: the box still shows
+  the camera [1.5.2].
+- [ ] **new** Channel view's tiles are a little wider than tall
+  (square on a phone upright); six people fit on a phone. A person
+  with a picture: a rounded square of it, on its main color (a light
+  picture on a darker shade of it); a transparent picture's ground is
+  its opaque part's color; a person without one: their initial on
+  their name's color. One or two people on a big screen: tiles no
+  wider than 560 px. A narrow desktop window: Leave call is its icon
+  with a tip [1.5.2].
 - [ ] **new** Settings → Camera (under Audio): the picker lists the
   computer's cameras; Preview shows the chosen one; picking another
   switches the preview; the Quality list shows 1080p / 720p (default)

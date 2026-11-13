@@ -47,6 +47,11 @@ struct Minimized {
     told: Cell<bool>,
 }
 
+/// A sharer's camera stream: their id with the camera bit.
+fn camera_of(client_id: u64) -> u64 {
+    client_id | client::protocol::recording::CAMERA_TRACK_BIT
+}
+
 /// A second look after a reveal: an X11 window manager may report the
 /// restore a little after the focus or redraw that announces it.
 const RECHECK_AFTER: Duration = Duration::from_millis(250);
@@ -55,6 +60,8 @@ impl Minimized {
     fn update(&self, minimized: bool) {
         if self.told.replace(minimized) != minimized {
             crate::present::set_stream_visible(Some(self.client_id), !minimized);
+            // The sharer's camera shows in this window too (1.5.2).
+            crate::present::set_stream_visible(Some(camera_of(self.client_id)), !minimized);
         }
     }
 
@@ -115,6 +122,8 @@ impl Viewer {
             s.set_watch_peer_name(peer_name.into());
             s.set_watch_stats("--".into());
             s.set_watch_frame(slint::Image::default());
+            s.set_watch_camera_on(false);
+            s.set_watch_camera_frame(slint::Image::default());
             s.set_watch_muted(false);
             s.set_watch_volume(1.0);
             s.set_watch_open(true);
@@ -240,6 +249,24 @@ impl Viewer {
         }
     }
 
+    /// The sharer's camera picture for the box over the stream, or
+    /// `None` when their camera is off or no longer watched (1.5.2).
+    pub fn set_camera(&self, frame: Option<slint::Image>) {
+        let on = frame.is_some();
+        let frame = frame.unwrap_or_default();
+        match &self.surface {
+            Surface::Window(win) => {
+                win.set_camera_on(on);
+                win.set_camera_frame(frame);
+            }
+            Surface::Page(main) => {
+                let s = main.global::<State>();
+                s.set_watch_camera_on(on);
+                s.set_watch_camera_frame(frame);
+            }
+        }
+    }
+
     fn set_stats(&self, stats: slint::SharedString) {
         match &self.surface {
             Surface::Window(win) => win.set_stats(stats),
@@ -320,8 +347,15 @@ impl Viewer {
                 // when the watch or the share ends); its reveal hook
                 // may still fire and finds nothing to do (review
                 // 2026-10-27, P1-2).
-                self.minimized.told.set(false);
+                let was_minimized = self.minimized.told.replace(false);
                 client::network::set_stream_hidden(self.minimized.client_id, false);
+                // Their camera goes on: back to its tile, seen again.
+                if was_minimized {
+                    crate::present::set_stream_visible(
+                        Some(camera_of(self.minimized.client_id)),
+                        true,
+                    );
+                }
             }
             Surface::Page(main) => {
                 let s = main.global::<State>();
@@ -329,6 +363,8 @@ impl Viewer {
                 crate::host::keep_screen_on(false);
                 // The last frame's texture goes with the page.
                 s.set_watch_frame(slint::Image::default());
+                s.set_watch_camera_on(false);
+                s.set_watch_camera_frame(slint::Image::default());
                 // The page held the keyboard focus: hand it back, or
                 // the next Back finds no handler and closes the app.
                 main.invoke_focus_composer();

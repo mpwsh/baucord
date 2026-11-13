@@ -5247,6 +5247,35 @@ fn profile_changes_are_rate_limited() {
     assert!(profile_verdict(&mut alice, &mut w, &mut []).is_ok());
 }
 
+/// A small animated GIF sent as a picture (1.5.2): it was refused as
+/// the wrong type, because pictures took the avatar's list of types.
+/// It uploads, and is kept as what it is; it still cannot be an avatar.
+#[test]
+fn a_gif_picture_uploads_but_is_never_an_avatar() {
+    let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));
+    let mut alice = w.connect_member("alice");
+    let mut gif = b"GIF89a".to_vec();
+    gif.extend_from_slice(&[16, 0, 16, 0]);
+    gif.extend(std::iter::repeat_n(7u8, 4 * 1024));
+
+    let blob_id = alice.upload_blob(&mut w, 1, "image/gif", &gif);
+    let done = alice.wait_for(&mut w, &mut [], |m| match m {
+        ServerMessage::UploadDone {
+            upload_id: 1,
+            blob_id,
+        } => Some(*blob_id),
+        ServerMessage::UploadRejected { reason, .. } => panic!("rejected: {reason:?}"),
+        _ => None,
+    });
+    assert_eq!(done, blob_id);
+
+    set_profile(&mut alice, &mut w, None, Some(blob_id));
+    assert_eq!(
+        profile_verdict(&mut alice, &mut w, &mut []),
+        Err(protocol::ProfileDenyReason::BadAvatar)
+    );
+}
+
 #[test]
 fn an_avatar_uploads_once_and_reaches_everyone() {
     let mut w = World::new(test_config(vec![open_channel("Lobby", true)]));

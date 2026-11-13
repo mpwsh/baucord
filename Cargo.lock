@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "android"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "android_logger",
  "app-core",
@@ -1010,7 +1010,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "client"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "audio",
  "crossbeam-channel",
@@ -1559,7 +1559,7 @@ dependencies = [
 
 [[package]]
 name = "desktop"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "client",
  "env_logger",
@@ -2146,7 +2146,7 @@ dependencies = [
 
 [[package]]
 name = "frontend"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "app-core",
  "arboard",
@@ -2279,7 +2279,7 @@ dependencies = [
 
 [[package]]
 name = "gateway"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "audioadapter-buffers",
  "clap",
@@ -3324,7 +3324,7 @@ dependencies = [
 
 [[package]]
 name = "ios"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "app-core",
  "block2 0.6.2",
@@ -4085,10 +4085,9 @@ dependencies = [
 [[package]]
 name = "nokhwa-bindings-linux"
 version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb67e22201a53322291740ca064b20eaaade7222ef0349f312d9b37b004e1984"
 dependencies = [
  "libc",
+ "log",
  "nokhwa-core",
  "v4l",
 ]
@@ -4111,9 +4110,8 @@ dependencies = [
 [[package]]
 name = "nokhwa-bindings-windows"
 version = "0.4.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5be28886bad8abcec3655c1f24b965b4cb596a72b23164c910c54439ce55d2a4"
 dependencies = [
+ "log",
  "nokhwa-core",
  "once_cell",
  "windows",
@@ -5260,7 +5258,7 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
 name = "protocol"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "bytes",
  "postcard",
@@ -5959,7 +5957,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "chrono",
  "clap",
@@ -6943,7 +6941,7 @@ dependencies = [
 
 [[package]]
 name = "transport"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "base64",
  "bytes",

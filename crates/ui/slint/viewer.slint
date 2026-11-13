@@ -38,6 +38,15 @@
 // and takes it back to the whole picture, as does a double-tap. The
 // bar also carries the viewer's own microphone and headphones (D43):
 // watching full screen, nobody should have to leave to mute.
+//
+// A sharer whose camera is on is shown in the picture too (1.5.2): their
+// camera in a small box over the stream, as a streamer's face sits over
+// their game. The box starts top-right; dragging moves it, its inner
+// corner's handle resizes it (the opposite corner stays put), and its ✕
+// or the bar's camera button hides it, as does C. It keeps clear of the
+// control bar's strip along the bottom. Its place is kept as fractions
+// of the room it can move in, so a resized window keeps it in the same
+// corner; a double-click puts it back.
 
 import { IconSet, IconDisplay } from "@lucide";
 import { Theme } from "theme.slint";
@@ -83,6 +92,11 @@ export component StreamViewerPanel inherits FocusScope {
     /// screen that turns by itself undoes it.
     in property <bool> rotate-available: false;
     in-out property <bool> rotated: false;
+    /// The sharer's camera (1.5.2), drawn as a box over the stream while
+    /// `camera-on`; `camera-shown` is the viewer's own choice to see it.
+    in property <image> camera-frame;
+    in property <bool> camera-on: false;
+    in-out property <bool> camera-shown: true;
     property <bool> rotate-offered: root.rotate-available && (root.rotated || root.width < root.height);
     property <bool> screen-landscape: root.width > root.height;
     changed screen-landscape => {
@@ -209,6 +223,73 @@ export component StreamViewerPanel inherits FocusScope {
         }
     }
 
+    // ── The camera box (1.5.2) ──────────────────────────────────────
+    // Where it sits: `pip-fx`/`pip-fy` place it along the room it can
+    // move in (0 = left/top edge, 1 = right/bottom), `pip-fw` is its
+    // width as a share of the stage's. Its height follows the camera.
+    in-out property <float> pip-fx: 1.0;
+    in-out property <float> pip-fy: 0.0;
+    in-out property <float> pip-fw: 0.24;
+    property <bool> pip-on: root.camera-on && root.camera-shown
+        && root.camera-frame.width > 0 && root.camera-frame.height > 0;
+    property <length> pip-margin: Theme.gap-md;
+    // The control bar's strip (48 px and its gap) stays clear.
+    property <length> pip-bottom: root.inset-b + 48px + 2 * Theme.gap-md;
+    property <float> cam-aspect: root.camera-frame.width > 0
+        ? root.camera-frame.height * 1.0 / root.camera-frame.width : 0.5625;
+    // Never under 120 px wide (or the stage, less its margins), never
+    // over 60% of the stage either way.
+    // Its room: the stage within the safe area, less the bar's strip.
+    property <length> pip-left: root.inset-l + root.pip-margin;
+    property <length> pip-top: root.inset-t + root.pip-margin;
+    property <length> pip-span-x: Math.max(0px, root.w - root.inset-l - root.inset-r - 2 * root.pip-margin);
+    property <length> pip-span-y: Math.max(0px, root.h - root.pip-top - root.pip-bottom);
+    property <length> pip-w-max: Math.min(root.w * 0.6, root.pip-span-x,
+        root.pip-span-y * 0.8 / root.cam-aspect);
+    property <length> pip-w-min: Math.min(120px, root.pip-w-max);
+    property <length> pip-w: Math.clamp(root.w * root.pip-fw, root.pip-w-min, root.pip-w-max);
+    property <length> pip-h: root.pip-w * root.cam-aspect;
+    property <length> pip-room-x: Math.max(0px, root.pip-span-x - root.pip-w);
+    property <length> pip-room-y: Math.max(0px, root.pip-span-y - root.pip-h);
+    property <length> pip-x: root.pip-left + root.pip-room-x * root.pip-fx;
+    property <length> pip-y: root.pip-top + root.pip-room-y * root.pip-fy;
+    // The resize handle is on the corner that faces the middle.
+    property <bool> pip-grip-left: root.pip-fx > 0.5;
+    property <bool> pip-grip-top: root.pip-fy > 0.5;
+
+    /// Move the box by (dx, dy), kept on the stage.
+    function pip-move(dx: length, dy: length) {
+        if (root.pip-room-x > 0px) {
+            root.pip-fx = Math.clamp(root.pip-fx + dx / root.pip-room-x, 0.0, 1.0);
+        }
+        if (root.pip-room-y > 0px) {
+            root.pip-fy = Math.clamp(root.pip-fy + dy / root.pip-room-y, 0.0, 1.0);
+        }
+    }
+    /// Put the box's top-left at (x, y), as fractions of its room.
+    function pip-place(x: length, y: length) {
+        root.pip-fx = root.pip-room-x > 0px
+            ? Math.clamp((x - root.pip-left) / root.pip-room-x, 0.0, 1.0) : 0.0;
+        root.pip-fy = root.pip-room-y > 0px
+            ? Math.clamp((y - root.pip-top) / root.pip-room-y, 0.0, 1.0) : 0.0;
+    }
+    /// Drag the handle by (dx, dy): the box grows or shrinks from that
+    /// corner, keeping its shape, and the opposite corner stays.
+    function pip-resize(dx: length, dy: length) {
+        let grow-x = root.pip-grip-left ? -dx : dx;
+        let grow-y = (root.pip-grip-top ? -dy : dy) / root.cam-aspect;
+        let grow = Math.abs(grow-x / 1px) > Math.abs(grow-y / 1px) ? grow-x : grow-y;
+        let right = root.pip-x + root.pip-w;
+        let bottom = root.pip-y + root.pip-h;
+        let left = root.pip-x;
+        let top = root.pip-y;
+        let left-grip = root.pip-grip-left;
+        let top-grip = root.pip-grip-top;
+        root.pip-fw = Math.clamp((root.pip-w + grow) / root.w, 0.05, 0.6);
+        // `pip-w`/`pip-h` follow the new width already.
+        root.pip-place(left-grip ? right - root.pip-w : left, top-grip ? bottom - root.pip-h : top);
+    }
+
     key-pressed(ev) => {
         if (ev.text == Key.Escape && root.fullscreen) {
             root.fullscreen = false;
@@ -225,6 +306,11 @@ export component StreamViewerPanel inherits FocusScope {
         }
         if (ev.text == "m" || ev.text == "M") {
             root.toggle-mute();
+            return accept;
+        }
+        if ((ev.text == "c" || ev.text == "C") && root.camera-on) {
+            root.camera-shown = !root.camera-shown;
+            root.wake();
             return accept;
         }
         if (ev.text == "+" || ev.text == "=") {
@@ -347,6 +433,95 @@ export component StreamViewerPanel inherits FocusScope {
                 }
                 changed has-hover => {
                     if (self.has-hover) { root.wake(); }
+                }
+            }
+        }
+
+        // ── The sharer's camera, a box over the stream (1.5.2) ──────────
+        if root.pip-on : Rectangle {
+            x: root.pip-x;
+            y: root.pip-y;
+            width: root.pip-w;
+            height: root.pip-h;
+            border-radius: Theme.radius-md;
+            background: #000000;
+            border-width: 1px;
+            border-color: pip-drag.has-hover || pip-grip.pressed ? Theme.accent : #FFFFFF40;
+            drop-shadow-blur: 14px;
+            drop-shadow-color: #00000090;
+            clip: true;
+            Image {
+                width: parent.width;
+                height: parent.height;
+                source: root.camera-frame;
+                image-fit: cover;
+            }
+            // Dragging the box moves it. (Under the handle and the ✕,
+            // which take their own presses.)
+            pip-drag := TouchArea {
+                mouse-cursor: MouseCursor.move;
+                moved => {
+                    if (self.pressed) {
+                        root.pip-move(self.mouse-x - self.pressed-x, self.mouse-y - self.pressed-y);
+                    }
+                    root.wake();
+                }
+                double-clicked => {
+                    // Back to its corner and size.
+                    root.pip-fx = 1.0;
+                    root.pip-fy = 0.0;
+                    root.pip-fw = 0.24;
+                }
+            }
+            // The handle, on the corner facing the middle.
+            Rectangle {
+                x: root.pip-grip-left ? 0px : parent.width - self.width;
+                y: root.pip-grip-top ? 0px : parent.height - self.height;
+                width: 22px;
+                height: 22px;
+                opacity: pip-drag.has-hover || pip-grip.has-hover || pip-grip.pressed ? 1.0 : 0.0;
+                animate opacity { duration: 120ms; }
+                Rectangle {
+                    x: root.pip-grip-left ? 4px : parent.width - self.width - 4px;
+                    y: root.pip-grip-top ? 4px : parent.height - self.height - 4px;
+                    width: 10px;
+                    height: 10px;
+                    border-radius: 2px;
+                    background: #FFFFFFE0;
+                    border-width: 1px;
+                    border-color: #00000080;
+                }
+                pip-grip := TouchArea {
+                    mouse-cursor: root.pip-grip-left == root.pip-grip-top
+                        ? MouseCursor.nwse-resize : MouseCursor.nesw-resize;
+                    moved => {
+                        if (self.pressed) {
+                            root.pip-resize(self.mouse-x - self.pressed-x, self.mouse-y - self.pressed-y);
+                        }
+                    }
+                }
+            }
+            // ✕: hide it (the bar's camera button brings it back).
+            Rectangle {
+                x: root.pip-grip-left ? parent.width - self.width - 4px : 4px;
+                y: 4px;
+                width: 20px;
+                height: 20px;
+                border-radius: 10px;
+                background: pip-hide.has-hover ? #000000E0 : #000000A0;
+                opacity: pip-drag.has-hover || pip-hide.has-hover ? 1.0 : 0.0;
+                animate opacity { duration: 120ms; }
+                IconDisplay {
+                    icon: IconSet.X;
+                    size: 12px;
+                    stroke: #FFFFFF;
+                }
+                pip-hide := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        root.camera-shown = false;
+                        root.wake();
+                    }
                 }
             }
         }
@@ -531,6 +706,22 @@ export component StreamViewerPanel inherits FocusScope {
                     horizontal-alignment: left;
                     overflow: elide;
                 }
+                // The sharer's camera box, hidden or shown (1.5.2).
+                if root.camera-on : Rectangle {
+                    width: 32px;
+                    IconBtn {
+                        y: (parent.height - self.height) / 2;
+                        size: 32px;
+                        icon-size: 18px;
+                        icon: root.camera-shown ? IconSet.Video : IconSet.VideoOff;
+                        active: !root.camera-shown;
+                        tooltip: root.camera-shown ? Tr.viewer-camera-hide : Tr.viewer-camera-show;
+                        clicked => {
+                            root.camera-shown = !root.camera-shown;
+                            root.wake();
+                        }
+                    }
+                }
                 if root.rotate-offered : Rectangle {
                     width: 32px;
                     IconBtn {
@@ -611,6 +802,9 @@ export component StreamViewerWindow inherits Window {
     /// The session's mute and deafen, pushed by the app (D43).
     in property <bool> self-muted;
     in property <bool> self-deafened;
+    /// The sharer's camera, for the box over the stream (1.5.2).
+    in property <image> camera-frame;
+    in property <bool> camera-on: false;
     callback volume-changed(float);
     callback mute-toggled(bool);
     callback stop-watching();
@@ -642,6 +836,8 @@ export component StreamViewerWindow inherits Window {
         self-controls: true;
         self-muted: root.self-muted;
         self-deafened: root.self-deafened;
+        camera-frame: root.camera-frame;
+        camera-on: root.camera-on;
         volume-changed(v) => { root.volume-changed(v); }
         mute-toggled(m) => { root.mute-toggled(m); }
         stop-watching => { root.stop-watching(); }

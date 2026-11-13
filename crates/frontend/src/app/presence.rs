@@ -238,9 +238,7 @@ impl AppState {
         self.session.active_sharers.remove(&client_id);
 
         // Close viewer if we were watching this user
-        if let Some(viewer) = self.viewers.remove(&client_id) {
-            viewer.close();
-        }
+        self.close_viewer(client_id);
 
         self.push_activity(&t!("chat-user-left", "name" => username));
         if was_in_our_channel {
