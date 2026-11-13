@@ -48,6 +48,16 @@ Check with `which cargo` and `df -h /` first.
 
 ### What can be checked here, per platform
 
+**The toolchain is Rust 1.95** (`rust-toolchain.toml`; every workflow
+reads it, CI's clippy included). Lint with it: a newer clippy is not a
+stand-in. 1.95 denies lints a later one has moved or relaxed — 1.5.0
+passed clippy on 1.97 here and failed CI on `collapsible_match` (a
+match arm holding a lone `if`). Where 1.95 cannot be installed (a
+sandbox that cannot reach static.rust-lang.org), say so and look over
+the new code for that shape by hand. Formatting is the other pin:
+`cargo +nightly-2026-10-10 fmt --all`, since `.rustfmt.toml`'s import
+options are nightly-only (a stable `cargo fmt` applies the rest).
+
 - **Host (Linux):** `cargo clippy -p audio -p client -p frontend` (the
   workspace denies `clippy::all`; compare the pedantic warnings with a
   run before the change — new ones are yours), `cargo check -p frontend
@@ -55,7 +65,28 @@ Check with `which cargo` and `df -h /` first.
   `cargo test -p protocol -p transport -p server` (86, 45 and 51 + 88
   e2e on 2026-10-09, all green), plus `-p audio`, `-p client`,
   `-p app-core`, `-p i18n` as touched.
-- **Android, Rust:** `RUSTC_BOOTSTRAP=1 cargo clippy -p audio --target
+- **The phones in CI (1.5):** `pr-check.yaml` type-checks and lints
+  both apps for their targets on every pull request and before every
+  release — `android` (`cargo ndk … clippy -p android`, the release's
+  NDK, SDK platform and environment) and `ios` (`cargo clippy -p ios
+  --target aarch64-apple-ios` on the release's macOS runner and Xcode).
+  Nothing is linked or packaged. 1.5.0's release was the first to find
+  a desktop-only dependency (`zune-jpeg`) used on the phones; these jobs
+  find the next one first.
+- **Android, Rust, here:** with Rust's `library/` linked into the
+  sysroot (as for iOS, below), `RUSTC_BOOTSTRAP=1 cargo check -p
+  frontend --no-default-features --target aarch64-linux-android
+  -Zbuild-std=std,panic_abort` type-checks the phones' shared code with
+  three stand-ins on the command line, no NDK needed:
+  `CC_aarch64_linux_android=clang`,
+  `CFLAGS_aarch64_linux_android="--target=aarch64-linux-android29
+  -ffreestanding"`, `AR_aarch64_linux_android=llvm-ar`, plus
+  `--config 'patch.crates-io.opusic-sys.path="<a copy whose build.rs
+  only prints its link line>"'` and `--config
+  'target.aarch64-linux-android.ring_core_0_17_14_.rustc-link-lib=["static=ring_core_0_17_14_"]'`
+  (2026-11-13). The same flags with the `aarch64_apple_ios` names and
+  `--target=arm64-apple-ios17.0` run `cargo clippy -p ios` for iOS with
+  no scratch workspace. `RUSTC_BOOTSTRAP=1 cargo clippy -p audio --target
   aarch64-linux-android -Zbuild-std=std,panic_abort` checks the AAudio
   backend. The `android` crate itself cannot be checked (Slint's build
   script wants an SDK): type-check `crates/android/src/java.rs` and
@@ -1387,9 +1418,14 @@ outcome in the spec's decision log, then take the line out):
 ## 6. Site screenshots
 
 `web/` holds the site (`web.yaml` deploys it; its `img/` and `js/`
-were not in the 2026-10-07 upload). Its screenshots were rendered from
-the real UI at 2× with the viewer and fixtures (call, popover, prompt,
-connect, settings-servers, settings-audio; `share.png` is the viewer
-chrome composited over `call.png` with a drawn scene, since the viewer
-cannot play a stream headless). After a UI change, re-render with the
-commands in §1 and replace the files.
+were not in the 2026-10-07 upload). Its screenshots are rendered from
+the real UI at 2× with the viewer: `tools/site-shots/shots.py` holds
+every fixture (the "Los Conos" server and its people), draws the
+camera tiles' and the stream's frames from its own PNGs (`share.png`
+is the viewer's window composited over the call, since the viewer
+cannot play a stream headless), and writes to `tools/site-shots/out`:
+
+    SLINT_VIEWER=/tmp/sv/slint-viewer/slint-viewer python3 tools/site-shots/shots.py [shot …]
+
+After a UI change, re-run it and copy the shots into `web/img`
+(1.5 re-rendered all ten, `stage.png` new).

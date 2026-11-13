@@ -89,6 +89,22 @@ impl AppState {
         (main, chat)
     }
 
+    /// The server's chat is in the pane and the pane on screen (the
+    /// window aside, as for any chat): its lines are read as they come.
+    pub(super) fn general_on_screen(&self) -> bool {
+        let s = self.main.global::<State>();
+        self.session.chat.active_dm.is_none() && !s.get_view_messages() && self.columns().1
+    }
+
+    /// After the columns change: the chat coming on screen has been
+    /// read (its count goes, as opening it from a DM does).
+    fn chat_seen(&mut self) {
+        if self.general_on_screen() && self.session.chat.general_unread > 0 {
+            self.session.chat.general_unread = 0;
+            self.main.global::<State>().set_general_unread(0);
+        }
+    }
+
     /// A press on the rail. The channel list and Channel view (in a
     /// call) are one main column, either one: pressing the other swaps
     /// it, pressing the one showing hides it while the chat is there to
@@ -115,6 +131,7 @@ impl AppState {
                 _ => {}
             }
             self.save_view_prefs();
+            self.chat_seen();
             return;
         }
         let (main, chat) = self.columns();
@@ -149,6 +166,7 @@ impl AppState {
             _ => {}
         }
         self.save_view_prefs();
+        self.chat_seen();
     }
 
     /// Channel view's back arrow: the channel list instead of it.
@@ -169,6 +187,7 @@ impl AppState {
             s.set_view_main(self.last_main.max(MAIN_LIST));
         }
         self.save_view_prefs();
+        self.chat_seen();
     }
 
     /// Into Messages, with the conversation last open there (wide; a
@@ -415,6 +434,13 @@ impl AppState {
     /// Channel view came on screen or left it: cameras are watched
     /// only while it can be seen.
     pub(super) fn stage_shown(&mut self, shown: bool) {
+        if self.session.stage.shown != shown && !self.session.stage.cameras.is_empty() {
+            info!(
+                "Channel view {}: cameras {}",
+                if shown { "on screen" } else { "out of sight" },
+                if shown { "watched" } else { "let go" }
+            );
+        }
         self.session.stage.shown = shown;
         self.sync_camera_watch();
     }
@@ -534,6 +560,7 @@ impl AppState {
             .copied()
             .collect();
         for id in start {
+            info!("watching {}'s camera", self.username_of(id));
             self.session.stage.watching.insert(id);
             // The screen thread first, so the frames are wanted before
             // the server sends any.
@@ -551,6 +578,7 @@ impl AppState {
                 .ok();
         }
         for id in stop {
+            info!("no longer watching {}'s camera", self.username_of(id));
             self.session.stage.watching.remove(&id);
             self.session.stage.pictured.remove(&id);
             self.screen
@@ -625,21 +653,24 @@ impl AppState {
         self.session.stage = Stage::default();
     }
 
-    /// One prepared camera frame: onto its sender's tile.
-    pub(super) fn camera_frame(&mut self, f: crate::present::PreparedFrame) {
+    /// One prepared camera frame: onto its sender's tile. True when it
+    /// reached one.
+    pub(super) fn camera_frame(&mut self, f: crate::present::PreparedFrame) -> bool {
         let sender = f.meta.client_id & !CAMERA_TRACK_BIT;
         if !self.session.stage.watching.contains(&sender) {
-            return;
+            return false;
         }
         self.session.stage.pictured.insert(sender);
         let Some(&i) = self.session.stage.tiles.get(&sender) else {
-            return;
+            return false;
         };
-        if let Some(mut tile) = self.stage_model.row_data(i) {
-            tile.camera = true;
-            tile.frame = slint::Image::from_rgba8(f.buffer);
-            self.stage_model.set_row_data(i, tile);
-        }
+        let Some(mut tile) = self.stage_model.row_data(i) else {
+            return false;
+        };
+        tile.camera = true;
+        tile.frame = slint::Image::from_rgba8(f.buffer);
+        self.stage_model.set_row_data(i, tile);
+        true
     }
 }
 

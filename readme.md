@@ -121,7 +121,7 @@ Working on the code? Start with [`START-HERE.md`](START-HERE.md).
 
 ### Prerequisites
 
-- Rust 1.95+ (`rust-toolchain.toml` pins it; edition 2024)
+- Rust 1.95 (`rust-toolchain.toml` pins it; CI builds and lints with exactly that, and a newer clippy can pass code 1.95 rejects; edition 2024)
 - FFmpeg **7.1** libraries (for screen share encode/decode): the
   `ffmpeg-next` 8 bindings do not build against FFmpeg 8
 - CMake (the Opus codec is built from source); with CMake 4, set

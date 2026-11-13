@@ -10,6 +10,11 @@ workspace = true
 [dependencies]
 log.workspace = true
 thiserror.workspace = true
+# MJPEG camera frames to RGBA (`camera::to_rgba`, 1.5). Pure Rust and
+# already in the tree through `image`; on every target, since the
+# conversion is platform-free (1.5.0's phone builds failed when it was
+# desktop-only).
+zune-jpeg = "0.5"
 
 # Desktop-only backends. iOS/Android builds get stub implementations
 # whose constructors fail cleanly (see src/capture.rs, src/codec_stub.rs);
@@ -112,9 +117,9 @@ ffmpeg-next = { version = "8", default-features = false, features = [
 # Cameras (1.5, `src/camera.rs`): nokhwa's native backends — Media
 # Foundation, AVFoundation and V4L2 — behind `camera::Camera`. Without
 # its `decoding` feature (mozjpeg, a second C build): an MJPEG camera
-# is decoded by zune-jpeg, already in the tree through `image`.
+# is decoded by zune-jpeg (in `[dependencies]`: `camera::to_rgba`
+# compiles on every target).
 nokhwa = { version = "0.10.11", default-features = false, features = ["input-native"] }
-zune-jpeg = "0.5"
 
 # X11 sharing reads the screen only where DAMAGE says it changed
 # (`src/x11.rs`); already in the tree through keywatch and arboard.

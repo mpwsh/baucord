@@ -103,6 +103,22 @@ impl Samples {
     }
 }
 
+/// A stream's id as its lines name it: a camera's carries the camera
+/// bit (`protocol::recording::CAMERA_TRACK_BIT`), which made it a
+/// 19-digit number nobody could match to the person.
+struct Peer(u64);
+
+impl std::fmt::Display for Peer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let bit = protocol::recording::CAMERA_TRACK_BIT;
+        if self.0 & bit == 0 {
+            write!(f, "{}", self.0)
+        } else {
+            write!(f, "{} (camera)", self.0 & !bit)
+        }
+    }
+}
+
 /// One watched stream's log state.
 pub(crate) struct Viewing {
     peer: u64,
@@ -235,7 +251,7 @@ impl Viewing {
             Level::Warn,
             format!(
                 "video from {} falling behind live: {} ms late, decoding busy {busy}% of the time",
-                self.peer,
+                Peer(self.peer),
                 behind.as_millis()
             ),
         ))
@@ -270,7 +286,7 @@ impl Viewing {
                 Level::Info,
                 format!(
                     "video from {} keeping up with live again (the lag lasted {:.0} s)",
-                    self.peer,
+                    Peer(self.peer),
                     last_late.duration_since(began).as_secs_f32()
                 ),
             ));
@@ -299,7 +315,7 @@ impl Viewing {
                         format!(
                             "video from {} frozen {:.0} s: no keyframe to restart from \
                              (asked for one {} times so far)",
-                            self.peer,
+                            Peer(self.peer),
                             now.duration_since(*since).as_secs_f32(),
                             buffer.stats.keyframe_requests
                         ),
@@ -312,7 +328,7 @@ impl Viewing {
                         Level::Info,
                         format!(
                             "video from {} resumed: a keyframe arrived after {:.1} s",
-                            self.peer,
+                            Peer(self.peer),
                             now.duration_since(*since).as_secs_f32()
                         ),
                     ));
@@ -335,7 +351,7 @@ impl Viewing {
             .duration_since(self.window_start)
             .as_secs_f32()
             .max(0.001);
-        let mut line = format!("viewing {}", self.peer);
+        let mut line = format!("viewing {}", Peer(self.peer));
         if self.size != (0, 0) {
             let _ = write!(line, " {}x{}", self.size.0, self.size.1);
         }
@@ -672,6 +688,13 @@ mod tests {
             codec: ms(codec),
             output: ms(output),
         })
+    }
+
+    #[test]
+    fn a_camera_is_named_by_its_sender() {
+        let bit = protocol::recording::CAMERA_TRACK_BIT;
+        assert_eq!(Peer(42).to_string(), "42");
+        assert_eq!(Peer(42 | bit).to_string(), "42 (camera)");
     }
 
     /// A 30 fps window where each picture costs 6 + 26 ms and lands
