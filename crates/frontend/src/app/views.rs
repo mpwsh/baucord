@@ -18,10 +18,11 @@
 //! A child of `app`: everything private to `AppState` is in reach
 //! through `super::*`, so these are the same methods, only filed.
 
-#[allow(clippy::wildcard_imports)]
-use super::*;
 use client::protocol::recording::CAMERA_TRACK_BIT;
 use ui::StageTile;
+
+#[allow(clippy::wildcard_imports)]
+use super::*;
 
 /// The rail's buttons, as `Logic.view-picked` numbers them.
 const VIEW_LIST: i32 = 0;
