@@ -1098,9 +1098,7 @@ impl AppState {
             }
             NetworkMessage::SubscribeDenied { target_id, reason } => {
                 // Close the viewer window WatchPeer opened optimistically.
-                if let Some(viewer) = self.viewers.remove(&target_id) {
-                    viewer.close();
-                }
+                self.close_viewer(target_id);
                 let username = self.username_of(target_id);
                 let why = describe_deny(reason);
                 self.push_chat_system(
@@ -1157,9 +1155,7 @@ impl AppState {
                         &t!("chat-peer-stopped-sharing", "name" => username.as_str()),
                     );
                 }
-                if let Some(viewer) = self.viewers.remove(&client_id) {
-                    viewer.close();
-                }
+                self.close_viewer(client_id);
                 // And coming down, ours included, under the same switch.
                 // A beat later and only if the sharer is still with us: a
                 // sharer who quits or leaves for the lobby sends the stop

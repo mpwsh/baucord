@@ -48,6 +48,82 @@ pub fn tile_tint(name: &str) -> [u8; 3] {
     hsl_to_rgb(hue, 0.45, 0.32)
 }
 
+/// A tile's ground for a person with a picture (1.5.2): the picture's
+/// own main color, so the square around it reads as part of it — a
+/// cream dog on warm tan, not on the name's random green. `rgba` is
+/// packed RGBA, `width`×`height`.
+///
+/// Up to 32×32 points are sampled and sorted into 512 boxes of similar
+/// color (3 bits a channel), each counted by its opacity; the fullest
+/// box's mean is the color (a plain mean of everything comes out grey).
+/// It is then held to the dark theme: lightness at most
+/// [`PICTURE_TINT_MAX_LIGHTNESS`], saturation a fifth up, its hue kept.
+/// `None` for an empty or wholly clear picture.
+#[must_use]
+pub fn picture_tint(rgba: &[u8], width: u32, height: u32) -> Option<[u8; 3]> {
+    let (cols, rows) = (width as usize, height as usize);
+    if cols == 0 || rows == 0 || rgba.len() < cols * rows * 4 {
+        return None;
+    }
+    let (step_x, step_y) = (cols.div_ceil(32), rows.div_ceil(32));
+    // Per box: red, green and blue sums, and the weight.
+    let mut boxes = vec![[0f64; 4]; 512];
+    for row in (step_y / 2..rows).step_by(step_y) {
+        for col in (step_x / 2..cols).step_by(step_x) {
+            let at = (row * cols + col) * 4;
+            let [red, green, blue, alpha] = [rgba[at], rgba[at + 1], rgba[at + 2], rgba[at + 3]];
+            let weight = f64::from(alpha) / 255.0;
+            let slot =
+                usize::from(red >> 5) << 6 | usize::from(green >> 5) << 3 | usize::from(blue >> 5);
+            let sums = &mut boxes[slot];
+            sums[0] += f64::from(red) * weight;
+            sums[1] += f64::from(green) * weight;
+            sums[2] += f64::from(blue) * weight;
+            sums[3] += weight;
+        }
+    }
+    // The fullest box; the first of equals, so the pick is stable.
+    let best = boxes
+        .iter()
+        .fold(None::<&[f64; 4]>, |best, sums| match best {
+            Some(kept) if kept[3] >= sums[3] => Some(kept),
+            _ => Some(sums),
+        })
+        .filter(|sums| sums[3] > 1e-6)?;
+    let [red, green, blue] = [0, 1, 2].map(|c| best[c] / best[3] / 255.0);
+    let (hue, sat, light) = rgb_to_hsl(red, green, blue);
+    Some(hsl_to_rgb(
+        hue,
+        (sat * 1.2).min(1.0),
+        light.min(PICTURE_TINT_MAX_LIGHTNESS),
+    ))
+}
+
+/// How light a picture's tile may be (HSL): lighter grounds glare on
+/// the dark theme and wash out the name chip's edge.
+pub const PICTURE_TINT_MAX_LIGHTNESS: f64 = 0.45;
+
+/// RGB in 0..=1 → hue in degrees, saturation and lightness in 0..=1.
+#[expect(clippy::many_single_char_names)]
+fn rgb_to_hsl(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = f64::midpoint(max, min);
+    let d = max - min;
+    if d < 1e-9 {
+        return (0.0, 0.0, l);
+    }
+    let s = d / (1.0 - (2.0 * l - 1.0).abs());
+    let h = if (max - r).abs() < 1e-12 {
+        60.0 * ((g - b) / d).rem_euclid(6.0)
+    } else if (max - g).abs() < 1e-12 {
+        60.0 * ((b - r) / d + 2.0)
+    } else {
+        60.0 * ((r - g) / d + 4.0)
+    };
+    (h, s, l)
+}
+
 // h, s, l, c, x and r, g, b are the names the HSL→RGB formula is
 // written with everywhere; longer ones would hide it.
 #[expect(clippy::many_single_char_names)]
@@ -338,6 +414,63 @@ pub fn join_id(lo: i32, hi: i32) -> ClientId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn solid(w: u32, h: u32, px: [u8; 4]) -> Vec<u8> {
+        px.repeat((w * h) as usize)
+    }
+
+    fn hsl_of([r, g, b]: [u8; 3]) -> (f64, f64, f64) {
+        rgb_to_hsl(
+            f64::from(r) / 255.0,
+            f64::from(g) / 255.0,
+            f64::from(b) / 255.0,
+        )
+    }
+
+    #[test]
+    fn a_picture_tints_its_tile_with_its_main_color() {
+        // Three quarters red, a quarter blue: red, a little stronger.
+        let mut mixed = solid(8, 8, [150, 30, 30, 255]);
+        mixed[..8 * 2 * 4].copy_from_slice(&solid(8, 2, [20, 20, 200, 255]));
+        let tint = picture_tint(&mixed, 8, 8).unwrap();
+        let (hue, sat, light) = hsl_of(tint);
+        let (hue0, sat0, light0) = hsl_of([150, 30, 30]);
+        assert!((hue - hue0).abs() < 2.0, "{tint:?}");
+        assert!(sat >= sat0 - 0.01);
+        assert!((light - light0).abs() < 0.01);
+        // Clear pixels count for nothing.
+        let mut clear = solid(4, 4, [10, 120, 10, 255]);
+        clear[..2 * 4 * 4].copy_from_slice(&solid(4, 2, [255, 255, 255, 0]));
+        let (hue, _, _) = hsl_of(picture_tint(&clear, 4, 4).unwrap());
+        assert!((hue - 120.0).abs() < 2.0);
+    }
+
+    #[test]
+    fn a_light_picture_gets_a_darker_ground_of_the_same_hue() {
+        // Cream, like a light dog's fur: a tan of the same hue.
+        let cream = [235, 215, 175];
+        let tint =
+            picture_tint(&solid(16, 16, [cream[0], cream[1], cream[2], 255]), 16, 16).unwrap();
+        let (hue, sat, light) = hsl_of(tint);
+        let (hue0, sat0, _) = hsl_of(cream);
+        assert!(light <= PICTURE_TINT_MAX_LIGHTNESS + 0.01, "{tint:?}");
+        assert!((hue - hue0).abs() < 3.0, "{tint:?}");
+        assert!(sat > sat0, "{tint:?}");
+    }
+
+    #[test]
+    fn grey_stays_grey() {
+        let (_, sat, light) = hsl_of(picture_tint(&solid(4, 4, [90, 90, 90, 255]), 4, 4).unwrap());
+        assert!(sat < 0.01);
+        assert!((light - 90.0 / 255.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn nothing_to_average_gives_no_tint() {
+        assert_eq!(picture_tint(&[], 0, 0), None);
+        assert_eq!(picture_tint(&solid(4, 4, [9, 9, 9, 0]), 4, 4), None);
+        assert_eq!(picture_tint(&[1, 2, 3], 4, 4), None);
+    }
 
     #[test]
     fn id_split_roundtrips_at_extremes() {

@@ -223,6 +223,19 @@ pub mod convert {
         slint::Color::from_rgb_u8(r, g, b)
     }
 
+    /// A picture's tile color: its own average
+    /// (`app_core::roster::picture_tint`). `None` when the image holds no
+    /// pixels to read.
+    #[must_use]
+    pub fn picture_tint(image: &slint::Image) -> Option<slint::Color> {
+        // The decoded avatars are pixel buffers: this is a handle, not
+        // a copy.
+        let pixels = image.to_rgba8()?;
+        let [r, g, b] =
+            app_core::roster::picture_tint(pixels.as_bytes(), pixels.width(), pixels.height())?;
+        Some(slint::Color::from_rgb_u8(r, g, b))
+    }
+
     /// Packed RGBA bytes → `slint::Image` (shared-buffer copy).
     ///
     /// Length-guarded: a stride/size mismatch yields a blank image and

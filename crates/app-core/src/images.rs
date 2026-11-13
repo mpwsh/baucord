@@ -227,6 +227,20 @@ pub fn extension_for(bytes: &[u8]) -> &'static str {
     }
 }
 
+/// The MIME type a picture about to be sent is announced as, from what
+/// its bytes are (`load_image_bytes` hands on PNG, JPEG, or an animated
+/// GIF untouched). Every picture was announced as `picture.png`,
+/// `image/png`: a GIF was refused by the server as the wrong type, and
+/// the toast named a PNG the person never had.
+#[must_use]
+pub fn mime_for(bytes: &[u8]) -> &'static str {
+    match extension_for(bytes) {
+        "jpg" => "image/jpeg",
+        "gif" => "image/gif",
+        _ => "image/png",
+    }
+}
+
 /// A picture's size from its header, without decoding it.
 fn dimensions_of(bytes: &[u8]) -> Option<(u32, u32)> {
     image::ImageReader::new(Cursor::new(bytes))
@@ -741,6 +755,9 @@ mod tests {
             "png"
         );
         assert_eq!(extension_for(b"?"), "png");
+        assert_eq!(mime_for(b"GIF89a\x01\x00\x01\x00"), "image/gif");
+        assert_eq!(mime_for(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 0]), "image/jpeg");
+        assert_eq!(mime_for(b"?"), "image/png");
     }
 
     #[test]

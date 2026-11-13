@@ -334,7 +334,10 @@ impl AppState {
 
     fn tile_of(&self, row: &UserRow, index: usize) -> StageTile {
         let id = roster::join_id(row.client_id_lo, row.client_id_hi);
-        let pictured = self.session.stage.pictured.contains(&id)
+        // Watching their stream, their camera is in its window and the
+        // tile shows their picture (1.5.2).
+        let watching = row.sharing && self.viewers.contains_key(&id);
+        let pictured = (self.session.stage.pictured.contains(&id) && !watching)
             || (row.is_us && self.session.stage.self_view);
         // A tile that already shows a camera keeps its last picture;
         // the next frame replaces it.
@@ -357,13 +360,20 @@ impl AppState {
             avatar: row.avatar.clone(),
             has_avatar: row.has_avatar,
             initial: row.initial.clone(),
-            tile_tint: row.tile_tint,
+            // With a picture, its own color (1.5.2); without, the
+            // name's.
+            tile_tint: row
+                .has_avatar
+                .then(|| ui::convert::picture_tint(&row.avatar))
+                .flatten()
+                .unwrap_or(row.tile_tint),
             name_color: row.name_color,
             has_name_color: row.has_name_color,
             speaking: row.speaking,
             self_muted: row.self_muted,
             self_deafened: row.self_deafened,
             sharing: row.sharing,
+            watching,
             is_us: row.is_us,
             camera: pictured,
             frame,
@@ -430,6 +440,22 @@ impl AppState {
     }
 
     // ── Cameras ─────────────────────────────────────────────────────
+
+    /// A stream's window opened or closed (1.5.2): the sharer's camera
+    /// moves between it and their tile, and the tile's badge between
+    /// Live and Watching.
+    pub(crate) fn viewers_changed(&mut self) {
+        self.sync_camera_watch();
+        self.rebuild_stage();
+    }
+
+    /// Close the viewer of `client_id`'s stream, if one is open.
+    pub(crate) fn close_viewer(&mut self, client_id: u64) {
+        if let Some(viewer) = self.viewers.remove(&client_id) {
+            viewer.close();
+            self.viewers_changed();
+        }
+    }
 
     /// Channel view came on screen or left it: cameras are watched
     /// only while it can be seen.
@@ -530,23 +556,26 @@ impl AppState {
         self.sync_camera_watch();
     }
 
-    /// Watch every camera of our channel while Channel view is seen;
-    /// let all of them go when it is not.
+    /// Watch every camera of our channel while Channel view is seen,
+    /// and the camera of anyone whose stream we watch (it shows in the
+    /// stream's window, 1.5.2); let the rest go.
     fn sync_camera_watch(&mut self) {
-        let wanted: HashSet<u64> = if self.session.stage.shown && !self.in_lobby() {
+        let wanted: HashSet<u64> = if self.in_lobby() {
+            HashSet::new()
+        } else {
             let ours = self.our_channel();
+            let shown = self.session.stage.shown;
             self.session
                 .stage
                 .cameras
                 .keys()
                 .copied()
                 .filter(|id| {
-                    self.session.users.get(id).map(|u| u.channel_id) == ours
+                    (shown || self.viewers.contains_key(id))
+                        && self.session.users.get(id).map(|u| u.channel_id) == ours
                         && !self.client_blocked(*id)
                 })
                 .collect()
-        } else {
-            HashSet::new()
         };
         let start: Vec<u64> = wanted
             .difference(&self.session.stage.watching)
@@ -611,6 +640,10 @@ impl AppState {
     }
 
     fn clear_tile_picture(&self, client_id: u64) {
+        // In their stream's window, it goes from there too.
+        if let Some(viewer) = self.viewers.get(&client_id) {
+            viewer.set_camera(None);
+        }
         let Some(&i) = self.session.stage.tiles.get(&client_id) else {
             return;
         };
@@ -653,7 +686,8 @@ impl AppState {
         self.session.stage = Stage::default();
     }
 
-    /// One prepared camera frame: onto its sender's tile. True when it
+    /// One prepared camera frame: into their stream's window when we
+    /// watch it (1.5.2), else onto its sender's tile. True when it
     /// reached one.
     pub(super) fn camera_frame(&mut self, f: crate::present::PreparedFrame) -> bool {
         let sender = f.meta.client_id & !CAMERA_TRACK_BIT;
@@ -661,6 +695,10 @@ impl AppState {
             return false;
         }
         self.session.stage.pictured.insert(sender);
+        if let Some(viewer) = self.viewers.get(&sender) {
+            viewer.set_camera(Some(slint::Image::from_rgba8(f.buffer)));
+            return true;
+        }
         let Some(&i) = self.session.stage.tiles.get(&sender) else {
             return false;
         };

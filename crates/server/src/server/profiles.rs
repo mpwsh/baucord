@@ -398,7 +398,7 @@ impl ChatServer {
         }
         // Avatar-sized images are everyone's (spec §7.1); anything else
         // is a file and goes through the file rules (spec §7).
-        let avatar_sized = is_avatar_mime(&mime)
+        let avatar_sized = is_picture_mime(&mime)
             && size != 0
             && usize::try_from(size).is_ok_and(|s| s <= self.avatar_cap());
         if !avatar_sized {
@@ -408,7 +408,7 @@ impl ChatServer {
             let files_here =
                 self.has_feature(client, features::FILES) && self.persist.is_persistent();
             if !files_here {
-                let reason = if is_avatar_mime(&mime) {
+                let reason = if is_picture_mime(&mime) {
                     UploadRejectReason::TooLarge
                 } else {
                     UploadRejectReason::BadType
@@ -506,7 +506,7 @@ impl ChatServer {
         }
         // An image is what it sniffs as; any other file keeps a sane
         // declared type or becomes an octet stream.
-        let sniffed = match sniff_image_mime(&bytes) {
+        let sniffed = match sniff_picture_mime(&bytes) {
             Some(image) => image.to_string(),
             None if announced.is_file => Self::sanitize_mime_impl(&announced.mime),
             None => {
@@ -845,9 +845,21 @@ fn is_avatar_mime(mime: &str) -> bool {
     )
 }
 
-/// The type the bytes say they are, for the types an avatar may be.
-fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(&super::PNG_MAGIC) {
+/// The types a picture in chat may be: an avatar's, and GIF (the
+/// desktop sends animated GIFs as they are). Pictures moved to the blob
+/// path in 1.4 with the avatar's list, so a GIF up to the avatar cap
+/// was refused as the wrong type, and a bigger one only went through
+/// as a file. A GIF still never becomes an avatar (`ChatServer::is_avatar_blob`).
+fn is_picture_mime(mime: &str) -> bool {
+    is_avatar_mime(mime) || mime.trim().eq_ignore_ascii_case("image/gif")
+}
+
+/// The type the bytes say they are, for the types a picture may be
+/// ([`is_picture_mime`]).
+fn sniff_picture_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.starts_with(&super::PNG_MAGIC) {
         Some("image/png")
     } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
         Some("image/jpeg")
@@ -877,24 +889,35 @@ mod tests {
     }
 
     #[test]
-    fn sniffing_admits_the_three_types() {
+    fn sniffing_admits_the_picture_types() {
         assert_eq!(
-            sniff_image_mime(&super::super::PNG_MAGIC),
+            sniff_picture_mime(&super::super::PNG_MAGIC),
             Some("image/png")
         );
         // A PNG needs the whole eight-byte signature, not just "PNG".
         assert_eq!(
-            sniff_image_mime(&[0x89, b'P', b'N', b'G', 0, 0, 0, 0]),
+            sniff_picture_mime(&[0x89, b'P', b'N', b'G', 0, 0, 0, 0]),
             None
         );
         assert_eq!(
-            sniff_image_mime(&[0xFF, 0xD8, 0xFF, 0xE0]),
+            sniff_picture_mime(&[0xFF, 0xD8, 0xFF, 0xE0]),
             Some("image/jpeg")
         );
         let mut webp = b"RIFF".to_vec();
         webp.extend_from_slice(&[0, 0, 0, 0]);
         webp.extend_from_slice(b"WEBPVP8 ");
-        assert_eq!(sniff_image_mime(&webp), Some("image/webp"));
-        assert_eq!(sniff_image_mime(b"GIF89a"), None);
+        assert_eq!(sniff_picture_mime(&webp), Some("image/webp"));
+        assert_eq!(sniff_picture_mime(b"GIF89a"), Some("image/gif"));
+        assert_eq!(sniff_picture_mime(b"GIF87a"), Some("image/gif"));
+        assert_eq!(sniff_picture_mime(b"GIF8"), None);
+    }
+
+    #[test]
+    fn a_gif_is_a_picture_but_never_an_avatar() {
+        assert!(is_picture_mime("image/gif"));
+        assert!(is_picture_mime(" IMAGE/GIF "));
+        assert!(is_picture_mime("image/png"));
+        assert!(!is_avatar_mime("image/gif"));
+        assert!(!is_picture_mime("image/svg+xml"));
     }
 }

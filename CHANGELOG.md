@@ -6,7 +6,7 @@ file are summed up in SESSION-GUIDE.md §3 ("Shipped").
 
 ## 1.5.2 (unreleased)
 
-Fixes to 1.5.1.
+Fixes to 1.5.1, and a streamer's camera in their stream.
 
 - **Cameras that would not open on Windows now do.** (Listed for
   1.5.1, but that release was built without it.) A camera that
@@ -26,6 +26,39 @@ Fixes to 1.5.1.
   of sizes or rates instead of a list, or only the YU12/YV12 pixel
   layouts, listed nothing. Ranges now offer the usual sizes and rates
   inside them, and YU12/YV12 are read.
+
+- **GIFs send again.** An animated GIF picked, dropped or pasted into
+  chat showed in the preview, then failed with "cannot send
+  picture.png: only PNG, JPEG and WebP images are accepted". Pictures
+  moved to the server's file storage with the avatar's list of types,
+  which has no GIF, and every picture was announced as `picture.png`.
+  The server now takes GIF pictures (never as avatars), and the app
+  names and types each picture for what it is. **The server fix alone
+  is enough** for 1.5.0 and 1.5.1 apps; the app's part is the name in
+  the toast. A GIF over the picture size cap (the avatar cap, 256 KB by
+  default) goes as a file, as a large PNG does, and needs the files
+  permission.
+
+### New
+
+- **A streamer's camera in their stream.** In Channel view, the Live
+  badge on someone's tile opens their stream. If their camera is on,
+  it shows in the stream's window as a small box over the picture, the
+  way a streamer's face sits over their game: drag it anywhere, resize
+  it from its inner corner, hide it with its ✕, the bar's camera button
+  or C, and double-click it to put it back top-right. While you watch,
+  their tile shows their picture with a **Watching** badge (a click
+  brings the stream's window forward); closing the stream puts their
+  camera back on the tile. Needs no server update.
+- **Channel view's tiles are nearly square** (5:4, square on a phone
+  held upright), so more people fit: six on a phone. Someone without a
+  camera shows as their picture in the roster's rounded square,
+  floating on a ground of the picture's own main color (a cream dog on
+  warm tan), not on a dimmed copy of it over a color picked from their
+  name; someone with no picture keeps their initial on their name's
+  color. The columns are the ones that make the tiles biggest, and a
+  tile is never wider than 560 px on a big screen. In a narrow window,
+  Leave call shows its icon alone.
 
 ## 1.5.1 (2026-11-13)
 

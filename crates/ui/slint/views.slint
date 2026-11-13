@@ -489,12 +489,17 @@ export component InboxEmpty inherits Rectangle {
     }
 }
 
-/// One person in Channel view: their camera, or their picture on a
-/// tinted ground, the speaking ring, their name and marks.
+/// One person in Channel view: their camera, or their picture as a
+/// floating squircle on a ground of its own main color (the host puts
+/// it in `tile-tint`, 1.5.2), or their initial on their name's tint;
+/// the speaking ring, their name and marks.
 component Tile inherits Rectangle {
     in property <StageTile> tile;
-    border-radius: Theme.radius-lg;
-    background: tile.camera ? #000000 : tile.tile-tint.darker(0.35);
+    // A squircle's corners: a tenth of the short side, 12–24 px.
+    border-radius: Math.clamp(Math.min(self.width, self.height) * 0.1, 12px, 24px);
+    background: tile.camera ? #000000
+        : tile.has-avatar ? tile.tile-tint
+        : tile.tile-tint.darker(0.35);
     clip: true;
     border-width: tile.speaking ? 3px : 1px;
     border-color: tile.speaking ? Theme.success : Theme.border;
@@ -506,32 +511,32 @@ component Tile inherits Rectangle {
         source: tile.frame;
         image-fit: cover;
     }
-    // A picture: the whole of it, over a dimmed copy that fills the
-    // tile's sides (no circle in a big square).
-    if !tile.camera && tile.has-avatar : Image {
-        width: parent.width;
-        height: parent.height;
-        source: tile.avatar;
-        image-fit: cover;
-        opacity: 0.25;
-    }
-    if !tile.camera && tile.has-avatar : Image {
-        width: parent.width;
-        height: parent.height;
-        source: tile.avatar;
-        image-fit: contain;
-    }
-    if !tile.camera && !tile.has-avatar : AvatarTile {
-        x: (parent.width - self.width) / 2;
-        y: (parent.height - self.height) / 2 - 8px;
-        side: Math.min(parent.width, parent.height) * 0.42;
-        corner: self.side / 2;
-        source: tile.avatar;
-        has-image: false;
-        initial: tile.initial;
-        tint: tile.tile-tint;
-        ring: false;
-        ring-room: false;
+    // No camera: their picture (or initial) as a squircle — the
+    // roster's shape — floating in the middle of the room above the
+    // name chip (its 22 px and margins), never under it.
+    property <length> chip-room: 36px;
+    property <length> face: Math.max(0px, Math.min(Math.min(self.width, self.height) * 0.5,
+        self.height - 2 * root.chip-room + 8px));
+    if !tile.camera : Rectangle {
+        x: (parent.width - root.face) / 2;
+        y: Math.max(6px, (parent.height - root.chip-room - root.face) / 2 + 4px);
+        width: root.face;
+        height: root.face;
+        border-radius: root.face * 0.27;
+        background: tile.has-avatar ? tile.tile-tint : tile.tile-tint.brighter(0.15);
+        drop-shadow-blur: root.face * 0.12;
+        drop-shadow-offset-y: root.face * 0.03;
+        drop-shadow-color: #00000059;
+        AvatarTile {
+            side: root.face;
+            corner: root.face * 0.27;
+            source: tile.avatar;
+            has-image: tile.has-avatar;
+            initial: tile.initial;
+            tint: tile.tile-tint.brighter(0.15);
+            ring: false;
+            ring-room: false;
+        }
     }
     // Name and marks, bottom left: the name, the role's glyph, the
     // level; the progress to the next level runs under them.
@@ -599,20 +604,6 @@ component Tile inherits Rectangle {
             background: Theme.accent-text;
         }
     }
-    if tile.sharing : Rectangle {
-        x: parent.width - self.width - 8px;
-        y: 8px;
-        width: live.preferred-width + 12px;
-        height: 18px;
-        border-radius: 9px;
-        background: Theme.danger;
-        live := Text {
-            text: Tr.live;
-            color: Theme.on-accent;
-            font-size: Theme.font-xs;
-            font-weight: 700;
-        }
-    }
     ta := TouchArea {
         pointer-event(ev) => {
             if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
@@ -627,35 +618,99 @@ component Tile inherits Rectangle {
             }
         }
     }
+    // Live, top right: a click opens their stream (1.5.2). Watching it,
+    // the badge says so and brings the stream's window forward. Over
+    // the tile's own touch area, which opens the menu.
+    if tile.sharing : Rectangle {
+        x: parent.width - self.width - 8px;
+        y: 8px;
+        width: badge-row.preferred-width;
+        height: 20px;
+        border-radius: 10px;
+        background: tile.watching ? Theme.accent : Theme.danger;
+        border-width: badge-ta.has-hover && !tile.is-us ? 1px : 0px;
+        border-color: #FFFFFFC0;
+        badge-row := HorizontalLayout {
+            padding-left: 7px;
+            padding-right: 7px;
+            spacing: 4px;
+            if tile.watching : Rectangle {
+                width: 12px;
+                IconDisplay {
+                    icon: IconSet.Eye;
+                    size: 12px;
+                    stroke: Theme.on-accent;
+                }
+            }
+            Text {
+                text: tile.watching ? Tr.tile-watching : Tr.live;
+                color: Theme.on-accent;
+                font-size: Theme.font-xs;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+        }
+        badge-ta := TouchArea {
+            property <string> tip: tile.watching ? Tr.tile-watching-tip : Tr.tile-watch-tip;
+            enabled: !tile.is-us;
+            mouse-cursor: tile.is-us ? MouseCursor.default : MouseCursor.pointer;
+            clicked => {
+                Tip.hide(self.tip);
+                Logic.watch-user(tile.index);
+            }
+            changed has-hover => {
+                if (self.has-hover) {
+                    Tip.show(self.tip, self.absolute-position.x, self.absolute-position.y,
+                        self.width, self.height, true);
+                } else {
+                    Tip.hide(self.tip);
+                }
+            }
+        }
+    }
 }
 
 /// Channel view: our channel's header — the way back to the list, its
-/// name, REC and timer — a grid of its people, 16:9 tiles sharing the
-/// stage evenly in the fewest columns that keep every tile on screen,
-/// and the call's bar under them.
+/// name, REC and timer — a grid of its people, nearly square tiles
+/// sharing the stage evenly in the column count that makes them
+/// biggest, and the call's bar under them.
 export component Stage inherits Rectangle {
     in property <bool> narrow: false;
     background: Theme.bg-primary;
     property <int> n: State.stage-tiles.length;
-    property <length> gap: 10px;
+    property <length> gap: root.narrow ? 8px : 10px;
     property <length> grid-w: grid.width;
     property <length> grid-h: grid.height;
+    // Tiles are nearly square (1.5.2): a little wider than tall, so a
+    // phone upright shows six in two columns, and a few people do not
+    // fill a big screen with 16:9 slabs. A camera fills its tile,
+    // cropped at the sides.
+    // An upright phone has height to spare and width to save: square.
+    property <float> ratio: root.narrow && root.grid-h > root.grid-w ? 1.0 : 1.25;
+    // No tile wider than this (one or two people on a big screen).
+    property <length> max-tw: root.narrow ? 100000px : 560px;
     pure function tile-w(c: int) -> length {
         return (root.grid-w - (c - 1) * root.gap) / c;
     }
     pure function rows(c: int) -> int {
         return Math.ceil(root.n / c);
     }
-    pure function fits(c: int) -> bool {
-        return root.rows(c) * root.tile-w(c) * 9 / 16 + (root.rows(c) - 1) * root.gap <= root.grid-h;
+    /// The tile's width in `c` columns: as wide as a column, no taller
+    /// than the rows allow.
+    pure function tw-of(c: int) -> length {
+        return Math.min(root.max-tw, root.tile-w(c),
+            (root.grid-h - (root.rows(c) - 1) * root.gap) / Math.max(1, root.rows(c)) * root.ratio);
     }
-    property <int> cols: root.n <= 1 ? 1 : root.fits(1) ? 1 : root.fits(2) ? 2
-        : root.fits(3) ? 3 : root.fits(4) ? 4 : root.fits(5) ? 5 : root.narrow ? 2 : 6;
-    // The tile's width: as wide as a column allows, and no taller than
-    // the rows allow.
-    property <length> tw: Math.min(root.tile-w(root.cols),
-        ((root.grid-h - (root.rows(root.cols) - 1) * root.gap) / Math.max(1, root.rows(root.cols))) * 16 / 9);
-    property <length> th: root.tw * 9 / 16;
+    // The column count that gives the biggest tiles (the fewest on a
+    // tie), up to six.
+    property <int> best2: root.tw-of(2) > root.tw-of(1) + 0.5px ? 2 : 1;
+    property <int> best3: root.tw-of(3) > root.tw-of(root.best2) + 0.5px ? 3 : root.best2;
+    property <int> best4: root.tw-of(4) > root.tw-of(root.best3) + 0.5px ? 4 : root.best3;
+    property <int> best5: root.tw-of(5) > root.tw-of(root.best4) + 0.5px ? 5 : root.best4;
+    property <int> best6: root.tw-of(6) > root.tw-of(root.best5) + 0.5px ? 6 : root.best5;
+    property <int> cols: root.n <= 1 ? 1 : Math.min(root.n, root.best6);
+    property <length> tw: Math.max(0px, root.tw-of(root.cols));
+    property <length> th: root.tw / root.ratio;
     property <length> used-w: root.cols * root.tw + (root.cols - 1) * root.gap;
     property <length> used-h: root.rows(root.cols) * root.th + (root.rows(root.cols) - 1) * root.gap;
 
@@ -733,7 +788,9 @@ export component Stage inherits Rectangle {
         }
         HorizontalLayout {
             alignment: center;
-            StageControls { }
+            // Leave call loses its words when the whole bar would not
+            // fit (a narrow desktop window: five buttons and the words).
+            StageControls { compact: root.width < 440px; }
         }
     }
 }

@@ -788,6 +788,9 @@ impl AppState {
                             .ok();
                         app.push_activity(&t!("chat-watching", "name" => username.as_str()));
                         info!("Viewer open + subscribed to {client_id}");
+                        // Their camera into the window, "Watching" on
+                        // their tile (1.5.2).
+                        app.viewers_changed();
                     }
                     Err(e) => {
                         warn!("Viewer open failed: {e}");
@@ -799,9 +802,7 @@ impl AppState {
     }
 
     pub fn handle_unwatch_peer(&mut self, client_id: u64) {
-        if let Some(viewer) = self.viewers.remove(&client_id) {
-            viewer.close();
-        }
+        self.close_viewer(client_id);
         self.screen
             .tx
             .send(ScreenControl::StopWatching { client_id })
