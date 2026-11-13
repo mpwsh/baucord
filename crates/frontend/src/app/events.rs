@@ -151,18 +151,27 @@ impl AppState {
     pub(super) fn present_frame(&mut self, f: crate::present::PreparedFrame) {
         // A camera's picture goes to its tile in Channel view.
         if f.meta.client_id & client::protocol::recording::CAMERA_TRACK_BIT != 0 {
-            self.camera_frame(f);
+            let meta = f.meta;
+            if self.camera_frame(f) {
+                self.tally_shown(&meta);
+            }
             return;
         }
         let Some(viewer) = self.viewers.get_mut(&f.meta.client_id) else {
             return;
         };
         viewer.update_frame(f.buffer, &f.meta);
-        // For the stream's summary line (client::viewlog): decoded →
-        // handed to the UI, this side's whole share of a frame's way.
-        let to_screen = u64::try_from(f.meta.decoded_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.tally_shown(&f.meta);
+    }
+
+    /// For the stream's summary line (`client::viewlog`): decoded →
+    /// handed to the UI, this side's whole share of a frame's way. A
+    /// camera's line counted none, so a tile that stopped changing
+    /// could not be told from frames that stopped coming.
+    fn tally_shown(&self, meta: &client::screen::FrameMeta) {
+        let to_screen = u64::try_from(meta.decoded_at.elapsed().as_micros()).unwrap_or(u64::MAX);
         if let Ok(mut tallies) = self.screen.shared.present.lock() {
-            let tally = tallies.entry(f.meta.client_id).or_default();
+            let tally = tallies.entry(meta.client_id).or_default();
             tally.shown += 1;
             tally.to_screen_us = tally.to_screen_us.saturating_add(to_screen);
             tally.to_screen_max_us = tally.to_screen_max_us.max(to_screen);

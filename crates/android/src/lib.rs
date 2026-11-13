@@ -73,7 +73,7 @@ fn android_main(app: AndroidApp) {
     // listener sees the Activity's lifecycle (spec §4.3); for now it
     // only narrates it into the log, which is what diagnosing the
     // first builds needs.
-    if let Err(e) = slint::android::init_with_event_listener(app.clone(), on_poll_event) {
+    if let Err(e) = slint::android::init_with_event_listener(app, on_poll_event) {
         // A second Activity in a process whose first run did not exit
         // (should not happen: see the end of this function). There is
         // no way to re-point Slint at the new Activity, so leave.
@@ -86,7 +86,7 @@ fn android_main(app: AndroidApp) {
 
     #[cfg(not(feature = "hello"))]
     {
-        if let Some(dir) = data_dir.clone() {
+        if let Some(dir) = data_dir {
             client::config::set_config_dir(dir);
         } else {
             log::warn!("no internal data path; settings will not persist");

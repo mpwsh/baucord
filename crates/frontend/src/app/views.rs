@@ -18,11 +18,10 @@
 //! A child of `app`: everything private to `AppState` is in reach
 //! through `super::*`, so these are the same methods, only filed.
 
-use client::protocol::recording::CAMERA_TRACK_BIT;
-use ui::StageTile;
-
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use client::protocol::recording::CAMERA_TRACK_BIT;
+use ui::StageTile;
 
 /// The rail's buttons, as `Logic.view-picked` numbers them.
 const VIEW_LIST: i32 = 0;
@@ -434,6 +433,13 @@ impl AppState {
     /// Channel view came on screen or left it: cameras are watched
     /// only while it can be seen.
     pub(super) fn stage_shown(&mut self, shown: bool) {
+        if self.session.stage.shown != shown && !self.session.stage.cameras.is_empty() {
+            info!(
+                "Channel view {}: cameras {}",
+                if shown { "on screen" } else { "out of sight" },
+                if shown { "watched" } else { "let go" }
+            );
+        }
         self.session.stage.shown = shown;
         self.sync_camera_watch();
     }
@@ -553,6 +559,7 @@ impl AppState {
             .copied()
             .collect();
         for id in start {
+            info!("watching {}'s camera", self.username_of(id));
             self.session.stage.watching.insert(id);
             // The screen thread first, so the frames are wanted before
             // the server sends any.
@@ -570,6 +577,7 @@ impl AppState {
                 .ok();
         }
         for id in stop {
+            info!("no longer watching {}'s camera", self.username_of(id));
             self.session.stage.watching.remove(&id);
             self.session.stage.pictured.remove(&id);
             self.screen
@@ -644,21 +652,24 @@ impl AppState {
         self.session.stage = Stage::default();
     }
 
-    /// One prepared camera frame: onto its sender's tile.
-    pub(super) fn camera_frame(&mut self, f: crate::present::PreparedFrame) {
+    /// One prepared camera frame: onto its sender's tile. True when it
+    /// reached one.
+    pub(super) fn camera_frame(&mut self, f: crate::present::PreparedFrame) -> bool {
         let sender = f.meta.client_id & !CAMERA_TRACK_BIT;
         if !self.session.stage.watching.contains(&sender) {
-            return;
+            return false;
         }
         self.session.stage.pictured.insert(sender);
         let Some(&i) = self.session.stage.tiles.get(&sender) else {
-            return;
+            return false;
         };
-        if let Some(mut tile) = self.stage_model.row_data(i) {
-            tile.camera = true;
-            tile.frame = slint::Image::from_rgba8(f.buffer);
-            self.stage_model.set_row_data(i, tile);
-        }
+        let Some(mut tile) = self.stage_model.row_data(i) else {
+            return false;
+        };
+        tile.camera = true;
+        tile.frame = slint::Image::from_rgba8(f.buffer);
+        self.stage_model.set_row_data(i, tile);
+        true
     }
 }
 
