@@ -16,6 +16,16 @@ Fixes to 1.5.1.
   requested format". Its rates are now rounded. A camera that offers
   only formats baucord cannot read still fails, and the log now names
   the camera and what it offers.
+- **Cameras that would not open on Linux now do.** A USB webcam
+  appears to Linux twice (`/dev/video0` for the picture, `/dev/video1`
+  for metadata, same name), and both were listed in no set order: the
+  camera picked could be the one with no picture, and turning it on
+  failed with "Failed to Fufill". Only the picture one is listed now,
+  once. The Windows fraction problem was there too, and more: a
+  virtual camera (v4l2loopback: phone apps, OBS) that offers a range
+  of sizes or rates instead of a list, or only the YU12/YV12 pixel
+  layouts, listed nothing. Ranges now offer the usual sizes and rates
+  inside them, and YU12/YV12 are read.
 
 ## 1.5.1 (2026-11-13)
 

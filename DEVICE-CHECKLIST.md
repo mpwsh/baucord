@@ -1345,7 +1345,15 @@ Nothing run on a device or against a real server.
   (OBS Virtual Camera set to 29.97 fps, a capture card, a phone-as-
   webcam app): it is listed with its sizes and turns on. A camera with
   no format baucord reads fails with a toast, and the log names the
-  camera and each format it skipped [CAM-1, 1.5.1].
+  camera and each format it skipped [CAM-1, 1.5.2].
+- [ ] **new** Linux, a USB webcam: Settings → Camera lists it once
+  (not twice, for its metadata node), and it turns on, also after a
+  restart with it picked [CAM-1, 1.5.2].
+- [ ] **new** Linux, a virtual camera (v4l2loopback: OBS Virtual
+  Camera, a phone-as-webcam app) and a plain USB camera: each is
+  listed with its sizes (`v4l2-ctl --list-formats-ext -d /dev/videoN`
+  shows what it offers) and turns on; a YU12 one shows correct colours,
+  not green or pink [CAM-1, 1.5.2].
 - [ ] **new** Settings → Camera (under Audio): the picker lists the
   computer's cameras; Preview shows the chosen one; picking another
   switches the preview; the Quality list shows 1080p / 720p (default)

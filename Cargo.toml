@@ -133,12 +133,6 @@ opt-level = 3
 # upstream exposes the client.
 [patch.crates-io]
 wasapi = { path = "third_party/wasapi" }
-# nokhwa's macOS camera bindings with one fix in `set_all` (1.5; the
-# camera thread panicked opening a C920 at 720p): see
-# third_party/nokhwa-bindings-macos/BAUCORD-PATCH.md.
 nokhwa-bindings-macos = { path = "third_party/nokhwa-bindings-macos" }
-# nokhwa's Windows camera bindings, with frame rates such as 30000/1001
-# kept rather than dropped (1.5.0: a camera that states its rates that
-# way listed nothing and would not open): see
-# third_party/nokhwa-bindings-windows/BAUCORD-PATCH.md.
 nokhwa-bindings-windows = { path = "third_party/nokhwa-bindings-windows" }
+nokhwa-bindings-linux = { path = "third_party/nokhwa-bindings-linux" }

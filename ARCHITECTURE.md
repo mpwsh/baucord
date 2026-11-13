@@ -518,8 +518,13 @@ exactly-once `ScreenShareStarted/Stopped` corrections. Validation
   `BAUCORD-PATCH.md`). On Windows the Media Foundation bindings
   dropped every frame rate stated as a fraction (30000/1001), so such
   a camera listed nothing; the vendored copy
-  (`third_party/nokhwa-bindings-windows`, 1.5.1) rounds them and logs
-  each format it skips. Every request takes all the pixel formats
+  (`third_party/nokhwa-bindings-windows`, 1.5.2) rounds them and logs
+  each format it skips. On Linux the V4L2 bindings had the same
+  fraction bug, read ranges of sizes and rates (virtual cameras,
+  v4l2loopback) wrongly, and could not read the YU12/YV12 such devices
+  offer; the vendored copy (`third_party/nokhwa-bindings-linux`, 1.5.2)
+  rounds rates, offers the common sizes and rates inside a range, and
+  hands YU12/YV12 on as NV12, interleaving the chroma planes. Every request takes all the pixel formats
   `to_rgba` reads (`READABLE`), not nokhwa's RGBA decoder's list
   — encodes it on the share's encoder at the size Settings →
   Camera asks (`Quality::CAMERA`: 1080p at ~3 Mbit/s, 720p — the
