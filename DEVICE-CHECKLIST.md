@@ -1341,6 +1341,11 @@ Nothing run on a device or against a real server.
 - [ ] **new** Watch a screen share and say nothing past the channel's
   AFK time: you are not moved to AFK. Stop watching: you are, after
   the time.
+- [ ] **new** Windows, a camera that states fractional frame rates
+  (OBS Virtual Camera set to 29.97 fps, a capture card, a phone-as-
+  webcam app): it is listed with its sizes and turns on. A camera with
+  no format baucord reads fails with a toast, and the log names the
+  camera and each format it skipped [CAM-1, 1.5.1].
 - [ ] **new** Settings → Camera (under Audio): the picker lists the
   computer's cameras; Preview shows the chosen one; picking another
   switches the preview; the Quality list shows 1080p / 720p (default)

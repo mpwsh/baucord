@@ -4,17 +4,23 @@ What changed from one release to the next, for the people who run a
 baucord server and the people who use the apps. Releases before this
 file are summed up in SESSION-GUIDE.md §3 ("Shipped").
 
-## 1.5.1 (unreleased)
+## 1.5.2 (unreleased)
 
-Fixes to 1.5.0.
+Fixes to 1.5.1.
 
-- **Cameras that would not open on Windows now do.** A camera that
+- **Cameras that would not open on Windows now do.** (Listed for
+  1.5.1, but that release was built without it.) A camera that
   states its frame rates as fractions (29.97 fps as 30000/1001) —
   common for capture cards, virtual cameras and phone-as-webcam apps —
   listed no formats, and turning it on failed with "Failed to fulfill
   requested format". Its rates are now rounded. A camera that offers
   only formats baucord cannot read still fails, and the log now names
   the camera and what it offers.
+
+## 1.5.1 (2026-11-13)
+
+Fixes to 1.5.0.
+
 - **The Android and iPhone apps build again.** 1.5.0's phone builds
   failed on a camera decoder only the desktop build had; the pull
   request check now compiles both apps for their targets.

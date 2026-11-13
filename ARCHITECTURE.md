@@ -515,7 +515,13 @@ exactly-once `ScreenShareStarted/Stopped` corrections. Validation
   YUYV, which `AVFoundation` converts to; and its `set_all` paired one
   format of a size with another's frame rate, which throws — fixed in
   a vendored copy (`third_party/nokhwa-bindings-macos`,
-  `BAUCORD-PATCH.md`) — encodes it on the share's encoder at the size Settings →
+  `BAUCORD-PATCH.md`). On Windows the Media Foundation bindings
+  dropped every frame rate stated as a fraction (30000/1001), so such
+  a camera listed nothing; the vendored copy
+  (`third_party/nokhwa-bindings-windows`, 1.5.1) rounds them and logs
+  each format it skips. Every request takes all the pixel formats
+  `to_rgba` reads (`READABLE`), not nokhwa's RGBA decoder's list
+  — encodes it on the share's encoder at the size Settings →
   Camera asks (`Quality::CAMERA`: 1080p at ~3 Mbit/s, 720p — the
   default — at ~1.7, 480p at ~0.85, all 30 fps; 240p only for a
   camera with no more), never above what the device delivers. Three
